@@ -4,6 +4,11 @@
   "description": "A collection of safety and permission extensions for Pi",
   "keywords": ["pi-package"],
   "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
   "pi": {
     "extensions": ["./extensions/**/*.ts"]
   }
