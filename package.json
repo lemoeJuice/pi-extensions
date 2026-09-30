@@ -1,0 +1,10 @@
+{
+  "name": "pi-guardrails",
+  "version": "0.1.0",
+  "description": "A collection of safety and permission extensions for Pi",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions/**/*.ts"]
+  }
+}
