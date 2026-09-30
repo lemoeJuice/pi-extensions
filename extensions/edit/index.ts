@@ -6,6 +6,7 @@ import { applyCodexPatch, parseCodexPatch } from "./lib/codex-apply-patch.ts";
 
 const EDIT_GUIDELINES = [
   "The edit tool requires exactly the intent and patch fields. patch must use Codex apply_patch syntax from *** Begin Patch through *** End Patch.",
+  "Keep intent to one short phrase; do not repeat the patch or narrate the implementation.",
   "Do not call edit with the native path/edits/oldText/newText format. That format is unsupported; encode changes as *** Update File hunks with context, '-' lines, and '+' lines.",
   "Prefer edit to modify existing text files and for focused file changes.",
   "When creating or rewriting large amounts of content, generating many files, or when content is better generated programmatically, use bash instead.",
@@ -67,7 +68,7 @@ function changeStats(change: Change) {
   return { path: change.path, kind: change.kind, removed, added, deletions: removed.length, additions: added.length };
 }
 
-function patchCallPreview(patchText: string): string {
+function patchCallSummary(patchText: string): string {
   try {
     const operations = parseCodexPatch(patchText);
     const headers = operations.map((operation) => {
@@ -78,37 +79,30 @@ function patchCallPreview(patchText: string): string {
       const added = hunks.reduce((count, hunk) => count + hunk.added.length, 0);
       return `${operation.moveTo ? `Move ${operation.path} → ${operation.moveTo}` : `Update ${operation.path}`} (+${added} −${removed})`;
     });
-    const edits = operations.flatMap((operation) => {
-      if (operation.kind === "add") return asLines(operation.contents).map((line) => `+ ${line}`);
-      if (operation.kind === "delete") return [];
-      return operation.chunks.flatMap((chunk) => {
-        const hunk = changedLines(chunk.oldLines.join("\n"), chunk.newLines.join("\n"));
-        return [...hunk.removed.map((line) => `− ${line}`), ...hunk.added.map((line) => `+ ${line}`)];
-      });
-    });
-    const excerpt = edits.slice(0, 10);
-    if (edits.length > excerpt.length) excerpt.push(`… ${edits.length - excerpt.length} more changed lines`);
-    return [...headers, ...(excerpt.length ? ["", ...excerpt] : [])].join("\n").slice(0, 1400);
+    const visible = headers.slice(0, 12);
+    if (headers.length > visible.length) visible.push(`${headers.length - visible.length} more file operations`);
+    return visible.join("\n");
   } catch {
-    return "Invalid Codex patch (expected *** Begin Patch / *** End Patch)";
+    return "Invalid patch";
   }
 }
 
-function resultText(stats: ReturnType<typeof changeStats>[]): string {
+function resultSummary(stats: ReturnType<typeof changeStats>[]): string {
   const totalAdded = stats.reduce((sum, item) => sum + item.additions, 0);
   const totalRemoved = stats.reduce((sum, item) => sum + item.deletions, 0);
   const headers = stats.map((item) => `${item.kind}: ${item.path} (+${item.additions} −${item.deletions})`);
-  const summary = `Applied ${stats.length} file operation${stats.length === 1 ? "" : "s"} (+${totalAdded} −${totalRemoved}).\n${headers.join("\n")}`;
+  return `Applied ${stats.length} file operation${stats.length === 1 ? "" : "s"} (+${totalAdded} −${totalRemoved}).\n${headers.join("\n")}`;
+}
+
+function resultDiff(stats: ReturnType<typeof changeStats>[]): string {
   const diffLines = stats.flatMap((item) => [
-    `\n${item.path}`,
-    ...item.removed.map((line) => `− ${line}`),
+    `--- ${item.path}`,
+    ...item.removed.map((line) => `- ${line}`),
     ...item.added.map((line) => `+ ${line}`),
   ]);
-  const excerpt = diffLines.slice(0, 48);
-  let detail = excerpt.join("\n");
-  if (diffLines.length > excerpt.length) detail += `\n… ${diffLines.length - excerpt.length} more diff lines omitted`;
-  if (detail.length > 5000) detail = `${detail.slice(0, 5000)}\n… diff preview truncated`;
-  return `${summary}${detail ? `\n\n${detail}` : ""}`;
+  const joined = diffLines.join("\n");
+  const maxChars = 100_000;
+  return joined.length > maxChars ? `${joined.slice(0, maxChars)}\n[diff truncated at ${maxChars} characters]` : joined;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -119,7 +113,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Call edit with {intent, patch}; patch is Codex apply_patch syntax, not native path/edits",
     promptGuidelines: EDIT_GUIDELINES,
     parameters: Type.Object({
-      intent: Type.String({ description: "Briefly explain the goal and expected side effects of this patch.", minLength: 1 }),
+      intent: Type.String({ description: "One short phrase stating what this patch accomplishes.", minLength: 1 }),
       patch: Type.String({ description: "Required Codex apply_patch document, beginning with *** Begin Patch and ending with *** End Patch. Do not provide native path/edits/oldText/newText arguments." }),
     }),
     async execute(_id, params: { intent: string; patch: string }, _signal, _onUpdate, ctx) {
@@ -127,32 +121,34 @@ export default function (pi: ExtensionAPI) {
       return withFileMutationQueue(ctx.cwd, async () => {
         const changes = await applyCodexPatch(ctx.cwd, params.patch, allowOutside);
         const stats = changes.map(changeStats);
-        const summary = resultText(stats);
+        const summary = resultSummary(stats);
+        const diff = resultDiff(stats);
         return {
           content: [{ type: "text", text: summary }],
-          details: { changes: stats.map(({ path, kind, additions, deletions }) => ({ path, kind, additions, deletions })), intent: params.intent },
+          details: { changes: stats.map(({ path, kind, additions, deletions }) => ({ path, kind, additions, deletions })), intent: params.intent, diff },
         };
       });
     },
     renderCall(args: { intent: string; patch: string }, theme: any) {
-      const intent = String(args.intent ?? "(missing intent)").replace(/\s+/g, " ").slice(0, 120);
+      const intent = String(args.intent ?? "(missing intent)").replace(/\s+/g, " ").slice(0, 100);
       return new Text(
-        `${theme.fg("toolTitle", theme.bold("edit"))} ${theme.fg("accent", intent)}\n${theme.fg("muted", patchCallPreview(args.patch))}`,
+        `${theme.fg("toolTitle", theme.bold("edit"))} ${theme.fg("accent", intent)}\n${theme.fg("muted", patchCallSummary(args.patch))}`,
         0,
         0,
       );
     },
     renderResult(result: any, { expanded }: { expanded: boolean }, theme: any) {
       const output = result.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
-      const details = result.details as { changes?: Array<{ path: string; kind: string; additions: number; deletions: number }> } | undefined;
+      const details = result.details as { changes?: Array<{ path: string; kind: string; additions: number; deletions: number }>; diff?: string } | undefined;
       const changes = details?.changes ?? [];
       const stats = changes.reduce((total, change) => ({ additions: total.additions + change.additions, deletions: total.deletions + change.deletions }), { additions: 0, deletions: 0 });
       const compact = result.isError
         ? (output.split("\n")[0] || "Edit failed")
-        : `Applied ${changes.length} file operation${changes.length === 1 ? "" : "s"} · +${stats.additions} −${stats.deletions}`;
+        : `Applied ${changes.length} file operation${changes.length === 1 ? "" : "s"} · +${stats.additions} −${stats.deletions} · Ctrl+O to expand`;
+      const expandedOutput = `${output}${details?.diff ? `\n\n${details.diff}` : ""}`;
       const display = expanded
-        ? output.split("\n").map((line: string) => {
-          if (line.startsWith("− ")) return theme.fg("error", line);
+        ? expandedOutput.split("\n").map((line: string) => {
+          if (line.startsWith("- ")) return theme.fg("error", line);
           if (line.startsWith("+ ")) return theme.fg("success", line);
           if (line.startsWith("Applied ")) return theme.fg("success", line);
           return theme.fg("muted", line);

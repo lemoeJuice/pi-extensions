@@ -5,12 +5,14 @@ A Pi extension package with separate permission-management and patch-editing ext
 ```text
 extensions/
 ├── permissions/
-│   └── index.ts
+│   ├── index.ts
+│   └── lib/bash-policy.ts
 └── edit/
     ├── index.ts
     └── lib/codex-apply-patch.ts
 test/
 ├── config.json
+├── bash-policy.test.mjs
 └── codex-apply-patch.test.mjs
 ```
 
@@ -18,13 +20,13 @@ The package manifest explicitly lists extension entrypoints, so helper modules u
 
 ## Permissions extension
 
-`extensions/permissions/index.ts` owns `/permissions manual|auto`, wraps `bash` and `read` with required `intent` summaries, and removes the native `write` tool from the model's active tool set. Read calls show the intent and path; read results are collapsed to a line count with a short expandable preview. Paths for `read`, `write`, and `edit` are resolved against the current working directory, including existing symlink targets. In-workspace paths pass without a prompt; out-of-workspace paths and paths whose scope cannot be verified go to manual confirmation or the auto reviewer. A small read-only Bash command allowlist passes directly; composed, mutating, unknown, or high-risk commands go through review. The allowlist is in `extensions/permissions/lib/bash-policy.ts`; these checks are policy gates, not a shell sandbox.
+`extensions/permissions/index.ts` owns `/permissions manual|auto`, wraps `bash` and `read` with required, short `intent` phrases, and removes the native `write` tool from the model's active tool set. Read calls show the intent and path; read results are collapsed to a line count with a short expandable preview. Paths for `read`, `write`, and `edit` are resolved against the current working directory, including existing symlink targets. In-workspace paths pass without a prompt; out-of-workspace paths and paths whose scope cannot be verified go to manual confirmation or the auto reviewer. A small read-only Bash command allowlist passes directly; its file operands are separately checked against the workspace (e.g. `grep pattern /outside/file` requires review). Composed, mutating, unknown, or high-risk commands go through review. The allowlist is in `extensions/permissions/lib/bash-policy.ts`; these checks are policy gates, not a shell sandbox.
 
 `manual` is the default mode and shows a concise confirmation with the intent, operation, target/command, and reason. `auto` asks the current model to judge the actual intent and operation in an isolated single-turn request at fixed `low` reasoning; it receives no session transcript or prior tool results. Being outside the workspace or not allowlisted is not itself an automatic denial—the operation is sent to review. Only the exact response `APPROVE` allows it. Missing models, timeouts, errors, and malformed decisions deny by default. The mode resets to `manual` on restart.
 
 ## Edit extension
 
-`extensions/edit/index.ts` replaces the native `edit` tool under the same name. It requires `intent` and `patch`; the native `path` / `edits` / `oldText` / `newText` argument shape is explicitly unsupported. The patch must be a Codex-compatible `apply_patch` document. Supported operations include `Add File`, `Delete File`, `Update File`, `@@` context chunks, `*** End of File`, and `*** Move to`. The TUI shows a compact operation summary and actual changed lines; the result is capped and expandable instead of echoing the entire patch.
+`extensions/edit/index.ts` replaces the native `edit` tool under the same name. It requires a short `intent` and `patch`; the native `path` / `edits` / `oldText` / `newText` argument shape is explicitly unsupported. The patch must be a Codex-compatible `apply_patch` document. Supported operations include `Add File`, `Delete File`, `Update File`, `@@` context chunks, `*** End of File`, and `*** Move to`. The TUI shows a compact summary derived from the patch, not its full schema. The result is collapsed by default; press **Ctrl+O** to expand and read the actual added/removed lines.
 
 Prefer `edit` for focused changes to existing text files. When creating or rewriting large amounts of content, generating many files, or producing content programmatically, use `bash` instead. The tool renderer displays the intent and patch preview.
 
