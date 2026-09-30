@@ -10,6 +10,6 @@
     "typebox": "*"
   },
   "pi": {
-    "extensions": ["./extensions/**/*.ts"]
+    "extensions": ["./extensions/permissions/index.ts", "./extensions/edit/index.ts"]
   }
 }

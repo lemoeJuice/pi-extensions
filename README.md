@@ -1,27 +1,48 @@
 # pi-guardrails
 
-A Pi package for permission and safety extensions. New extensions belong under `extensions/`; implementation helpers live outside that resource directory so Pi does not load them as standalone extensions.
+A Pi extension package with separate permission-management and patch-editing extensions:
 
-## Permissions and tools
+```text
+extensions/
+├── permissions/
+│   └── index.ts
+└── edit/
+    ├── index.ts
+    └── lib/codex-apply-patch.ts
+test/
+├── config.json
+└── codex-apply-patch.test.mjs
+```
 
-The permissions extension replaces Pi's built-in `bash` and `edit` tools under the same names:
+The package manifest explicitly lists extension entrypoints, so helper modules under `lib/` are imported by their extension and are not loaded as separate plugins.
 
-- `bash` requires an `intent` summary, which appears in the TUI call display.
-- `edit` requires an `intent` summary and a Codex-compatible `apply_patch` document. It supports `Add File`, `Delete File`, `Update File`, `@@` context chunks, `*** End of File`, and `*** Move to`.
-- `write` is removed from the model's active tool list; patch `Add File` operations cover normal file creation.
-- `read` and `write` calls within the current working directory are allowed without a prompt. Out-of-workspace `read`, `write`, and `edit` paths require approval.
+## Permissions extension
 
-Prefer `edit` for focused changes to existing text files. When creating or rewriting a large amount of content, generating many files, or producing content programmatically, use `bash` instead.
+`extensions/permissions/index.ts` owns `/permissions manual|auto`, wraps `bash` and `read` with required `intent` summaries, and removes the native `write` tool from the model's active tool set. Read calls show the intent and path; read results are collapsed to a line count with a short expandable preview. Paths for `read`, `write`, and `edit` are resolved against the current working directory, including existing symlink targets. In-workspace paths pass without a prompt; out-of-workspace paths and paths whose scope cannot be verified go to manual confirmation or the auto reviewer. A small read-only Bash command allowlist passes directly; composed, mutating, unknown, or high-risk commands go through review. The allowlist is in `extensions/permissions/lib/bash-policy.ts`; these checks are policy gates, not a shell sandbox.
 
-Use `/permissions manual` (default) to ask the user before selected high-risk Bash commands and out-of-workspace file operations, or `/permissions auto` to ask the current model to review them. Each automatic review gets a fresh, isolated request containing only the current operation, intent/arguments, and reason for review—not the session transcript or prior tool results. It must answer exactly `APPROVE`; missing model, errors, or any other response block the operation. Mode resets to `manual` on restart.
+`manual` is the default mode and shows a concise confirmation with the intent, operation, target/command, and reason. `auto` asks the current model to judge the actual intent and operation in an isolated single-turn request at fixed `low` reasoning; it receives no session transcript or prior tool results. Being outside the workspace or not allowlisted is not itself an automatic denial—the operation is sent to review. Only the exact response `APPROVE` allows it. Missing models, timeouts, errors, and malformed decisions deny by default. The mode resets to `manual` on restart.
 
-High-risk Bash patterns include recursive/force `rm`, `sudo`, disk erase/format, broad `chmod`/`chown`, device writes, `find -delete`, destructive Git operations, and download-pipe-to-shell. This is not a sandbox: shell command checks are pattern-based, and model-provided intent is untrusted input. Other extensions can still perform their own filesystem operations.
+## Edit extension
 
-The patch parser/applier in `lib/codex-apply-patch.ts` follows the public Codex apply-patch grammar and operations: <https://github.com/openai/codex/tree/main/codex-rs/apply-patch>.
+`extensions/edit/index.ts` replaces the native `edit` tool under the same name. It requires `intent` and `patch`; the native `path` / `edits` / `oldText` / `newText` argument shape is explicitly unsupported. The patch must be a Codex-compatible `apply_patch` document. Supported operations include `Add File`, `Delete File`, `Update File`, `@@` context chunks, `*** End of File`, and `*** Move to`. The TUI shows a compact operation summary and actual changed lines; the result is capped and expandable instead of echoing the entire patch.
+
+Prefer `edit` for focused changes to existing text files. When creating or rewriting large amounts of content, generating many files, or producing content programmatically, use `bash` instead. The tool renderer displays the intent and patch preview.
+
+The parser/applier follows the public grammar and application behavior in [OpenAI Codex's apply-patch crate](https://github.com/openai/codex/tree/main/codex-rs/apply-patch).
+
+## Test
+
+Run parser and filesystem tests with:
+
+```sh
+node --experimental-strip-types --test test/*.test.mjs
+```
+
+`test/config.json` records the model for manual Pi integration testing (`openai/gpt-6-luna`).
 
 ## Load
 
-Try this checkout for one invocation:
+Try this checkout:
 
 ```sh
 pi -e .
@@ -33,4 +54,4 @@ Install globally for the current user:
 pi install /home/lemonjuice/Projects/pi-extensions
 ```
 
-Or install as a project-local package with `pi install . --local`.
+Or install for one project with `pi install . --local`.
