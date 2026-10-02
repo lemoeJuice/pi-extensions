@@ -12,8 +12,9 @@ const wsUrl = `ws://${host}:${port}/internal`;
 const remoteCommands = [
   { name: 'abort', description: 'Stop the current Pi generation', source: 'remote' },
   { name: 'compact', description: 'Compact the current session context', source: 'remote' },
-  { name: 'thinking', description: 'Set thinking level: off, minimal, low, medium, high', source: 'remote' },
-  { name: 'name', description: 'Set the session display name', source: 'remote' },
+  { name: 'thinking', description: 'Set thinking level: off, minimal, low, medium, high, xhigh, max', source: 'remote', requiresArgs: true },
+  { name: 'model', description: 'Switch model using provider/model-id', source: 'remote', requiresArgs: true },
+  { name: 'name', description: 'Set the session display name', source: 'remote', requiresArgs: true },
 ];
 
 async function ensureDaemon() {
@@ -61,7 +62,7 @@ export default function (pi: ExtensionAPI) {
         await new Promise<void>((resolve, reject) => {
           const ws = new WebSocket(wsUrl); socket = ws;
           let registered = false;
-          ws.on('open', () => ws.send(JSON.stringify({ type: 'register', instance: { instanceId, sessionId, pid: process.pid, cwd, model, title: undefined, startedAt: Date.now(), sessionFile, leafId: ctx.sessionManager.getLeafId(), metadata: collectMetadata(ctx), commands: pi.getCommands().map(({ name, description, source }) => ({ name, description, source })) } })));
+          ws.on('open', () => ws.send(JSON.stringify({ type: 'register', instance: { instanceId, sessionId, pid: process.pid, cwd, model, title: undefined, startedAt: Date.now(), sessionFile, leafId: ctx.sessionManager.getLeafId(), metadata: collectMetadata(ctx), commands: [...remoteCommands, ...pi.getCommands().map(({ name, description, source }) => ({ name, description, source }))] } })));
           ws.on('message', async data => {
             let msg: any; try { msg = JSON.parse(data.toString()); } catch { return; }
             if (msg.type === 'registered') {
@@ -81,8 +82,17 @@ export default function (pi: ExtensionAPI) {
               if (msg.name === 'abort') { ctx.abort(); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); return; }
               if (msg.name === 'compact') { ctx.compact(); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); return; }
               if (msg.name === 'thinking') {
-                if (!['off', 'minimal', 'low', 'medium', 'high'].includes(args)) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Use /thinking off|minimal|low|medium|high' })); return; }
+                if (!['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(args)) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Use /thinking off|minimal|low|medium|high|xhigh|max' })); return; }
                 pi.setThinkingLevel(args as any); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); return;
+              }
+              if (msg.name === 'model') {
+                const separator = args.indexOf('/');
+                if (separator < 1 || separator === args.length - 1) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Use /model provider/model-id' })); return; }
+                const selected = ctx.modelRegistry.find(args.slice(0, separator), args.slice(separator + 1));
+                if (!selected) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: `Unknown model: ${args}` })); return; }
+                try { if (!await pi.setModel(selected)) throw new Error('Authentication is not configured for this model'); model = `${selected.provider}/${selected.id}`; sendMetadata(ctx); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); }
+                catch (error) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: String(error) })); }
+                return;
               }
               if (msg.name === 'name') {
                 if (!args) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Session name is required' })); return; }
@@ -113,7 +123,8 @@ export default function (pi: ExtensionAPI) {
       totals.cacheRead += Number(usage.cacheRead) || 0;
       totals.output += Number(usage.output) || 0;
     }
-    return { thinkingLevel: pi.getThinkingLevel(), contextUsage: ctx.getContextUsage(), totals };
+    const activeModel = ctx.model;
+    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), contextUsage: ctx.getContextUsage(), totals };
   }
   function sendMetadata(ctx: any) {
     if (socket?.readyState === WebSocket.OPEN) sendEvent({ type: 'metadata', metadata: collectMetadata(ctx) });

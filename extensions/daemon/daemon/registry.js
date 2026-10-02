@@ -60,6 +60,8 @@ class Registry {
     if (event.event?.type === 'metadata') {
       i.metadata = event.event.metadata;
       s.metadata = event.event.metadata;
+      i.model = event.event.metadata?.model || i.model;
+      s.model = event.event.metadata?.model || s.model;
     }
     if (event.event?.entryId) s.leafId = event.event.entryId;
     i.status = event.type === 'agent_start' ? 'running' : event.type === 'agent_end' ? 'waiting' : i.status;
