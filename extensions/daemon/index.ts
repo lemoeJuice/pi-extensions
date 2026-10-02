@@ -61,7 +61,7 @@ export default function (pi: ExtensionAPI) {
         await new Promise<void>((resolve, reject) => {
           const ws = new WebSocket(wsUrl); socket = ws;
           let registered = false;
-          ws.on('open', () => ws.send(JSON.stringify({ type: 'register', instance: { instanceId, sessionId, pid: process.pid, cwd, model, title: undefined, startedAt: Date.now(), sessionFile, leafId: ctx.sessionManager.getLeafId(), commands: pi.getCommands().map(({ name, description, source }) => ({ name, description, source })) } })));
+          ws.on('open', () => ws.send(JSON.stringify({ type: 'register', instance: { instanceId, sessionId, pid: process.pid, cwd, model, title: undefined, startedAt: Date.now(), sessionFile, leafId: ctx.sessionManager.getLeafId(), metadata: collectMetadata(ctx), commands: pi.getCommands().map(({ name, description, source }) => ({ name, description, source })) } })));
           ws.on('message', async data => {
             let msg: any; try { msg = JSON.parse(data.toString()); } catch { return; }
             if (msg.type === 'registered') {
@@ -104,12 +104,26 @@ export default function (pi: ExtensionAPI) {
   }
 
   function sendStatus(status: string) { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'status', status })); }
+  function collectMetadata(ctx: any) {
+    const totals = { input: 0, cacheRead: 0, output: 0 };
+    for (const entry of ctx.sessionManager.getBranch()) {
+      const usage = entry.type === 'usage' ? entry.usage : entry.type === 'compaction' ? entry.usage : entry.type === 'message' && entry.message?.role === 'assistant' ? entry.message.usage : undefined;
+      if (!usage) continue;
+      totals.input += Number(usage.input) || 0;
+      totals.cacheRead += Number(usage.cacheRead) || 0;
+      totals.output += Number(usage.output) || 0;
+    }
+    return { thinkingLevel: pi.getThinkingLevel(), contextUsage: ctx.getContextUsage(), totals };
+  }
+  function sendMetadata(ctx: any) {
+    if (socket?.readyState === WebSocket.OPEN) sendEvent({ type: 'metadata', metadata: collectMetadata(ctx) });
+  }
   function sendEvent(event: any) {
     if (socket?.readyState !== WebSocket.OPEN) return;
     try { socket.send(JSON.stringify({ type: 'event', seq: ++seq, timestamp: Date.now(), event })); } catch { /* event serialization must not affect Pi */ }
   }
   pi.on('agent_start', () => { sendStatus('running'); sendEvent({ type: 'agent_start' }); });
-  pi.on('agent_end', (_event, ctx) => { sendStatus('waiting'); sendEvent({ type: 'agent_end', entryId: ctx.sessionManager.getLeafId() }); });
+  pi.on('agent_end', (_event, ctx) => { sendStatus('waiting'); sendEvent({ type: 'agent_end', entryId: ctx.sessionManager.getLeafId() }); sendMetadata(ctx); });
   pi.on('message_update', event => {
     const update = event.assistantMessageEvent;
     if (update.type === 'start') currentStreamId = `${instanceId}:${++streamCounter}`;
@@ -144,8 +158,10 @@ export default function (pi: ExtensionAPI) {
       if (index >= 0) requestId = pendingRemoteMessages.splice(index, 1)[0].requestId;
     }
     sendEvent({ type: 'message_end', entryId: ctx.sessionManager.getLeafId(), streamId: message.role === 'assistant' ? currentStreamId : undefined, requestId, message: { role: message.role, content } });
+    if (message.role === 'assistant') sendMetadata(ctx);
     if (message.role === 'assistant') currentStreamId = undefined;
   });
+  pi.on('thinking_level_select', (_event, ctx) => sendMetadata(ctx));
   pi.on('tool_execution_start', event => sendEvent({ type: 'tool_execution_start', ...event }));
   pi.on('tool_execution_update', event => sendEvent({ type: 'tool_execution_update', ...event }));
   pi.on('tool_execution_end', event => sendEvent({ type: 'tool_execution_end', ...event }));

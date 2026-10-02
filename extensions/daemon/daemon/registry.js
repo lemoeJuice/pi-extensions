@@ -5,7 +5,7 @@ class Registry {
   register(ws, instance) {
     let session = this.sessions.get(instance.sessionId);
     if (!session) {
-      session = { sessionId: instance.sessionId, cwd: instance.cwd, model: instance.model, title: instance.title, instances: new Map(), events: [], lastActivityAt: Date.now() };
+      session = { sessionId: instance.sessionId, cwd: instance.cwd, model: instance.model, title: instance.title, metadata: instance.metadata, instances: new Map(), events: [], lastActivityAt: Date.now() };
       this.sessions.set(instance.sessionId, session);
     }
     session.sessionFile = instance.sessionFile || session.sessionFile;
@@ -18,6 +18,7 @@ class Registry {
     session.cwd = instance.cwd || session.cwd;
     session.model = instance.model || session.model;
     session.title = instance.title || session.title;
+    session.metadata = instance.metadata || session.metadata;
     session.lastActivityAt = Date.now();
     this.broadcastList();
     return { writable: instance.writable, conflict };
@@ -50,12 +51,16 @@ class Registry {
         if (event.instanceId === instance.instanceId) activeEvents.push({ type: 'event', sessionId, instanceId: event.instanceId, seq: event.seq, timestamp: event.timestamp, event: event.event });
       }
     }
-    return { sessionId: s.sessionId, title: s.title || s.cwd?.split(/[\\/]/).filter(Boolean).pop() || s.sessionId, cwd: s.cwd, model: s.model, status, live: instances.length > 0, writable: instances.some(i => i.writable), commands: instances.find(i => i.writable)?.commands || [], instances: instances.map(({ ws, sessionFile, commands, ...i }) => i), lastActivityAt: s.lastActivityAt, activeEvents };
+    return { sessionId: s.sessionId, title: s.title || s.cwd?.split(/[\\/]/).filter(Boolean).pop() || s.sessionId, cwd: s.cwd, model: s.model, metadata: instances.find(i => i.writable)?.metadata || s.metadata, status, live: instances.length > 0, writable: instances.some(i => i.writable), commands: instances.find(i => i.writable)?.commands || [], instances: instances.map(({ ws, sessionFile, commands, ...i }) => i), lastActivityAt: s.lastActivityAt, activeEvents };
   }
   list() { return [...this.sessions.keys()].map(id => this.getSession(id)).filter(s => s?.live).sort((a,b) => rank(a.status)-rank(b.status) || b.lastActivityAt-a.lastActivityAt); }
   event(sessionId, instanceId, event) {
     const s = this.sessions.get(sessionId); if (!s) return;
     const i = s.instances.get(instanceId); if (!i) return;
+    if (event.event?.type === 'metadata') {
+      i.metadata = event.event.metadata;
+      s.metadata = event.event.metadata;
+    }
     if (event.event?.entryId) s.leafId = event.event.entryId;
     i.status = event.type === 'agent_start' ? 'running' : event.type === 'agent_end' ? 'waiting' : i.status;
     s.lastActivityAt = Date.now();
