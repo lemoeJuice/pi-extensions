@@ -117,6 +117,8 @@ export default function (pi: ExtensionAPI) {
       patch: Type.String({ description: "Required Codex apply_patch document, beginning with *** Begin Patch and ending with *** End Patch. Do not provide native path/edits/oldText/newText arguments." }),
     }),
     async execute(_id, params: { intent: string; patch: string }, _signal, _onUpdate, ctx) {
+      const intent = typeof params.intent === "string" ? params.intent.trim() : "";
+      if (!intent) throw new Error("edit requires a non-empty intent; retry with one short phrase stating what the patch accomplishes.");
       const allowOutside = (params as any).__allowOutsideWorkingDirectory === true;
       return withFileMutationQueue(ctx.cwd, async () => {
         const changes = await applyCodexPatch(ctx.cwd, params.patch, allowOutside);
@@ -125,7 +127,7 @@ export default function (pi: ExtensionAPI) {
         const diff = resultDiff(stats);
         return {
           content: [{ type: "text", text: summary }],
-          details: { changes: stats.map(({ path, kind, additions, deletions }) => ({ path, kind, additions, deletions })), intent: params.intent, diff },
+          details: { changes: stats.map(({ path, kind, additions, deletions }) => ({ path, kind, additions, deletions })), intent, diff },
         };
       });
     },
