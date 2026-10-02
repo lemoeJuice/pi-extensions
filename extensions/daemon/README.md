@@ -26,6 +26,11 @@ registered while the daemon is running, the session page reads the active branch
 from Pi's JSONL file (read-only) and loads older messages in pages. Offline
 session discovery after a daemon restart is not implemented.
 
+The registry is in memory and keeps only sessions with a connected Pi instance.
+When the last instance disconnects, its registry entry and captured runtime
+events are discarded. The daemon does not save session state or copy history;
+Pi itself owns the JSONL session files, which the daemon only reads.
+
 ## HTTP and WebSocket API
 
 - `GET /health`

@@ -25,6 +25,11 @@ class Registry {
   unregister(sessionId, instanceId) {
     const s = this.sessions.get(sessionId); if (!s) return;
     s.instances.delete(instanceId);
+    if (s.instances.size === 0) {
+      this.sessions.delete(sessionId);
+      this.broadcastList();
+      return;
+    }
     // Promote only when exactly one connected instance remains.
     for (const i of s.instances.values()) i.writable = s.instances.size === 1;
     s.lastActivityAt = Date.now(); this.broadcastList();
@@ -47,7 +52,7 @@ class Registry {
     }
     return { sessionId: s.sessionId, title: s.title || s.cwd?.split(/[\\/]/).filter(Boolean).pop() || s.sessionId, cwd: s.cwd, model: s.model, status, live: instances.length > 0, writable: instances.some(i => i.writable), commands: instances.find(i => i.writable)?.commands || [], instances: instances.map(({ ws, sessionFile, commands, ...i }) => i), lastActivityAt: s.lastActivityAt, activeEvents };
   }
-  list() { return [...this.sessions.keys()].map(id => this.getSession(id)).sort((a,b) => rank(a.status)-rank(b.status) || b.lastActivityAt-a.lastActivityAt); }
+  list() { return [...this.sessions.keys()].map(id => this.getSession(id)).filter(s => s?.live).sort((a,b) => rank(a.status)-rank(b.status) || b.lastActivityAt-a.lastActivityAt); }
   event(sessionId, instanceId, event) {
     const s = this.sessions.get(sessionId); if (!s) return;
     const i = s.instances.get(instanceId); if (!i) return;
