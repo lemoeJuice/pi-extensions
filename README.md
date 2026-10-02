@@ -1,59 +1,91 @@
 # pi-guardrails
 
-A Pi extension package with separate permission-management and patch-editing extensions:
+A Pi extension package with permission guardrails, Codex-style patch editing, and a browser-based remote session daemon.
+
+## Included extensions
+
+The `pi` manifest loads these entrypoints:
 
 ```text
-extensions/
-├── permissions/
-│   ├── index.ts
-│   └── lib/bash-policy.ts
-└── edit/
-    ├── index.ts
-    └── lib/codex-apply-patch.ts
-test/
-├── config.json
-├── bash-policy.test.mjs
-└── codex-apply-patch.test.mjs
+extensions/permissions/index.ts
+extensions/edit/index.ts
+extensions/daemon/index.ts
 ```
 
-The package manifest explicitly lists extension entrypoints, so helper modules under `lib/` are imported by their extension and are not loaded as separate plugins.
+Helper modules under each extension's `lib/` (or daemon runtime directory) are implementation details, not separate extensions.
 
-## Permissions extension
+### Permissions
 
-`extensions/permissions/index.ts` owns `/permissions manual|auto`, wraps `bash` and `read` with required, short `intent` phrases, and removes the native `write` tool from the model's active tool set. Read calls show the intent and path; read results are collapsed to a line count with a short expandable preview. Paths for `read`, `write`, and `edit` are resolved against the current working directory, including existing symlink targets. In-workspace paths pass without a prompt; out-of-workspace paths and paths whose scope cannot be verified go to manual confirmation or the auto reviewer. A small read-only Bash command allowlist passes directly; its file operands are separately checked against the workspace (e.g. `grep pattern /outside/file` requires review). Composed, mutating, unknown, or high-risk commands go through review. The allowlist is in `extensions/permissions/lib/bash-policy.ts`; these checks are policy gates, not a shell sandbox.
+`/permissions` reports the current mode; `/permissions manual` and `/permissions auto` select the mode for the current Pi session. Mode resets to `manual` on restart.
 
-`manual` is the default mode and shows a selection with the intent, operation, target/command, and reason: allow once, switch to auto, or deny. Choosing `Switch to auto` changes the current session's mode and sends the pending operation to the auto reviewer as well. `auto` asks the current model to judge the actual intent and operation in an isolated single-turn request at fixed `low` reasoning; it receives no session transcript or prior tool results. Being outside the workspace or not allowlisted is not itself an automatic denial—the operation is sent to review. Only the exact response `APPROVE` allows it. Missing models, timeouts, errors, and malformed decisions deny by default. The mode resets to `manual` on restart.
+The extension wraps `bash` and `read` to require a short `intent`, removes the native `write` tool from the active tool set, and reviews operations involving out-of-workspace paths, destructive tools, or Bash commands that cannot be certified by its read-only allowlist. File paths are resolved against the session working directory (including existing symlink targets). Bash policy parsing is a review gate, **not a shell sandbox**.
 
-## Edit extension
+In manual mode, review prompts let you allow once, switch to auto, or deny. Switching to auto sends the pending operation to the reviewer. Auto review sees only the operation and its intent in an isolated request, not the session transcript. Only the exact verdict `APPROVE` allows the operation; missing models, errors, timeouts, and invalid decisions fail closed. Being outside the workspace or requiring review is not by itself a reason for the reviewer to deny.
 
-`extensions/edit/index.ts` replaces the native `edit` tool under the same name. It requires a short `intent` and `patch`; the native `path` / `edits` / `oldText` / `newText` argument shape is explicitly unsupported. The patch must be a Codex-compatible `apply_patch` document. Supported operations include `Add File`, `Delete File`, `Update File`, `@@` context chunks, `*** End of File`, and `*** Move to`. The TUI shows a compact summary derived from the patch, not its full schema. The result is collapsed by default; press **Ctrl+O** to expand and read the actual added/removed lines.
+### Patch-based `edit`
 
-Prefer `edit` for focused changes to existing text files. When creating or rewriting large amounts of content, generating many files, or producing content programmatically, use `bash` instead. The tool renderer displays the intent and patch preview.
+The extension replaces the native `edit` tool with a tool that accepts exactly `intent` and `patch`. The patch must use Codex `apply_patch` syntax, from `*** Begin Patch` through `*** End Patch`; native `path` / `edits` / `oldText` / `newText` arguments are unsupported. Supported operations include add, delete, update, context hunks, end-of-file markers, and moves. File mutations are queued per working directory. The TUI displays a patch summary; **Ctrl+O** expands the result to show changed lines.
 
-The parser/applier follows the public grammar and application behavior in [OpenAI Codex's apply-patch crate](https://github.com/openai/codex/tree/main/codex-rs/apply-patch).
+Use `edit` for focused changes to existing text files. Prefer `bash` for large rewrites, many generated files, or programmatic content generation. The parser/applier follows the public grammar and behavior of [OpenAI Codex's apply-patch crate](https://github.com/openai/codex/tree/main/codex-rs/apply-patch).
 
-## Test
+### Remote daemon
 
-Run parser and filesystem tests with:
+The daemon extension starts the local daemon if it is unavailable, registers the current Pi session, and forwards session events and browser input. The daemon is detached and can remain running after Pi exits. Remote connectivity is optional: connection failures are retried with backoff and do not stop Pi.
+
+Defaults are `PI_REMOTE_HOST=100.64.209.124` and `PI_REMOTE_PORT=4317` (the host is currently configured for this environment). Override either variable in Pi's environment as needed. The extension and daemon must use the same values. The daemon listens on that address; access should be restricted by your network/Tailscale ACLs. Do not bind to a public interface without deliberately adding appropriate access controls. A localhost bind can be exposed through Tailscale Serve, for example:
 
 ```sh
-node --experimental-strip-types --test test/*.test.mjs
+PI_REMOTE_HOST=127.0.0.1 pi -e .
+tailscale serve http://127.0.0.1:4317
 ```
 
-`test/config.json` records the model for manual Pi integration testing (`openai/gpt-6-luna`).
+The browser UI lists registered sessions, streams live events, shows streamed thinking collapsed, reads history from the active session branch (read-only, paginated), sends messages, aborts generation, and dispatches available Pi commands. Type `/` in the session input to find commands. Only one instance per session is writable; additional live instances are marked non-writable. The daemon does not modify session files or expose a remote shell. Offline session discovery after daemon restart is not implemented.
 
-## Load
+HTTP API:
 
-Try this checkout:
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Health check |
+| `GET` | `/api/sessions` | List registered sessions |
+| `GET` | `/api/sessions/:sessionId` | Session details |
+| `GET` | `/api/sessions/:sessionId/history?limit=60&before=<entryId>` | Read paginated history |
+| `GET` | `/api/sessions/:sessionId/commands` | Get commands from live Pi |
+| `POST` | `/api/sessions/:sessionId/messages` | Send `{ "text": "..." }` |
+| `POST` | `/api/sessions/:sessionId/abort` | Abort current generation |
+| `POST` | `/api/sessions/:sessionId/commands` | Dispatch `{ "name": "...", "args": "..." }` |
+| WebSocket | `/ws/sessions` | Session list updates |
+| WebSocket | `/ws/sessions/:sessionId` | Session event stream |
+
+Remote command dispatch includes built-in `abort`, `compact`, `thinking`, and `name` controls, as well as commands available in that Pi session. Commands are expanded/dispatched by Pi, not executed by the daemon.
+
+For daemon internals and the wire protocol see [`extensions/daemon/README.md`](extensions/daemon/README.md); the design notes are in [`extensions/daemon/docs/pi-remote-daemon-design.md`](extensions/daemon/docs/pi-remote-daemon-design.md).
+
+## Install and run
+
+Run this checkout:
 
 ```sh
 pi -e .
 ```
 
-Install globally for the current user:
+Install for the current user:
 
 ```sh
-pi install /home/lemonjuice/Projects/pi-extensions
+pi install .
 ```
 
-Or install for one project with `pi install . --local`.
+Or install in the current project only:
+
+```sh
+pi install . --local
+```
+
+## Tests
+
+Run the policy and patch parser/filesystem tests with Node's type stripping:
+
+```sh
+node --experimental-strip-types --test test/*.test.mjs
+```
+
+`test/config.json` records the model used for manual Pi integration testing; it is not needed to run the automated tests.
