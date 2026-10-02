@@ -174,6 +174,22 @@ export default function (pi: ExtensionAPI) {
       : reason;
     const reviewPrompt = `Working directory: ${ctx.cwd}\nIntent: ${intent}\nOperation: ${event.toolName}\nReview trigger (not necessarily a risk finding): ${reviewReason}\nTargets: ${outside.join(", ") || targets.join(", ") || "(command review)"}\nActual operation: ${details}`;
 
+    if (mode === "manual") {
+      if (!ctx.hasUI) return { block: true, reason: `Blocked ${event.toolName}: ${reason} (confirmation unavailable)` };
+      const behavior = event.toolName === "bash"
+        ? `Command: ${String(input.command ?? "").replace(/\s+/g, " ").slice(0, 240)}`
+        : `Target: ${outside.join(", ") || targets.join(", ") || "(not applicable)"}`;
+      const manualPrompt = `Intent: ${intent}\nOperation: ${event.toolName}\n${behavior}\nReview reason: ${reason}`;
+      const choice = await ctx.ui.select(manualPrompt, ["Allow once", "Switch to auto", "Deny"]);
+      if (choice === "Deny" || choice === undefined) {
+        return { block: true, reason: choice === undefined ? "Permission prompt dismissed" : "Blocked by user" };
+      }
+      if (choice === "Switch to auto") {
+        mode = "auto";
+        ctx.ui.notify("Permission mode: auto; reviewing this operation", "info");
+      }
+    }
+
     if (mode === "auto") {
       const model = ctx.model;
       if (!model) return { block: true, reason: "Automatic permission review unavailable: no current model" };
@@ -195,7 +211,7 @@ export default function (pi: ExtensionAPI) {
           messages: [{ role: "user", content: reviewPrompt, timestamp: Date.now() }],
         // Reasoning tokens share maxTokens with the final answer on many providers;
         // a tiny cap can exhaust the response before the reviewer emits its verdict.
-        }, { signal: ctx.signal, timeoutMs: REVIEW_TIMEOUT_MS, maxRetries: 0, maxTokens: 128, temperature: 0, reasoning: "low" }).result();
+        }, { signal: ctx.signal, timeoutMs: REVIEW_TIMEOUT_MS, maxRetries: 5, maxTokens: 128, temperature: 0, reasoning: "low" }).result();
         const reviewerText = review.content.filter((part) => part.type === "text").map((part) => part.text).join("").trim();
         if (!reviewerText) {
           const reasoningTokens = review.usage.reasoning === undefined ? "unknown" : String(review.usage.reasoning);
@@ -208,15 +224,6 @@ export default function (pi: ExtensionAPI) {
         if (verdict !== "APPROVE") return { block: true, reason: `Permission reviewer denied ${event.toolName}: ${reason} (verdict: ${JSON.stringify(verdict.slice(0, 80))})` };
       } catch (error) {
         return { block: true, reason: `Permission review failed; operation blocked: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    } else {
-      if (!ctx.hasUI) return { block: true, reason: `Blocked ${event.toolName}: ${reason} (confirmation unavailable)` };
-      const behavior = event.toolName === "bash"
-        ? `Command: ${String(input.command ?? "").replace(/\s+/g, " ").slice(0, 240)}`
-        : `Target: ${outside.join(", ") || targets.join(", ") || "(not applicable)"}`;
-      const manualPrompt = `Intent: ${intent}\nOperation: ${event.toolName}\n${behavior}\nReview reason: ${reason}\n\nAllow this operation?`;
-      if (!(await ctx.ui.confirm("Permission check", manualPrompt))) {
-        return { block: true, reason: "Blocked by user" };
       }
     }
 
