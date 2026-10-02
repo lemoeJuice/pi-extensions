@@ -79,28 +79,28 @@ export default function (pi: ExtensionAPI) {
               catch (error) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: String(error) })); }
             } else if (msg.type === 'run_command') {
               const args = typeof msg.args === 'string' ? msg.args.trim() : '';
-              if (msg.name === 'abort') { ctx.abort(); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); return; }
-              if (msg.name === 'compact') { ctx.compact(); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); return; }
+              if (msg.name === 'abort') { ctx.abort(); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: 'Stop requested' })); return; }
+              if (msg.name === 'compact') { ctx.compact(); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: 'Compaction requested' })); return; }
               if (msg.name === 'thinking') {
                 if (!['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(args)) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Use /thinking off|minimal|low|medium|high|xhigh|max' })); return; }
-                pi.setThinkingLevel(args as any); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); return;
+                pi.setThinkingLevel(args as any); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: `Thinking level set to ${pi.getThinkingLevel()}` })); return;
               }
               if (msg.name === 'model') {
                 const separator = args.indexOf('/');
                 if (separator < 1 || separator === args.length - 1) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Use /model provider/model-id' })); return; }
                 const selected = ctx.modelRegistry.find(args.slice(0, separator), args.slice(separator + 1));
                 if (!selected) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: `Unknown model: ${args}` })); return; }
-                try { if (!await pi.setModel(selected)) throw new Error('Authentication is not configured for this model'); model = `${selected.provider}/${selected.id}`; sendMetadata(ctx); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); }
+                try { if (!await pi.setModel(selected)) throw new Error('Authentication is not configured for this model'); model = `${selected.provider}/${selected.id}`; sendMetadata(ctx); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: `Model set to ${model}` })); }
                 catch (error) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: String(error) })); }
                 return;
               }
               if (msg.name === 'name') {
                 if (!args) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Session name is required' })); return; }
-                pi.setSessionName(args); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); return;
+                pi.setSessionName(args); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: `Session name set to ${args}` })); return;
               }
               const available = pi.getCommands().some(command => command.name === msg.name);
               if (!available) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Command is not available in this Pi session' })); return; }
-              try { await pi.sendUserMessage(`/${msg.name}${args ? ` ${args}` : ''}`, { deliverAs: 'steer', expandPromptTemplates: true }); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId })); }
+              try { await pi.sendUserMessage(`/${msg.name}${args ? ` ${args}` : ''}`, { deliverAs: 'steer', expandPromptTemplates: true }); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: `Dispatched /${msg.name} to Pi` })); }
               catch (error) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: String(error) })); }
             }
           });

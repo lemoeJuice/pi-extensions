@@ -58,7 +58,7 @@ const server = http.createServer((req, res) => {
       if (typeof value.name !== 'string' || !/^[\w:-]+$/.test(value.name) || (value.args !== undefined && typeof value.args !== 'string')) return json(400, { error: 'Invalid command' });
       const requestId = require('node:crypto').randomUUID();
       return registry.request(decodeURIComponent(command[1]), { type: 'run_command', requestId, name: value.name, args: value.args || '' }, 10000)
-        .then(result => json(result.error ? 409 : 202, result.error ? result : { ok: true }));
+        .then(result => json(result.error ? 409 : 202, result.error ? result : { ok: true, result: result.result || 'Command accepted by Pi' }));
     }); return;
   }
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/s/'))) {
@@ -91,7 +91,7 @@ wss.on('connection', (ws, req) => {
         registry.resolveRequest(msg.requestId, { commands });
         registry.broadcastList();
       }
-      else if ((msg.type === 'request_ack' || msg.type === 'request_error') && typeof msg.requestId === 'string') registry.resolveRequest(msg.requestId, msg.type === 'request_error' ? { error: msg.error || 'Pi rejected the command' } : { ok: true });
+      else if ((msg.type === 'request_ack' || msg.type === 'request_error') && typeof msg.requestId === 'string') registry.resolveRequest(msg.requestId, msg.type === 'request_error' ? { error: msg.error || 'Pi rejected the command' } : { ok: true, result: msg.result });
       else if (msg.type === 'event' && Number.isSafeInteger(msg.seq)) registry.event(registered.sessionId, registered.instanceId, { seq: msg.seq, timestamp: Number(msg.timestamp) || Date.now(), type: msg.event?.type || 'event', event: msg.event });
       else if (msg.type === 'status' && ['idle','running','waiting','error'].includes(msg.status)) { const s=registry.sessions.get(registered.sessionId); const i=s?.instances.get(registered.instanceId); if(i)i.status=msg.status; registry.broadcastList(); }
     });

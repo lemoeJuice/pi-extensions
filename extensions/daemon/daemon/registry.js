@@ -89,7 +89,7 @@ class Registry {
     const instance = [...s.instances.values()].find(i => i.writable && i.ws.readyState === 1);
     if (!instance) return Promise.resolve({ error: s.instances.size ? 'Session has no writable instance (conflict)' : 'Session is offline' });
     return new Promise(resolve => {
-      const timer = setTimeout(() => { this.pendingRequests.delete(message.requestId); resolve({ error: 'Pi command list request timed out' }); }, timeoutMs);
+      const timer = setTimeout(() => { this.pendingRequests.delete(message.requestId); resolve({ error: 'Pi request timed out' }); }, timeoutMs);
       this.pendingRequests.set(message.requestId, { resolve, timer });
       try { instance.ws.send(JSON.stringify(message)); }
       catch (error) { clearTimeout(timer); this.pendingRequests.delete(message.requestId); resolve({ error: String(error) }); }
