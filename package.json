@@ -9,7 +9,10 @@
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
   "pi": {
-    "extensions": ["./extensions/permissions/index.ts", "./extensions/edit/index.ts"]
+    "extensions": ["./extensions/permissions/index.ts", "./extensions/edit/index.ts", "./extensions/daemon/index.ts"]
   }
 }
