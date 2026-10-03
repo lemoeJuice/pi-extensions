@@ -29,3 +29,12 @@ test("declines remote approval delivery when no session page is connected", () =
   assert.equal(registry.approvalRequest("s", "pi-1", { requestId: "approval-2" }), false);
   assert.equal(registry.sessions.get("s").approvals.size, 0);
 });
+
+test("notifies a session page that opened before its Pi instance registered", () => {
+  const registry = new Registry();
+  const browser = socket();
+  registry.clients.add({ ws: browser, sessionId: "s" });
+  registry.register(socket(), { sessionId: "s", instanceId: "pi-1", pid: 1, cwd: "/tmp" });
+  assert.equal(browser.frames.at(-1).type, "session_available");
+  assert.equal(browser.frames.at(-1).sessionId, "s");
+});

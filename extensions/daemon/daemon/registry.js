@@ -21,6 +21,8 @@ class Registry {
     session.metadata = instance.metadata || session.metadata;
     session.lastActivityAt = Date.now();
     this.broadcastList();
+    const available = JSON.stringify({ type: 'session_available', sessionId: instance.sessionId });
+    for (const client of this.clients) if (client.sessionId === instance.sessionId && client.ws.readyState === 1) client.ws.send(available);
     return { writable: instance.writable, conflict };
   }
   unregister(sessionId, instanceId) {

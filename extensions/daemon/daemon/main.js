@@ -108,6 +108,10 @@ wss.on('connection', (ws, req) => {
         const delivered = registry.approvalRequest(registered.sessionId, registered.instanceId, msg);
         ws.send(JSON.stringify({ type: 'approval_delivery', requestId: msg.requestId, delivered }));
       }
+      else if (msg.type === 'approval_cancel' && typeof msg.requestId === 'string' && ['Allow once', 'Switch to auto', 'Deny'].includes(msg.choice)) {
+        const result = registry.respondApproval(registered.sessionId, msg.requestId, msg.choice);
+        if (result.error) ws.send(JSON.stringify({ type: 'approval_cancel_error', requestId: msg.requestId, error: result.error }));
+      }
       else if (msg.type === 'event' && Number.isSafeInteger(msg.seq)) registry.event(registered.sessionId, registered.instanceId, { seq: msg.seq, timestamp: Number(msg.timestamp) || Date.now(), type: msg.event?.type || 'event', event: msg.event });
       else if (msg.type === 'status' && ['idle','running','waiting','error'].includes(msg.status)) { const s=registry.sessions.get(registered.sessionId); const i=s?.instances.get(registered.instanceId); if(i)i.status=msg.status; registry.broadcastList(); }
     });
@@ -124,6 +128,7 @@ wss.on('connection', (ws, req) => {
   if (!sessionId) return ws.close(1008);
   const client = { ws, sessionId }; registry.clients.add(client);
   const state = registry.sessions.get(sessionId);
+  if (state) ws.send(JSON.stringify({ type: 'session_available', sessionId }));
   for (const approval of state?.approvals.values() || []) ws.send(JSON.stringify(approval.payload));
   ws.on('close', () => registry.clients.delete(client));
 });

@@ -87,6 +87,7 @@ async function ensureDaemon() {
 export default function (pi: ExtensionAPI) {
   let socket: WebSocket | undefined;
   let stopped = false;
+  let connectionGeneration = 0;
   let seq = 0;
   let retry = 1000;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -98,7 +99,7 @@ export default function (pi: ExtensionAPI) {
   let streamCounter = 0;
   let currentStreamId: string | undefined;
   const pendingRemoteMessages: Array<{ requestId: string; text: string }> = [];
-  const pendingApprovals = new Map<string, { request: any; delivered: boolean }>();
+  const pendingApprovals = new Map<string, { request: any; delivered: boolean; cancelChoice?: string; generation: number }>();
   const pendingCommandResults = new Map<string, Array<(result: string) => void>>();
 
   pi.events.on('pi-remote:command-result', (result: any) => {
@@ -127,7 +128,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.events.on('pi-remote:approval-request', (request: any) => {
     if (socket?.readyState !== WebSocket.OPEN || typeof request?.requestId !== 'string') { request?.onUnavailable?.(); return; }
-    pendingApprovals.set(request.requestId, { request, delivered: false });
+    pendingApprovals.set(request.requestId, { request, delivered: false, generation: connectionGeneration });
     try {
       socket.send(JSON.stringify({ type: 'approval_request', requestId: request.requestId, toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior }));
     } catch {
@@ -136,7 +137,21 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.events.on('pi-remote:approval-cancel', (response: any) => {
+    const pending = pendingApprovals.get(response?.requestId);
+    if (!pending || !['Allow once', 'Switch to auto', 'Deny'].includes(response?.choice)) return;
+    pending.cancelChoice = response.choice;
+    if (pending.delivered && socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'approval_cancel', requestId: response.requestId, choice: response.choice }));
+    }
+  });
+
   pi.on('session_start', async (_event, ctx) => {
+    const generation = ++connectionGeneration;
+    try { socket?.close(); } catch { /* ignore stale connection close */ }
+    socket = undefined;
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = undefined;
     stopped = false; seq = 0; retry = 1000; streamCounter = 0; currentStreamId = undefined;
     cwd = ctx.cwd;
     sessionFile = ctx.sessionManager.getSessionFile();
@@ -144,19 +159,23 @@ export default function (pi: ExtensionAPI) {
     instanceId = `${process.pid}-${randomUUID().slice(0, 8)}`;
     const activeModel = ctx.model;
     model = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
-    void connect(ctx);
+    void connect(ctx, generation);
   });
 
-  async function connect(ctx: any) {
-    while (!stopped) {
+  async function connect(ctx: any, generation: number) {
+    while (!stopped && generation === connectionGeneration) {
       try {
         await ensureDaemon();
-        if (stopped) break;
+        if (stopped || generation !== connectionGeneration) break;
         await new Promise<void>((resolve, reject) => {
           const ws = new WebSocket(wsUrl); socket = ws;
           let registered = false;
-          ws.on('open', () => ws.send(JSON.stringify({ type: 'register', instance: { instanceId, sessionId, pid: process.pid, cwd, model, title: undefined, startedAt: Date.now(), sessionFile, leafId: ctx.sessionManager.getLeafId(), metadata: collectMetadata(ctx), commands: [...remoteCommands, ...pi.getCommands().map(({ name, description, source }) => ({ name, description, source }))] } })));
+          ws.on('open', () => {
+            if (generation !== connectionGeneration) { ws.close(); return; }
+            ws.send(JSON.stringify({ type: 'register', instance: { instanceId, sessionId, pid: process.pid, cwd, model, title: undefined, startedAt: Date.now(), sessionFile, leafId: ctx.sessionManager.getLeafId(), metadata: collectMetadata(ctx), commands: [...remoteCommands, ...pi.getCommands().map(({ name, description, source }) => ({ name, description, source }))] } }));
+          });
           ws.on('message', async data => {
+            if (generation !== connectionGeneration) return;
             let msg: any; try { msg = JSON.parse(data.toString()); } catch { return; }
             if (msg.type === 'registered') {
               registered = true; retry = 1000;
@@ -164,13 +183,21 @@ export default function (pi: ExtensionAPI) {
             } else if (msg.type === 'approval_delivery') {
               const pending = pendingApprovals.get(msg.requestId);
               if (!pending) return;
-              if (msg.delivered) { pending.delivered = true; pending.request.onDelivered?.(); }
+              if (msg.delivered) {
+                pending.delivered = true; pending.request.onDelivered?.();
+                if (pending.cancelChoice) ws.send(JSON.stringify({ type: 'approval_cancel', requestId: msg.requestId, choice: pending.cancelChoice }));
+              }
               else { pendingApprovals.delete(msg.requestId); pending.request.onUnavailable?.(); }
             } else if (msg.type === 'approval_choice') {
               const pending = pendingApprovals.get(msg.requestId);
               if (!pending) return;
               pendingApprovals.delete(msg.requestId);
               pending.request.respond?.(msg.choice);
+            } else if (msg.type === 'approval_cancel_error') {
+              const pending = pendingApprovals.get(msg.requestId);
+              if (!pending) return;
+              pendingApprovals.delete(msg.requestId);
+              pending.request.respond?.(pending.cancelChoice || 'Deny');
             } else if (msg.type === 'get_commands') {
               const commands = [...remoteCommands, ...pi.getCommands().map(({ name, description, source }) => ({ name, description, source }))];
               ws.send(JSON.stringify({ type: 'commands', requestId: msg.requestId, commands }));
@@ -221,8 +248,10 @@ export default function (pi: ExtensionAPI) {
           });
           ws.on('error', reject);
           ws.on('close', () => {
-            if (heartbeat) clearInterval(heartbeat); heartbeat = undefined;
+            if (socket === ws) socket = undefined;
+            if (generation === connectionGeneration) { if (heartbeat) clearInterval(heartbeat); heartbeat = undefined; }
             for (const [requestId, pending] of pendingApprovals) {
+              if (pending.generation !== generation) continue;
               pendingApprovals.delete(requestId);
               if (pending.delivered) pending.request.respond?.('Deny');
               else pending.request.onUnavailable?.();
@@ -231,7 +260,7 @@ export default function (pi: ExtensionAPI) {
           });
         });
       } catch { /* Remote control is optional; keep Pi running and retry. */ }
-      if (stopped) return;
+      if (stopped || generation !== connectionGeneration) return;
       await new Promise(r => setTimeout(r, retry)); retry = Math.min(retry * 2, 30000);
     }
   }
@@ -312,7 +341,8 @@ export default function (pi: ExtensionAPI) {
   pi.on('tool_execution_update', event => sendEvent({ type: 'tool_execution_update', ...event }));
   pi.on('tool_execution_end', event => sendEvent({ type: 'tool_execution_end', ...event }));
   pi.on('session_shutdown', async () => {
-    stopped = true; if (heartbeat) clearInterval(heartbeat);
+    stopped = true; connectionGeneration++; if (heartbeat) clearInterval(heartbeat); heartbeat = undefined;
     try { socket?.close(); } catch { /* ignored */ }
+    socket = undefined;
   });
 }
