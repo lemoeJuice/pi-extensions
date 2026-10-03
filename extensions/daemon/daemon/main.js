@@ -6,8 +6,10 @@ const path = require('node:path');
 const { WebSocketServer, WebSocket } = require('ws');
 const { Registry } = require('./registry');
 const { findSessionFile, readHistory } = require('./history');
+const { getDaemonVersion } = require('./version');
 const host = process.env.PI_REMOTE_HOST || '100.64.209.124';
 const port = Number(process.env.PI_REMOTE_PORT || 4317);
+const daemonVersion = getDaemonVersion();
 const registry = new Registry();
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -15,7 +17,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' }); return res.end(); }
   const json = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(body)); };
-  if (url.pathname === '/health') return json(200, { ok: true });
+  if (url.pathname === '/health') return json(200, { ok: true, daemonVersion, pid: process.pid });
   if (req.method === 'GET' && url.pathname === '/api/sessions') return json(200, registry.list().map(({ events, activeEvents, ...s }) => s));
   const history = url.pathname.match(/^\/api\/sessions\/([^/]+)\/history$/);
   if (req.method === 'GET' && history) {
@@ -112,3 +114,20 @@ wss.on('connection', (ws, req) => {
 function validInstance(i) { return i && typeof i.instanceId === 'string' && typeof i.sessionId === 'string' && Number.isInteger(i.pid) && typeof i.cwd === 'string'; }
 server.listen(port, host, () => console.log(`[daemon] listening on ${host}:${port}`));
 server.on('error', e => { console.error(`[daemon] ${e.message}`); process.exitCode = 1; });
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[daemon] shutting down on ${signal}`);
+  for (const client of wss.clients) {
+    try { client.close(1012, 'Pi Remote daemon restarting'); } catch { client.terminate(); }
+  }
+  const forceClose = setTimeout(() => {
+    for (const client of wss.clients) client.terminate();
+    server.closeAllConnections?.();
+  }, 1000);
+  forceClose.unref();
+  server.close(() => clearTimeout(forceClose));
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

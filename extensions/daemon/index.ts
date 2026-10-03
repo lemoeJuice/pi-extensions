@@ -1,10 +1,13 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readdirSync, readFileSync, readlinkSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import WebSocket from 'ws';
+import { getDaemonVersion } from './daemon/version.js';
 
 const daemonPath = resolve(__dirname, 'daemon/main.js');
+const daemonVersion = getDaemonVersion();
 const port = Number(process.env.PI_REMOTE_PORT || 4317);
 const host = process.env.PI_REMOTE_HOST || '100.64.209.124';
 const httpUrl = `http://${host}:${port}`;
@@ -17,13 +20,66 @@ const remoteCommands = [
   { name: 'name', description: 'Set the session display name', source: 'remote', requiresArgs: true },
 ];
 
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function daemonHealth(): Promise<any | undefined> {
+  try {
+    const response = await fetch(`${httpUrl}/health`, { signal: AbortSignal.timeout(800) });
+    if (response.ok) return await response.json();
+  } catch { /* daemon is not listening */ }
+  return undefined;
+}
+
+function findLocalDaemonPid(): number | undefined {
+  if (process.platform !== 'linux') return undefined;
+  const octets = host.split('.').map(Number);
+  if (octets.length !== 4 || octets.some(value => !Number.isInteger(value) || value < 0 || value > 255)) return undefined;
+  const expectedAddress = octets.reverse().map(value => value.toString(16).padStart(2, '0')).join('').toUpperCase();
+  const listenerInodes = new Set<string>();
+  try {
+    for (const line of readFileSync('/proc/net/tcp', 'utf8').split('\n').slice(1)) {
+      const fields = line.trim().split(/\s+/);
+      const [address, hexPort] = (fields[1] || '').split(':');
+      if (fields[3] === '0A' && Number.parseInt(hexPort, 16) === port && (address === expectedAddress || address === '00000000')) listenerInodes.add(fields[9]);
+    }
+  } catch { return undefined; }
+  if (!listenerInodes.size) return undefined;
+  let pids: string[];
+  try { pids = readdirSync('/proc').filter(name => /^\d+$/.test(name)); } catch { return undefined; }
+  for (const pid of pids) {
+    try {
+      const commandLine = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+      if (!commandLine.includes(daemonPath)) continue;
+      for (const fd of readdirSync(`/proc/${pid}/fd`)) {
+        const target = readlinkSync(`/proc/${pid}/fd/${fd}`).match(/^socket:\[(\d+)\]$/)?.[1];
+        if (target && listenerInodes.has(target)) return Number(pid);
+      }
+    } catch { /* process exited or procfs access denied */ }
+  }
+  return undefined;
+}
+
+async function stopStaleDaemon() {
+  const pid = findLocalDaemonPid();
+  if (!pid) throw new Error(`Pi Remote daemon at ${host}:${port} is outdated, but its local process could not be identified safely`);
+  try { process.kill(pid, 'SIGTERM'); }
+  catch (error: any) { if (error?.code !== 'ESRCH') throw error; }
+  for (let n = 0; n < 32; n++) {
+    await sleep(200);
+    if (!(await daemonHealth())) return;
+  }
+  throw new Error(`Outdated Pi Remote daemon process ${pid} did not stop`);
+}
+
 async function ensureDaemon() {
-  try { const r = await fetch(`${httpUrl}/health`, { signal: AbortSignal.timeout(800) }); if (r.ok) return; } catch { /* start below */ }
+  const current = await daemonHealth();
+  if (current?.daemonVersion === daemonVersion) return;
+  if (current?.ok) await stopStaleDaemon();
   const child = spawn(process.execPath, [daemonPath], { detached: true, stdio: 'ignore', env: process.env });
   child.unref();
   for (let n = 0; n < 30; n++) {
-    await new Promise(r => setTimeout(r, 250));
-    try { const r = await fetch(`${httpUrl}/health`, { signal: AbortSignal.timeout(500) }); if (r.ok) return; } catch { /* retry */ }
+    await sleep(250);
+    if ((await daemonHealth())?.daemonVersion === daemonVersion) return;
   }
   throw new Error('Pi Remote daemon did not become available');
 }

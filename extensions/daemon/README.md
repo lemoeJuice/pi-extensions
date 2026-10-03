@@ -20,8 +20,14 @@ to localhost and expose it through Tailscale Serve:
 PI_REMOTE_HOST=127.0.0.1 tailscale serve http://127.0.0.1:4317
 ```
 
-You can also start the daemon manually with `node
-extensions/daemon/daemon/main.js`. It remains alive after Pi exits. For sessions
+When a new Pi process connects, the extension compares the running daemon's
+build fingerprint with the local daemon files. If they differ, it sends the
+outdated local daemon `SIGTERM`, waits for it to release the configured address,
+and starts the matching version. The daemon closes WebSocket clients cleanly
+when it receives `SIGTERM`; connected Pi extensions reconnect automatically.
+This replacement is limited to a daemon process on this machine listening on
+the configured IPv4 address and port. You can also start the daemon manually
+with `node extensions/daemon/daemon/main.js`. It remains alive after Pi exits. For sessions
 registered while the daemon is running, the session page reads the active branch
 from Pi's JSONL file (read-only) and loads older messages in pages. Offline
 session discovery after a daemon restart is not implemented.
@@ -50,5 +56,6 @@ instances are marked non-writable to avoid duplicate input delivery.
 The session page renders streamed thinking in a collapsed section, pages
 read-only history from the registered session's active branch, and swaps the
 Send button for Stop while Pi is generating. Type `/` to filter available
-commands; selecting one completes it in the input. Commands are dispatched back
-through Pi's extension/prompt command expansion rather than executed by the daemon.
+commands; selecting one opens a dialog to edit its arguments and apply it.
+Commands are dispatched back through Pi's extension/prompt command expansion
+rather than executed by the daemon.
