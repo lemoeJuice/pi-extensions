@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { isPathWithinWorkingDirectory, patchPaths } from "../edit/lib/codex-apply-patch.ts";
@@ -7,6 +8,37 @@ import { analyzeBashCommand } from "./lib/bash-policy.ts";
 
 const REVIEW_TIMEOUT_MS = 15_000;
 type PermissionMode = "manual" | "auto";
+type ManualChoice = "Allow once" | "Switch to auto" | "Deny";
+
+async function selectPermissionChoice(pi: ExtensionAPI, ctx: any, request: { toolName: string; intent: string; reason: string; behavior: string }): Promise<ManualChoice | undefined> {
+  let markAvailable!: (available: boolean) => void;
+  let choose!: (choice: ManualChoice) => void;
+  let availabilitySettled = false;
+  const available = new Promise<boolean>(resolve => { markAvailable = resolve; });
+  const remoteChoice = new Promise<ManualChoice>(resolve => { choose = resolve; });
+  const resolveAvailability = (value: boolean) => {
+    if (availabilitySettled) return;
+    availabilitySettled = true;
+    markAvailable(value);
+  };
+  const availabilityTimeout = setTimeout(() => resolveAvailability(false), 700);
+  const requestId = randomUUID();
+  pi.events.emit("pi-remote:approval-request", {
+    ...request,
+    requestId,
+    onDelivered: () => { clearTimeout(availabilityTimeout); resolveAvailability(true); },
+    onUnavailable: () => { clearTimeout(availabilityTimeout); resolveAvailability(false); },
+    respond: (choice: ManualChoice) => choose(choice),
+  });
+  if (await available) {
+    return Promise.race([
+      remoteChoice,
+      new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 120_000)),
+    ]);
+  }
+  if (!ctx.hasUI) return undefined;
+  return ctx.ui.select(`${request.intent}\nOperation: ${request.toolName}\n${request.behavior}\nReview reason: ${request.reason}`, ["Allow once", "Switch to auto", "Deny"]);
+}
 
 function requireIntent(value: unknown, toolName: string): string {
   const intent = typeof value === "string" ? value.trim() : "";
@@ -109,11 +141,17 @@ export default function (pi: ExtensionAPI) {
       const requested = args.trim().toLowerCase();
       if (requested === "manual" || requested === "auto") {
         mode = requested;
-        ctx.ui.notify(`Permission mode: ${mode}`, "info");
+        const result = `Permission mode: ${mode}`;
+        ctx.ui.notify(result, "info");
+        pi.events.emit("pi-remote:command-result", { name: "permissions", result });
       } else if (requested) {
-        ctx.ui.notify("Usage: /permissions [manual|auto]", "warning");
+        const result = "Usage: /permissions [manual|auto]";
+        ctx.ui.notify(result, "warning");
+        pi.events.emit("pi-remote:command-result", { name: "permissions", result });
       } else {
-        ctx.ui.notify(`Permission mode: ${mode}`, "info");
+        const result = `Permission mode: ${mode}`;
+        ctx.ui.notify(result, "info");
+        pi.events.emit("pi-remote:command-result", { name: "permissions", result });
       }
     },
   });
@@ -175,12 +213,10 @@ export default function (pi: ExtensionAPI) {
     const reviewPrompt = `Working directory: ${ctx.cwd}\nIntent: ${intent}\nOperation: ${event.toolName}\nReview trigger (not necessarily a risk finding): ${reviewReason}\nTargets: ${outside.join(", ") || targets.join(", ") || "(command review)"}\nActual operation: ${details}`;
 
     if (mode === "manual") {
-      if (!ctx.hasUI) return { block: true, reason: `Blocked ${event.toolName}: ${reason} (confirmation unavailable)` };
       const behavior = event.toolName === "bash"
         ? `Command: ${String(input.command ?? "").replace(/\s+/g, " ").slice(0, 240)}`
         : `Target: ${outside.join(", ") || targets.join(", ") || "(not applicable)"}`;
-      const manualPrompt = `Intent: ${intent}\nOperation: ${event.toolName}\n${behavior}\nReview reason: ${reason}`;
-      const choice = await ctx.ui.select(manualPrompt, ["Allow once", "Switch to auto", "Deny"]);
+      const choice = await selectPermissionChoice(pi, ctx, { toolName: event.toolName, intent, behavior, reason });
       if (choice === "Deny" || choice === undefined) {
         return { block: true, reason: choice === undefined ? "Permission prompt dismissed" : "Blocked by user" };
       }

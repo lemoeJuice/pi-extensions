@@ -98,6 +98,43 @@ export default function (pi: ExtensionAPI) {
   let streamCounter = 0;
   let currentStreamId: string | undefined;
   const pendingRemoteMessages: Array<{ requestId: string; text: string }> = [];
+  const pendingApprovals = new Map<string, { request: any; delivered: boolean }>();
+  const pendingCommandResults = new Map<string, Array<(result: string) => void>>();
+
+  pi.events.on('pi-remote:command-result', (result: any) => {
+    if (typeof result?.name !== 'string' || typeof result?.result !== 'string') return;
+    const waiters = pendingCommandResults.get(result.name);
+    const resolve = waiters?.shift();
+    if (resolve) resolve(result.result);
+    if (waiters && !waiters.length) pendingCommandResults.delete(result.name);
+  });
+
+  function waitForCommandResult(name: string, timeoutMs = 1500): Promise<string | undefined> {
+    return new Promise(resolve => {
+      const waiters = pendingCommandResults.get(name) || [];
+      const done = (result?: string) => {
+        clearTimeout(timer);
+        const index = waiters.indexOf(done as (result: string) => void);
+        if (index >= 0) waiters.splice(index, 1);
+        if (!waiters.length) pendingCommandResults.delete(name);
+        resolve(result);
+      };
+      const timer = setTimeout(() => done(), timeoutMs);
+      waiters.push(done as (result: string) => void);
+      pendingCommandResults.set(name, waiters);
+    });
+  }
+
+  pi.events.on('pi-remote:approval-request', (request: any) => {
+    if (socket?.readyState !== WebSocket.OPEN || typeof request?.requestId !== 'string') { request?.onUnavailable?.(); return; }
+    pendingApprovals.set(request.requestId, { request, delivered: false });
+    try {
+      socket.send(JSON.stringify({ type: 'approval_request', requestId: request.requestId, toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior }));
+    } catch {
+      pendingApprovals.delete(request.requestId);
+      request.onUnavailable?.();
+    }
+  });
 
   pi.on('session_start', async (_event, ctx) => {
     stopped = false; seq = 0; retry = 1000; streamCounter = 0; currentStreamId = undefined;
@@ -124,6 +161,16 @@ export default function (pi: ExtensionAPI) {
             if (msg.type === 'registered') {
               registered = true; retry = 1000;
               heartbeat = setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'heartbeat', timestamp: Date.now() })); }, 10000);
+            } else if (msg.type === 'approval_delivery') {
+              const pending = pendingApprovals.get(msg.requestId);
+              if (!pending) return;
+              if (msg.delivered) { pending.delivered = true; pending.request.onDelivered?.(); }
+              else { pendingApprovals.delete(msg.requestId); pending.request.onUnavailable?.(); }
+            } else if (msg.type === 'approval_choice') {
+              const pending = pendingApprovals.get(msg.requestId);
+              if (!pending) return;
+              pendingApprovals.delete(msg.requestId);
+              pending.request.respond?.(msg.choice);
             } else if (msg.type === 'get_commands') {
               const commands = [...remoteCommands, ...pi.getCommands().map(({ name, description, source }) => ({ name, description, source }))];
               ws.send(JSON.stringify({ type: 'commands', requestId: msg.requestId, commands }));
@@ -156,12 +203,32 @@ export default function (pi: ExtensionAPI) {
               }
               const available = pi.getCommands().some(command => command.name === msg.name);
               if (!available) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Command is not available in this Pi session' })); return; }
-              try { await pi.sendUserMessage(`/${msg.name}${args ? ` ${args}` : ''}`, { deliverAs: 'steer', expandPromptTemplates: true }); ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: `Dispatched /${msg.name} to Pi` })); }
+              try {
+                const commandResult = msg.name === 'permissions' ? waitForCommandResult(msg.name) : undefined;
+                await pi.sendUserMessage(`/${msg.name}${args ? ` ${args}` : ''}`, { deliverAs: 'steer', expandPromptTemplates: true });
+                if (msg.name === 'fast') {
+                  await sleep(100);
+                  sendMetadata(ctx);
+                  const fastMode = fastModeState();
+                  ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: fastMode === undefined ? 'Fast mode status is unavailable for this session' : `Fast mode is ${fastMode ? 'on' : 'off'}` }));
+                } else {
+                  const result = commandResult ? await commandResult : undefined;
+                  ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: result || `Dispatched /${msg.name} to Pi; this command did not return text` }));
+                }
+              }
               catch (error) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: String(error) })); }
             }
           });
           ws.on('error', reject);
-          ws.on('close', () => { if (heartbeat) clearInterval(heartbeat); heartbeat = undefined; if (registered) reject(new Error('daemon disconnected')); else reject(new Error('connection closed')); });
+          ws.on('close', () => {
+            if (heartbeat) clearInterval(heartbeat); heartbeat = undefined;
+            for (const [requestId, pending] of pendingApprovals) {
+              pendingApprovals.delete(requestId);
+              if (pending.delivered) pending.request.respond?.('Deny');
+              else pending.request.onUnavailable?.();
+            }
+            if (registered) reject(new Error('daemon disconnected')); else reject(new Error('connection closed'));
+          });
         });
       } catch { /* Remote control is optional; keep Pi running and retry. */ }
       if (stopped) return;
@@ -170,6 +237,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   function sendStatus(status: string) { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'status', status })); }
+  function fastModeState(): boolean | undefined {
+    if (!pi.getCommands().some(command => command.name === 'fast')) return undefined;
+    const segments = (globalThis as any)[Symbol.for('@pi-plugins/statusline-registry')];
+    if (!(segments instanceof Map)) return undefined;
+    return segments.get('fast-mode')?.text === '[fast mode]';
+  }
   function collectMetadata(ctx: any) {
     const totals = { input: 0, cacheRead: 0, output: 0 };
     for (const entry of ctx.sessionManager.getBranch()) {
@@ -180,7 +253,7 @@ export default function (pi: ExtensionAPI) {
       totals.output += Number(usage.output) || 0;
     }
     const activeModel = ctx.model;
-    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), contextUsage: ctx.getContextUsage(), totals };
+    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), fastMode: fastModeState(), contextUsage: ctx.getContextUsage(), totals };
   }
   function sendMetadata(ctx: any) {
     if (socket?.readyState === WebSocket.OPEN) sendEvent({ type: 'metadata', metadata: collectMetadata(ctx) });
@@ -204,6 +277,8 @@ export default function (pi: ExtensionAPI) {
         delta: 'delta' in update ? update.delta : undefined,
         content: 'content' in update ? update.content : undefined,
         thinking: 'thinking' in update ? update.thinking : undefined,
+        reason: update.type === 'error' ? update.reason : undefined,
+        error: update.type === 'error' ? { message: update.error.errorMessage, stopReason: update.error.stopReason } : undefined,
         toolCall: 'toolCall' in update ? update.toolCall : undefined,
         message: 'message' in update ? update.message : undefined,
       },
@@ -224,11 +299,15 @@ export default function (pi: ExtensionAPI) {
       const index = pendingRemoteMessages.findIndex(item => item.text === text);
       if (index >= 0) requestId = pendingRemoteMessages.splice(index, 1)[0].requestId;
     }
-    sendEvent({ type: 'message_end', entryId: ctx.sessionManager.getLeafId(), streamId: message.role === 'assistant' ? currentStreamId : undefined, requestId, message: { role: message.role, content } });
+    sendEvent({ type: 'message_end', entryId: ctx.sessionManager.getLeafId(), streamId: message.role === 'assistant' ? currentStreamId : undefined, requestId, message: { role: message.role, content, stopReason: message.stopReason, errorMessage: message.errorMessage } });
     if (message.role === 'assistant') sendMetadata(ctx);
     if (message.role === 'assistant') currentStreamId = undefined;
   });
   pi.on('thinking_level_select', (_event, ctx) => sendMetadata(ctx));
+  pi.on('model_select', (_event, ctx) => sendMetadata(ctx));
+  pi.on('input', (event, ctx) => {
+    if (/^\/fast(?:\s|$)/i.test(event.text.trim())) setTimeout(() => sendMetadata(ctx), 100);
+  });
   pi.on('tool_execution_start', event => sendEvent({ type: 'tool_execution_start', ...event }));
   pi.on('tool_execution_update', event => sendEvent({ type: 'tool_execution_update', ...event }));
   pi.on('tool_execution_end', event => sendEvent({ type: 'tool_execution_end', ...event }));

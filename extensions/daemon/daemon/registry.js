@@ -5,7 +5,7 @@ class Registry {
   register(ws, instance) {
     let session = this.sessions.get(instance.sessionId);
     if (!session) {
-      session = { sessionId: instance.sessionId, cwd: instance.cwd, model: instance.model, title: instance.title, metadata: instance.metadata, instances: new Map(), events: [], lastActivityAt: Date.now() };
+      session = { sessionId: instance.sessionId, cwd: instance.cwd, model: instance.model, title: instance.title, metadata: instance.metadata, instances: new Map(), approvals: new Map(), events: [], lastActivityAt: Date.now() };
       this.sessions.set(instance.sessionId, session);
     }
     session.sessionFile = instance.sessionFile || session.sessionFile;
@@ -25,6 +25,12 @@ class Registry {
   }
   unregister(sessionId, instanceId) {
     const s = this.sessions.get(sessionId); if (!s) return;
+    for (const [requestId, approval] of s.approvals) {
+      if (approval.instanceId !== instanceId) continue;
+      clearTimeout(approval.timer);
+      s.approvals.delete(requestId);
+      this.broadcastApprovalResolved(sessionId, requestId);
+    }
     s.instances.delete(instanceId);
     if (s.instances.size === 0) {
       this.sessions.delete(sessionId);
@@ -95,6 +101,36 @@ class Registry {
       catch (error) { clearTimeout(timer); this.pendingRequests.delete(message.requestId); resolve({ error: String(error) }); }
     });
   }
+  approvalRequest(sessionId, instanceId, request) {
+    const s = this.sessions.get(sessionId);
+    const instance = s?.instances.get(instanceId);
+    if (!s || !instance || !request?.requestId) return false;
+    const clients = [...this.clients].filter(client => client.sessionId === sessionId && client.ws.readyState === 1);
+    if (!clients.length) return false;
+    const payload = { type: 'approval_request', sessionId, requestId: request.requestId, toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior, timestamp: Date.now() };
+    const timer = setTimeout(() => this.respondApproval(sessionId, requestIdSafe(request.requestId), 'Deny'), 120000);
+    s.approvals.set(request.requestId, { instanceId, timer, payload });
+    for (const client of clients) client.ws.send(JSON.stringify(payload));
+    return true;
+  }
+  respondApproval(sessionId, requestId, choice) {
+    const s = this.sessions.get(sessionId);
+    const approval = s?.approvals.get(requestId);
+    const instance = approval && s.instances.get(approval.instanceId);
+    if (!s || !approval || !instance || instance.ws.readyState !== 1) return { error: 'Approval request is no longer active' };
+    clearTimeout(approval.timer);
+    s.approvals.delete(requestId);
+    try {
+      instance.ws.send(JSON.stringify({ type: 'approval_choice', requestId, choice }));
+      this.broadcastApprovalResolved(sessionId, requestId);
+    }
+    catch (error) { return { error: String(error) }; }
+    return {};
+  }
+  broadcastApprovalResolved(sessionId, requestId) {
+    const frame = JSON.stringify({ type: 'approval_resolved', sessionId, requestId });
+    for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(frame);
+  }
   resolveRequest(requestId, result) {
     const pending = this.pendingRequests.get(requestId); if (!pending) return;
     clearTimeout(pending.timer); this.pendingRequests.delete(requestId); pending.resolve(result);
@@ -105,4 +141,5 @@ class Registry {
   }
 }
 function rank(status) { return ({ waiting: 0, running: 1, idle: 2, error: 3, conflict: 4, offline: 5 })[status] ?? 6; }
+function requestIdSafe(value) { return typeof value === 'string' ? value : ''; }
 module.exports = { Registry };

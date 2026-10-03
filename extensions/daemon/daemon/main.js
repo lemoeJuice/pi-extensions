@@ -63,6 +63,16 @@ const server = http.createServer((req, res) => {
         .then(result => json(result.error ? 409 : 202, result.error ? result : { ok: true, result: result.result || 'Command accepted by Pi' }));
     }); return;
   }
+  const approval = url.pathname.match(/^\/api\/sessions\/([^/]+)\/approvals$/);
+  if (req.method === 'POST' && approval) {
+    let body = ''; req.on('data', chunk => { body += chunk; if (body.length > 16 * 1024) req.destroy(); });
+    req.on('end', () => {
+      let value; try { value = JSON.parse(body); } catch { return json(400, { error: 'Invalid JSON' }); }
+      if (typeof value.requestId !== 'string' || !['Allow once', 'Switch to auto', 'Deny'].includes(value.choice)) return json(400, { error: 'Invalid approval response' });
+      const result = registry.respondApproval(decodeURIComponent(approval[1]), value.requestId, value.choice);
+      return result.error ? json(409, result) : json(202, { ok: true });
+    }); return;
+  }
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/s/'))) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return fs.createReadStream(path.join(__dirname, '../web/index.html')).pipe(res);
   }
@@ -94,6 +104,10 @@ wss.on('connection', (ws, req) => {
         registry.broadcastList();
       }
       else if ((msg.type === 'request_ack' || msg.type === 'request_error') && typeof msg.requestId === 'string') registry.resolveRequest(msg.requestId, msg.type === 'request_error' ? { error: msg.error || 'Pi rejected the command' } : { ok: true, result: msg.result });
+      else if (msg.type === 'approval_request' && typeof msg.requestId === 'string') {
+        const delivered = registry.approvalRequest(registered.sessionId, registered.instanceId, msg);
+        ws.send(JSON.stringify({ type: 'approval_delivery', requestId: msg.requestId, delivered }));
+      }
       else if (msg.type === 'event' && Number.isSafeInteger(msg.seq)) registry.event(registered.sessionId, registered.instanceId, { seq: msg.seq, timestamp: Number(msg.timestamp) || Date.now(), type: msg.event?.type || 'event', event: msg.event });
       else if (msg.type === 'status' && ['idle','running','waiting','error'].includes(msg.status)) { const s=registry.sessions.get(registered.sessionId); const i=s?.instances.get(registered.instanceId); if(i)i.status=msg.status; registry.broadcastList(); }
     });
@@ -109,6 +123,8 @@ wss.on('connection', (ws, req) => {
   const sessionId = decodeURIComponent(pathname.slice('/ws/sessions/'.length));
   if (!sessionId) return ws.close(1008);
   const client = { ws, sessionId }; registry.clients.add(client);
+  const state = registry.sessions.get(sessionId);
+  for (const approval of state?.approvals.values() || []) ws.send(JSON.stringify(approval.payload));
   ws.on('close', () => registry.clients.delete(client));
 });
 function validInstance(i) { return i && typeof i.instanceId === 'string' && typeof i.sessionId === 'string' && Number.isInteger(i.pid) && typeof i.cwd === 'string'; }

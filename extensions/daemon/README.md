@@ -57,5 +57,9 @@ The session page renders streamed thinking in a collapsed section, pages
 read-only history from the registered session's active branch, and swaps the
 Send button for Stop while Pi is generating. Type `/` to filter available
 commands; selecting one opens a dialog to edit its arguments and apply it.
-Commands are dispatched back through Pi's extension/prompt command expansion
-rather than executed by the daemon.
+Manual permission reviews are presented in the session page when it is
+connected; otherwise the extension falls back to Pi's local confirmation UI.
+Provider and tool errors are shown in the conversation. The footer shows the
+active fast-mode status when the installed fast-mode extension exposes its
+statusline segment. Commands are dispatched back through Pi's
+extension/prompt command expansion rather than executed by the daemon.
