@@ -9,6 +9,13 @@ import { analyzeBashCommand } from "./lib/bash-policy.ts";
 const REVIEW_TIMEOUT_MS = 15_000;
 type PermissionMode = "manual" | "auto";
 type ManualChoice = "Allow once" | "Switch to auto" | "Deny";
+let localPromptQueue: Promise<void> = Promise.resolve();
+
+function queueLocalPrompt<T>(prompt: () => Promise<T>): Promise<T> {
+  const current = localPromptQueue.then(prompt, prompt);
+  localPromptQueue = current.then(() => undefined, () => undefined);
+  return current;
+}
 
 async function selectPermissionChoice(pi: ExtensionAPI, ctx: any, request: { toolName: string; intent: string; reason: string; behavior: string }): Promise<ManualChoice | undefined> {
   let markAvailable!: (available: boolean) => void;
@@ -17,8 +24,13 @@ async function selectPermissionChoice(pi: ExtensionAPI, ctx: any, request: { too
   const available = new Promise<boolean>(resolve => { markAvailable = resolve; });
   const remoteChoice = new Promise<ManualChoice>(resolve => { choose = resolve; });
   const localController = new AbortController();
+  let settled = false;
   const localChoice = ctx.hasUI
-    ? ctx.ui.select(`${request.intent}\nOperation: ${request.toolName}\n${request.behavior}\nReview reason: ${request.reason}`, ["Allow once", "Switch to auto", "Deny"], { signal: localController.signal, timeout: 120_000 }).then((choice: ManualChoice | undefined) => ({ source: "local" as const, choice }))
+    ? queueLocalPrompt(async () => {
+        if (settled) return { source: "skipped" as const, choice: undefined };
+        const choice = await ctx.ui.select(`${request.intent}\nOperation: ${request.toolName}\n${request.behavior}\nReview reason: ${request.reason}`, ["Allow once", "Switch to auto", "Deny"], { signal: localController.signal, timeout: 120_000 });
+        return { source: "local" as const, choice: choice as ManualChoice | undefined };
+      })
     : undefined;
   let remoteDelivered = false;
   const resolveAvailability = (value: boolean) => {
@@ -41,9 +53,12 @@ async function selectPermissionChoice(pi: ExtensionAPI, ctx: any, request: { too
       remoteChoice.then(choice => ({ source: "remote" as const, choice })),
     ]);
     if (winner.source === "remote") {
+      settled = true;
       localController.abort();
       return winner.choice;
     }
+    if (winner.source === "skipped") return undefined;
+    settled = true;
     const choice = winner.choice;
     pi.events.emit("pi-remote:approval-cancel", { requestId, choice: choice || "Deny" });
     if (remoteDelivered || await available) {
@@ -241,7 +256,7 @@ export default function (pi: ExtensionAPI) {
         : `Target: ${outside.join(", ") || targets.join(", ") || "(not applicable)"}`;
       const choice = await selectPermissionChoice(pi, ctx, { toolName: event.toolName, intent, behavior, reason });
       if (choice === "Deny" || choice === undefined) {
-        return { block: true, reason: choice === undefined ? "Permission prompt dismissed" : "Blocked by user" };
+        return { block: true, reason: choice === undefined ? "Permission review was not completed or no approval UI was available" : "Blocked by user" };
       }
       if (choice === "Switch to auto") {
         mode = "auto";
