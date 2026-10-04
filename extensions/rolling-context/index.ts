@@ -99,7 +99,7 @@ export default function rollingContext(pi:ExtensionAPI) {
     const tokens=estimateProjection(projection);
     const current=ctx.getContextUsage();
     lastStatus=`mode=${mode}; projected≈${tokens}; usage=${current?.tokens??"unknown"}; groups=${groups(projection).length}; items=${state.snapshot.items.length}`;
-    if(config.mode==="observe"||config.mode==="off")return;
+    if(mode==="observe"||mode==="off")return;
     if(event.outcome!=="completed")return;
     const branch=ctx.sessionManager.getBranch();
     const own=planTurn({entries:projection,branch,eventEntries:event.entries,baseLeaf:ctx.sessionManager.getLeafId(),config:{...config,mode},state,sessionId:ctx.sessionManager.getSessionId()});
