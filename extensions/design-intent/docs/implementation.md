@@ -1,6 +1,8 @@
 # Design Intent 实现细节设计
 
-状态：实现蓝图，**尚无插件代码**。上层决策见 [design.md](design.md)，职责边界见 [integration.md](integration.md)。长期设计与关键决策仍由本插件统一管理，不再拆插件。
+状态：本文是实现蓝图；当前代码为已接入包清单的**受限 MVP**，具备版本化存储/查询/提案/显式审批、哈希复核、文件锁及原子替换。模块集中于 `index.ts`、`lib.ts`，不是本文所有建议能力均已交付。上层决策见 [design.md](design.md)，职责边界见 [integration.md](integration.md)。
+
+当前限制：项目根固定为受信任的 `ctx.cwd`，不扫描仓库父目录；文件检查只读取用户选定路径并返回 `unknown`，不会生成 Git diff 或自动判定 pass/violation；审批 UI 显示候选记录/关系的变更说明，非交互审批使用 `--design-intent-confirm PROPOSAL:ACTION:SOURCE_HASH:CANDIDATE_HASH` 精确绑定参数。目录 fsync、外部写入 CAS 和多进程崩溃恢复仍受普通文件系统约束。
 
 ## 1. MVP 的固定选择
 
@@ -213,7 +215,7 @@ reject：新增 rejected 记录与用户否决理由，**不执行 draft 中拟�
 
 UI 审批展示：完整 statement/rationale、源版本、关系影响、受影响依赖、文件差异及 file/lock/temp 副作用；随后 confirm。不能仅确认一句“是否接受？”而不展示关键差异。超长内容先 review/分页，未展示的内容不自动批准。
 
-无 UI 默认不提交。操作者可以使用明确的 `--yes --expect-source=<hash|missing> --expect-candidate=<hash>` 选项；还必须指定 proposal ID 和否决理由。只 `--yes` 不够。command/RPC 被视为用户控制通道，但不是认证防篡改机制；不得宣称可以阻止恶意 shell 直接改文件。
+无 UI 默认不提交。当前非交互入口要求 `--design-intent-confirm=<proposal-id>:<accept|reject>:<source-hash|missing>:<candidate-hash>`；该值必须逐字匹配当前预览候选，陈旧 hash 会失败。command/RPC 被视为用户控制通道，但不是认证防篡改机制；不得宣称可以阻止恶意 shell 直接改文件。
 
 ## 9. 单文件提交、并发与崩溃
 
@@ -326,7 +328,7 @@ flags 初始只需 root、read-enable、入口注入开关和输出预算。原�
 
 纯逻辑用 fixtures、临时文件和仓库现有 Node 测试形式；并发/故障用注入的 StoreIO 和子进程验证，不依赖付费模型。文件提交测试明确区分进程崩溃与电源故障，不能用单一 happy path 声称事务安全。
 
-交付：只读查询与 source hash → 分支提案 → 用户审批/单文件提交 → 有限实际修改检查 → RC 引用集成。各阶段没有完成时，接口明确 unavailable/unsupported，不返回假的成功。最终测试通过才增加根 package.json 入口。
+后续交付：完整投影分页与查询诊断 → 更强故障注入/跨进程提交恢复 → 有限检查证据与 diff 覆盖 → RC 交叉集成。未实现能力必须明确 unknown/unavailable，不返回假的成功。
 
 ## 14. 宿主和仓库参考
 

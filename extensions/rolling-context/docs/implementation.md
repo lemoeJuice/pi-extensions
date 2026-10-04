@@ -1,6 +1,8 @@
 # Rolling Context 实现细节设计
 
-状态：实现蓝图，**尚无插件代码**。上层决策见 [design.md](design.md)，双插件边界见[集成说明](../../design-intent/docs/integration.md)。本文细化 MVP，不另建框架；所有新增类型、函数和文件名均为拟议的扩展内部接口。
+状态：本文是实现蓝图；当前代码是**受限 MVP**，不是本文所有 P0/P1 能力的完整交付。已接入根包清单、提供 note/recall/状态命令、分支回放、工具结果证据、保守裁剪规划及 checkpoint callback。实现集中在 `index.ts`、`lib.ts`，函数/字段与本文拟议接口可能不同。上层决策见 [design.md](design.md)，双插件边界见[集成说明](../../design-intent/docs/integration.md)。
+
+当前明确限制：首版默认 observe，`--rolling-context-mode on` opt-in；预算采用配置阈值和粗略 token 估算，尚未接入模型实际窗口/usage 自适应、提取器、完整 recall 分页索引或穷尽所有宿主扩展消息类型。checkpoint 只在来源覆盖、非多模态和候选预算净收益都可验证时尝试，否则保留上下文/交由原生 compact；这可能导致超预算但避免静默丢失。
 
 ## 1. 实现约束与宿主基线
 
@@ -322,7 +324,7 @@ cursor 包含 sessionId、查询 hash、索引版本和下一位置；leaf/索�
 
 单元测试复用仓库 `node --experimental-strip-types --test test/*.test.mjs` 形式；宿主集成测试在测试依赖环境中运行，不使用付费模型做纯逻辑测试。
 
-交付顺序：先 observe 和重建/候选 fixture，再开放 note/recall、安全胶囊，最后开放覆盖充分的 checkpoint 及 command callbacks。实现文件存在并测试通过后才加根 package.json 入口；当前文档不改变运行配置。
+实现顺序仍按下文分期推进；当前包清单已注册两个入口。后续扩展范围前先补对应 fixture、宿主集成与故障恢复测试，不将“已注册/可加载”描述为全部蓝图均已完成。
 
 ## 15. 实现参考
 

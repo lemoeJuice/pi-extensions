@@ -6,6 +6,7 @@
   "license": "MIT",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
@@ -13,6 +14,6 @@
     "ws": "^8.18.0"
   },
   "pi": {
-    "extensions": ["./extensions/permissions/index.ts", "./extensions/edit/index.ts", "./extensions/daemon/index.ts"]
+    "extensions": ["./extensions/permissions/index.ts", "./extensions/edit/index.ts", "./extensions/daemon/index.ts", "./extensions/rolling-context/index.ts", "./extensions/design-intent/index.ts"]
   }
 }

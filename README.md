@@ -1,6 +1,6 @@
 # pi-guardrails
 
-A Pi extension package with permission guardrails, Codex-style patch editing, and a browser-based remote session daemon.
+A Pi extension package with permission guardrails, Codex-style patch editing, a browser-based remote session daemon, rolling task context, and project-level design intent.
 
 ## Included extensions
 
@@ -10,9 +10,17 @@ The `pi` manifest loads these entrypoints:
 extensions/permissions/index.ts
 extensions/edit/index.ts
 extensions/daemon/index.ts
+extensions/rolling-context/index.ts
+extensions/design-intent/index.ts
 ```
 
 Helper modules under each extension's `lib/` (or daemon runtime directory) are implementation details, not separate extensions.
+
+### Rolling Context and Design Intent
+
+`/rolling-context status` inspects task memory. Automatic rolling edits are opt-in with `--rolling-context-mode on`; observe mode is the default. The extension preserves source history and uses conservative tool-result capsules/checkpoints, with native compaction retained as fallback. See [`extensions/rolling-context/README.md`](extensions/rolling-context/README.md).
+
+Design Intent stores approved project requirements and decisions in `.pi/design-intent.json`. Reading requires trusted project access and session approval (or `--design-intent-read`); approvals are explicit `/design-intent accept|reject` operations. Proposal tools cannot approve or write project intent. See [`extensions/design-intent/README.md`](extensions/design-intent/README.md).
 
 ### Permissions
 
@@ -82,7 +90,7 @@ pi install . --local
 
 ## Tests
 
-Run the policy and patch parser/filesystem tests with Node's type stripping:
+Run the complete policy, patch, Rolling Context, and Design Intent test suite with Node's type stripping:
 
 ```sh
 node --experimental-strip-types --test test/*.test.mjs
