@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 export const STATE_TYPE = "rolling-context.state.v1";
 export const NOTE_TYPE = "rolling-context.note.v1";
 export const CHECKPOINT_TYPE = "rolling-context.checkpoint.v1";
+export const MAX_STATE_BYTES=128*1024;
+export function serializedStateBytes(value:unknown):number{return new TextEncoder().encode(JSON.stringify(value)).byteLength;}
 
 export interface MemoryItem {
   id: string;
@@ -40,6 +42,7 @@ export interface RollingConfig {
   mode: "observe" | "on" | "off";
   targetTokens: number;
   reserveTokens: number;
+  contextWindow?: number;
   minSavingTokens: number;
   minCheckpointTurns: number;
   recallMaxTokens: number;
@@ -50,6 +53,11 @@ export interface Group {
   results: Array<{ id:string; message: Extract<AgentMessage,{role:"toolResult"}> }>;
 }
 export const hash = (value: unknown) => createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex");
+export function effectiveTarget(config:RollingConfig):number{
+  if(!Number.isSafeInteger(config.contextWindow)||!config.contextWindow)return config.targetTokens;
+  const safety=Math.max(2048,Math.ceil(config.contextWindow*0.05));
+  return Math.min(config.targetTokens,Math.max(0,config.contextWindow-config.reserveTokens-safety));
+}
 export function emptySnapshot(taskId = "") : MemorySnapshot {
   return { schemaVersion:1, revision:0, coveredThroughEntryId:"", items:[], intentRefs:[], focus:{taskId,nextSteps:[],openQuestions:[]}, coverage:[] };
 }
@@ -84,9 +92,27 @@ export function rebuild(branch: SessionEntry[], sessionId: string): {snapshot:Me
     }
     if (entry.type === "message" && entry.message.role === "user" && !snapshot.focus.taskId) snapshot.focus.taskId=`RC-T-${entry.id}`;
     if (entry.type === "compaction" && (entry.details as any)?.type===CHECKPOINT_TYPE) {
-      const data=(entry.details as any).stateEnvelope as StateEnvelope|undefined;
-      if(data && validSnapshot(data.snapshot) && data.revision>=snapshot.revision){snapshot=data.snapshot; envelope=data;}
+      const details=entry.details as any;const data=details.stateEnvelope as StateEnvelope|undefined;const actualSummaryHash=hash(entry.summary);
+      const validCheckpoint=data&&data.checkpoint?.firstKeptEntryId===entry.firstKeptEntryId&&data.checkpoint?.summaryHash===actualSummaryHash&&details.firstKeptEntryId===entry.firstKeptEntryId&&details.summaryHash===actualSummaryHash;
+      if(data&&validCheckpoint&&validSnapshot(data.snapshot)&&data.revision>=snapshot.revision){snapshot=data.snapshot;envelope=data;}
+      else diagnostics.push(`Checkpoint metadata does not match compaction entry ${entry.id}`);
     }
+  }
+  if(envelope){
+    const latestEdits=new Map<string,Extract<SessionEntry,{type:"context_edit"}>>();
+    for(const entry of branch)if(entry.type==="context_edit")latestEdits.set(entry.targetId,entry);
+    const committedEdits=envelope.edits.filter(edit=>{
+      const actual=latestEdits.get(edit.targetId);if(!actual?.replacement)return false;
+      const content=actual.replacement.content;
+      const text=typeof content==="string"?content:Array.isArray(content)&&content.every(part=>part.type==="text")?content.map(part=>part.type==="text"?part.text:"").join("\n"):undefined;
+      return text!==undefined&&hash(text)===edit.replacementHash;
+    });
+    for(const edit of envelope.edits)if(!committedEdits.some(actual=>actual.targetId===edit.targetId&&actual.replacementHash===edit.replacementHash))diagnostics.push(`Planned context edit is not active at ${edit.targetId}`);
+    const checkpoint=envelope.checkpoint;
+    if(checkpoint&&!branch.some(entry=>entry.type==="compaction"&&entry.firstKeptEntryId===checkpoint.firstKeptEntryId&&hash(entry.summary)===checkpoint.summaryHash&&(entry.details as any)?.type===CHECKPOINT_TYPE&&(entry.details as any)?.summaryHash===checkpoint.summaryHash&&(entry.details as any)?.firstKeptEntryId===checkpoint.firstKeptEntryId)){
+      diagnostics.push("Planned checkpoint has no matching committed compaction entry");
+      envelope={...envelope,edits:committedEdits,checkpoint:undefined};
+    }else envelope={...envelope,edits:committedEdits};
   }
   return {snapshot,envelope,diagnostics};
 }
@@ -119,9 +145,43 @@ export function groups(entries: ProjectedSessionEntry[]): Group[] {
   }
   return out;
 }
+function safeBashEvidence(command:string):boolean {
+  if(/[;&|<>`]/.test(command))return false;
+  return /^\s*(?:pwd|ls|find|rg|grep|git\s+(?:status|diff|log|show)|cat|head|tail|sed\s+-n)\b/i.test(command)||/\b(?:test|vitest|jest|pytest|cargo test|go test|npm run test|pnpm test)\b/i.test(command);
+}
+function capsuleSafe(group:Group):boolean {
+  return group.complete&&group.consumed&&group.results.length>0&&group.results.every(result=>{
+    const call=group.message.content.find((part):part is Extract<typeof part,{type:"toolCall"}>=>part.type==="toolCall"&&part.id===result.message.toolCallId);
+    if(!call||call.name!==result.message.toolName||result.message.isError||textContent(result.message)===undefined)return false;
+    if(result.message.toolName==="read")return typeof call.arguments.path==="string";
+    if(result.message.toolName==="edit")return Array.isArray((result.message.details as any)?.changes)&&((result.message.details as any).changes.length>0);
+    if(result.message.toolName==="bash")return typeof call.arguments.command==="string"&&safeBashEvidence(call.arguments.command);
+    return false;
+  });
+}
+export function analyzeGroups(entries:ProjectedSessionEntry[],snapshot:MemorySnapshot):Array<{assistantId:string;resultIds:string[];reasons:string[]}>{
+  const all=groups(entries),recent=new Set(all.filter(group=>group.complete).slice(-3).map(group=>group.assistantId));
+  const pinned=new Set(snapshot.items.filter(item=>item.pinned).flatMap(item=>item.sourceEntryIds));
+  const dependencies=snapshot.items.filter(item=>item.status==="active"&&(item.authority==="agent-report"||item.pinned)).flatMap(item=>item.dependencies.map(dep=>dep.path.replace(/\\/g,"/")));
+  const pathProtected=(path:string)=>dependencies.some(dep=>{const actual=path.replace(/\\/g,"/"),expected=dep.replace(/\\/g,"/");return actual===expected||actual.endsWith(`/${expected}`)||expected.endsWith(`/${actual}`);});
+  return all.map(group=>{
+    const reasons:string[]=[];
+    if(!group.complete)reasons.push("INCOMPLETE_TOOL_GROUP");
+    if(!group.consumed)reasons.push("NOT_CONSUMED");
+    if(!capsuleSafe(group))reasons.push("UNSUPPORTED_TOOL_OR_RESULT");
+    if(recent.has(group.assistantId))reasons.push("RECENT_GROUP");
+    if(group.results.some(result=>pinned.has(result.id)||pinned.has(group.assistantId)))reasons.push("PINNED_SOURCE");
+    if(group.results.some(result=>{
+      const call=group.message.content.find((part):part is Extract<typeof part,{type:"toolCall"}>=>part.type==="toolCall"&&part.id===result.message.toolCallId);
+      const paths:string[]=[];if(typeof call?.arguments.path==="string")paths.push(call.arguments.path);
+      const changes=(result.message.details as any)?.changes;if(Array.isArray(changes))for(const change of changes)if(typeof change?.path==="string")paths.push(change.path);
+      return paths.some(path=>pathProtected(path));
+    }))reasons.push("ACTIVE_PATH_DEPENDENCY");
+    return{assistantId:group.assistantId,resultIds:group.resultIds,reasons};
+  });
+}
 export function makeCapsule(group:Group, entries:SessionEntry[], onlyResultId?:string):string|undefined {
-  if(!group.complete||!group.consumed||group.results.length===0) return;
-  const callNames=group.message.content.filter((x):x is Extract<typeof x,{type:"toolCall"}>=>x.type==="toolCall").map(c=>c.name);
+  if(!capsuleSafe(group)) return;
   const lines:string[]=[];
   const selected=onlyResultId?group.results.filter(result=>result.id===onlyResultId):group.results;
   if(!selected.length)return;
@@ -129,11 +189,12 @@ export function makeCapsule(group:Group, entries:SessionEntry[], onlyResultId?:s
     const source=entries.find(e=>e.id===result.id);
     if(!source || source.type!=="message") return;
     const content=textContent(result.message);
-    if(content===undefined || result.message.isError) return;
+    if(content===undefined || result.message.isError||content.startsWith("[Rolling Context 历史工具证据；")) return;
+    const call=group.message.content.find((part):part is Extract<typeof part,{type:"toolCall"}>=>part.type==="toolCall"&&part.id===result.message.toolCallId);
     const preview=content.length>700?`${content.slice(0,700)}… [已缩减]`:content;
-    lines.push(`- ${result.message.toolName}: ${preview}`);
+    lines.push(`- ${result.message.toolName} args=${JSON.stringify(call?.arguments??{}).slice(0,400)}; source=${result.id}: ${preview}`);
   }
-  const capsule=`[Rolling Context 历史工具证据；原始来源 ${group.resultIds.join(", ")}; calls ${callNames.join(", ")} ]\n${lines.join("\n")}`;
+  const capsule=`[Rolling Context 历史工具证据；原始来源 ${group.resultIds.join(", ")}；需要精确内容时对每个来源 ID 分别调用 context_recall(entryId=…) 召回]\n${lines.join("\n")}`;
   return capsule.length<group.results.reduce((n,r)=>n+(textContent(r.message)?.length||0),0)*0.5?capsule:undefined;
 }
 export function renderCheckpoint(snapshot:MemorySnapshot):string {
@@ -144,9 +205,9 @@ export function renderCheckpoint(snapshot:MemorySnapshot):string {
 export function estimateProjection(entries:ProjectedSessionEntry[]):number {
   return entries.reduce((sum,e)=>sum+e.messages.reduce((n,m)=>n+estimateTokens(m),0),0);
 }
-export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEntry[];eventEntries:SessionBoundaryDraft[];baseLeaf:string|null;config:RollingConfig;state:ReturnType<typeof rebuild>;sessionId:string}):SessionBoundaryDraft[] {
+export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEntry[];eventEntries:SessionBoundaryDraft[];baseLeaf:string|null;config:RollingConfig;state:ReturnType<typeof rebuild>;sessionId:string;currentTokens?:number|null}):SessionBoundaryDraft[] {
   const {entries,branch,eventEntries,baseLeaf,config,state,sessionId}=args;
-  if(config.mode!=="on") return [];
+  if(config.mode==="off")return [];
   const drafts:SessionBoundaryDraft[]=[];
   let snapshot=structuredClone(state.snapshot);
   if(!snapshot.focus.taskId){const firstUser=entries.find(e=>e.messages.some(m=>m.role==="user"));if(firstUser)snapshot.focus.taskId=`RC-T-${firstUser.sourceEntry.id}`;}
@@ -173,11 +234,13 @@ export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEnt
     snapshot.items.push(constraint);
   }
   const toolGroups=groups(entries);
+  const groupAnalysis=analyzeGroups(entries,snapshot);const groupReasons=new Map(groupAnalysis.map(group=>[group.assistantId,group.reasons]));
   const edits=state.envelope?.edits? [...state.envelope.edits]:[];
   for(const group of toolGroups) {
     if(!group.consumed) continue;
     for(const result of group.results) {
-      const capsule=makeCapsule(group,branch,result.id);
+      const capsuleAllowed=(groupReasons.get(group.assistantId)?.length??1)===0;
+      const capsule=capsuleAllowed?makeCapsule(group,branch,result.id):undefined;
       const original=textContent(result.message);
       if(original===undefined)continue;
       const call=group.message.content.find((part):part is Extract<typeof part,{type:"toolCall"}>=>part.type==="toolCall"&&part.id===result.message.toolCallId);
@@ -205,7 +268,7 @@ export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEnt
       if(!capsule||original.length-capsule.length<config.minSavingTokens*4)continue;
       if(edits.some(e=>e.targetId===result.id&&e.replacementHash===hash(capsule)))continue;
       const edit={targetId:result.id,originalHash:hash(original),replacementHash:hash(capsule),replacement:capsule};
-      edits.push(edit);drafts.push({type:"context_edit",targetId:result.id,replacement:{content:capsule}});
+      edits.push(edit);drafts.push({type:"context_edit",targetId:result.id,replacement:{content:[{type:"text",text:capsule}]}});
     }
   }
   for(const projected of entries){
@@ -221,28 +284,40 @@ export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEnt
       }
     }
   }
-  const projectedTokens=estimateProjection(entries);
-  const ctxWindow=undefined;
-  const target=Math.min(config.targetTokens,ctxWindow??config.targetTokens);
-  const maybeCheckpoint=projectedTokens>target && projectedTokens>config.reserveTokens && branch.length>config.minCheckpointTurns;
+  const projectedTokens=Number.isSafeInteger(args.currentTokens)&&args.currentTokens!>=0?args.currentTokens!:estimateProjection(entries);
+  const target=effectiveTarget(config);
+  const maybeCheckpoint=projectedTokens>target&&branch.length>config.minCheckpointTurns;
   let checkpoint:StateEnvelope["checkpoint"];
   if(maybeCheckpoint) {
     const latest=entries.filter(e=>e.messages.some(m=>m.role==="user")).at(-1);
     const latestIndex=latest?entries.findIndex(e=>e.sourceEntry.id===latest.sourceEntry.id):-1;
-    const protectedIndices=toolGroups.filter(group=>!group.complete||!group.consumed).map(group=>entries.findIndex(e=>e.sourceEntry.id===group.assistantId)).filter(index=>index>=0);
-    const firstKeptIndex=Math.min(latestIndex<0?entries.length:latestIndex,...protectedIndices);
+    const recentIds=new Set(toolGroups.filter(group=>group.complete).slice(-3).map(group=>group.assistantId));
+    const protectedIndices=toolGroups.filter(group=>!group.complete||!group.consumed||recentIds.has(group.assistantId)).map(group=>entries.findIndex(e=>e.sourceEntry.id===group.assistantId)).filter(index=>index>=0);
+    const firstKeptIndex=protectedIndices.length?Math.min(...protectedIndices):(latestIndex<0?entries.length:latestIndex);
     const firstKept=entries[firstKeptIndex]?.sourceEntry.id;
     const hasImage=entries.slice(0,firstKeptIndex).some(e=>e.messages.some(m=>m.role==="user"&&Array.isArray(m.content)&&m.content.some(c=>c.type==="image")));
     const hasForeign=branch.some(e=>(e.type==="custom_message"&&e.customType!=="design-intent.projection.v1")||e.type==="branch_summary");
+    const rawCutIndex=firstKept?branch.findIndex(entry=>entry.id===firstKept):-1;
+    const rawPrefixIds=new Set(rawCutIndex>=0?branch.slice(0,rawCutIndex).map(entry=>entry.id):[]);
+    const latestEdits=new Map<string,Extract<SessionEntry,{type:"context_edit"}>>();for(const entry of branch)if(entry.type==="context_edit")latestEdits.set(entry.targetId,entry);
+    const hasForeignEdit=rawCutIndex<0||eventEntries.some(draft=>draft.type==="context_edit")||Array.from(rawPrefixIds).some(targetId=>{
+      const edit=latestEdits.get(targetId);if(!edit)return false;if(!edit.replacement)return true;
+      const content=edit.replacement.content;const text=typeof content==="string"?content:Array.isArray(content)&&content.every(part=>part.type==="text")?content.map(part=>part.type==="text"?part.text:"").join("\n"):undefined;
+      return text===undefined||!edits.some(owned=>owned.targetId===targetId&&owned.replacementHash===hash(text));
+    });
     const hasExistingCompaction=[...eventEntries,...drafts].some(d=>d.type==="compaction");
     const covered=new Set(snapshot.items.flatMap(item=>item.sourceEntryIds));
-    const contentCovered=entries.slice(0,firstKeptIndex).every(entry=>entry.messages.every(message=>{
+    const unknownToolCrossed=toolGroups.some(group=>{
+      const groupIndex=entries.findIndex(entry=>entry.sourceEntry.id===group.assistantId);
+      return groupIndex>=0&&groupIndex<firstKeptIndex&&!capsuleSafe(group);
+    });
+    const contentCovered=!unknownToolCrossed&&entries.slice(0,firstKeptIndex).every(entry=>entry.messages.every(message=>{
       if(message.role==="system")return true;
       if(message.role==="custom")return message.customType==="design-intent.projection.v1"&&snapshot.intentRefs.some(ref=>ref.id);
       if(message.role==="compactionSummary"||message.role==="branchSummary")return false;
       return covered.has(entry.sourceEntry.id);
     }));
-    if(firstKept&&!hasImage&&!hasForeign&&!hasExistingCompaction&&contentCovered) {
+    if(firstKept&&!hasImage&&!hasForeign&&!hasForeignEdit&&!hasExistingCompaction&&contentCovered) {
       const summary=renderCheckpoint(snapshot);
       const keptTokens=estimateProjection(entries.slice(firstKeptIndex));
       const candidateTokens=keptTokens+Math.ceil(summary.length/4);
@@ -260,11 +335,12 @@ export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEnt
     if(index!==undefined)dispositions.set(sourceEntryId,checkpoint&&index>=retainedFrom?"retained":"extracted");
   }
   snapshot.coverage=[...dispositions].map(([sourceEntryId,disposition])=>({sourceEntryId,disposition}));
-  snapshot.coveredThroughEntryId=entries.at(-1)?.sourceEntry.id??snapshot.coveredThroughEntryId;
+  snapshot.coveredThroughEntryId=entries.filter(entry=>entry.messages.length>0).at(-1)?.sourceEntry.id??snapshot.coveredThroughEntryId;
   if(!drafts.length&&hash(snapshot)===hash(state.snapshot))return [];
   snapshot.revision=state.snapshot.revision+1;
   const planId=hash([sessionId,baseLeaf,snapshot.revision,edits.map(e=>e.replacementHash),checkpoint]).slice(0,24);
-  const envelope:StateEnvelope={schemaVersion:1,revision:snapshot.revision,planId,baseLeafId:baseLeaf,snapshot,edits,checkpoint};
+  const envelope:StateEnvelope={schemaVersion:1,revision:snapshot.revision,planId,baseLeafId:baseLeaf,snapshot,edits,checkpoint:checkpoint??state.envelope?.checkpoint};
+  if(serializedStateBytes(envelope)>MAX_STATE_BYTES)return [];
   for(const draft of drafts)if(draft.type==="compaction"&&(draft.details as any)?.type===CHECKPOINT_TYPE)(draft.details as any).stateEnvelope=envelope;
   drafts.unshift({type:"custom",customType:STATE_TYPE,data:envelope});
   return drafts;

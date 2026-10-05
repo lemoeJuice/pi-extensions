@@ -1,9 +1,9 @@
 import type { ExtensionAPI, SessionBoundaryDraft, SessionEntry, ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { emptySnapshot, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, type RollingConfig } from "./lib.ts";
+import { analyzeGroups, effectiveTarget, emptySnapshot, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, serializedStateBytes, MAX_STATE_BYTES, type RollingConfig } from "./lib.ts";
 
 const NoteParams=Type.Object({intent:Type.String({minLength:1}),kind:Type.Union([Type.Literal("plan"),Type.Literal("task-decision"),Type.Literal("focus"),Type.Literal("next-step")]),text:Type.String({minLength:1,maxLength:2000}),replaces:Type.Optional(Type.Array(Type.String(),{maxItems:8})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:12}))},{additionalProperties:false});
-const RecallParams=Type.Object({intent:Type.String({minLength:1}),entryId:Type.Optional(Type.String()),itemId:Type.Optional(Type.String()),query:Type.Optional(Type.String({maxLength:300})),cursor:Type.Optional(Type.Number({minimum:0})),limit:Type.Optional(Type.Number({minimum:1,maximum:8}))},{additionalProperties:false});
+const RecallParams=Type.Object({intent:Type.String({minLength:1}),entryId:Type.Optional(Type.String()),itemId:Type.Optional(Type.String()),query:Type.Optional(Type.String({maxLength:300})),paths:Type.Optional(Type.Array(Type.String({minLength:1,maxLength:256}),{maxItems:12})),cursor:Type.Optional(Type.String({maxLength:2048})),limit:Type.Optional(Type.Number({minimum:1,maximum:8}))},{additionalProperties:false});
 const NoteDetails=Type.Object({type:Type.Literal("rolling-context.note.v1"),noteId:Type.String(),taskId:Type.String(),kind:Type.String(),text:Type.String(),replaces:Type.Array(Type.String()),paths:Type.Array(Type.String())});
 
 function parseConfig(pi:ExtensionAPI):RollingConfig {
@@ -45,36 +45,73 @@ export default function rollingContext(pi:ExtensionAPI) {
     const branch=ctx.sessionManager.getBranch();
     const projection=ctx.sessionManager.buildSessionProjection();
     const projectedById=new Map(projection.entries.map(e=>[e.sourceEntry.id,e.messages]));
-    const allowed=new Set(projectedById.keys());
+    const visibleIds=new Set(projection.entries.filter(e=>e.messages.length>0).map(e=>e.sourceEntry.id));
     const state=rebuild(branch,ctx.sessionManager.getSessionId());
-    const start=Math.max(0,Math.floor(params.cursor??0));const limit=params.limit??5;
-    let matches=branch.filter(e=>allowed.has(e.id)&&(e.type==="message"||e.type==="custom_message"&&e.customType==="design-intent.projection.v1"||e.type==="compaction"));
-    if(params.entryId)matches=matches.filter(e=>e.id===params.entryId);
-    else if(params.itemId){const item=state.snapshot.items.find(i=>i.id===params.itemId);matches=matches.filter(e=>item?.sourceEntryIds.includes(e.id));}
-    else if(params.query){const q=params.query.toLowerCase();matches=matches.filter(e=>JSON.stringify(e).toLowerCase().includes(q));}
+    if(params.paths?.some(path=>path.startsWith("/")||path.includes("\0")||path.split(/[\\/]/).includes("..")))throw new Error("Recall paths must be project-relative and cannot traverse directories");
+    const selectors=[params.entryId,params.itemId,params.query].filter(Boolean);if(selectors.length>1)throw new Error("Use only one of entryId, itemId or query; paths may be combined as a filter");
+    const perEntryChars=Math.max(64,Math.min(1600,config.recallMaxTokens*4-300));
+    const limit=Math.min(params.limit??5,Math.max(1,Math.floor(config.recallMaxTokens*4/1800)));const leafId=ctx.sessionManager.getLeafId();
+    const projectionHash=hash(projection.entries.map(e=>[e.sourceEntry.id,e.messages]));
+    const queryHash=hash({entryId:params.entryId,itemId:params.itemId,query:params.query?.toLowerCase(),paths:params.paths?.map(p=>p.replace(/\\/g,"/")).sort(),limit});
+    let start=0;
+    if(params.cursor){try{const decoded=JSON.parse(Buffer.from(params.cursor,"base64url").toString("utf8"));if(decoded.v!==1||decoded.sessionId!==ctx.sessionManager.getSessionId()||decoded.leafId!==leafId||decoded.queryHash!==queryHash||decoded.projectionHash!==projectionHash||!Number.isSafeInteger(decoded.start)||decoded.start<0)throw new Error();start=decoded.start;}catch{throw new Error("STALE_RECALL_CURSOR: branch, projection or query changed; start a new recall request");}}
+    const callPaths=new Map<string,string>();
+    for(const entry of projection.entries)for(const message of entry.messages)if(message.role==="assistant")for(const part of message.content)if(part.type==="toolCall"&&typeof part.arguments.path==="string")callPaths.set(part.id,part.arguments.path.replace(/\\/g,"/"));
+    const candidates=branch.filter(e=>visibleIds.has(e.id)&&(e.type==="message"||e.type==="custom_message"&&e.customType==="design-intent.projection.v1"||e.type==="compaction"));
+    if(params.entryId&&branch.some(entry=>entry.id===params.entryId)&&!visibleIds.has(params.entryId))return{content:[{type:"text",text:`[${params.entryId}] Source is absent from the current authorized projection; content withheld.`}],details:{denied:true,reason:"SOURCE_NOT_IN_CURRENT_PROJECTION",returned:0}};
+    const render=(entry:SessionEntry):string=>{
+      const linked=state.snapshot.items.filter(item=>item.sourceEntryIds.includes(entry.id));
+      const status=[...new Set(linked.map(item=>item.status).filter(value=>value==="stale"||value==="superseded"))].join(",");
+      const prefix=`[${entry.id}; historical evidence${status?`; ${status}`:""}; not current filesystem truth]`;
+      if(entry.type==="message"){
+        const messages=projectedById.get(entry.id)??[];return messages.map(message=>{
+          let effective=message;
+          if(message.role==="toolResult"&&(typeof message.content==="string"||Array.isArray(message.content))){
+            const effectiveText=typeof message.content==="string"?message.content:message.content.every((part:any)=>part.type==="text")?message.content.map((part:any)=>part.text).join("\n"):undefined;
+            const owned=effectiveText!==undefined&&state.envelope?.edits.some(edit=>edit.targetId===entry.id&&hash(effectiveText)===edit.replacementHash);
+            if(owned&&entry.message.role==="toolResult")effective=entry.message;
+          }
+          if(message.role==="user"){const text=typeof message.content==="string"?message.content:message.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text).join("\n");return `${prefix} user: ${text.slice(0,perEntryChars)}${Array.isArray(message.content)&&message.content.some((part:any)=>part.type==="image")?" [image omitted]":""}`;}
+          if(effective.role==="assistant")return `${prefix} assistant: ${effective.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text).join("\n").slice(0,perEntryChars)}${effective.content.some((part:any)=>part.type==="thinking")?" [thinking omitted]":""}`;
+          if(effective.role==="toolResult"){const content=typeof effective.content==="string"?effective.content:Array.isArray(effective.content)?effective.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text).join("\n"):"";const callPath=callPaths.get(effective.toolCallId);return `${prefix} toolResult ${effective.toolName}${callPath?` path=${callPath}`:""}: ${content.slice(0,perEntryChars)}${Array.isArray(effective.content)&&effective.content.some((part:any)=>part.type==="image")?" [image omitted]":""}`;}
+          return `${prefix} ${effective.role}`;
+        }).join("\n");
+      }
+      if(entry.type==="custom_message")return `${prefix} Design Intent projection: ${entry.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text).join("\n").slice(0,Math.min(1200,perEntryChars))}`;
+      if(entry.type==="compaction")return `${prefix} checkpoint: ${entry.summary.slice(0,Math.min(1200,perEntryChars))}`;
+      return prefix;
+    };
+    let matches=candidates.map(entry=>({entry,text:render(entry)}));
+    if(params.entryId)matches=matches.filter(x=>x.entry.id===params.entryId);
+    else if(params.itemId){const item=state.snapshot.items.find(i=>i.id===params.itemId);matches=matches.filter(x=>item?.sourceEntryIds.includes(x.entry.id));}
+    else if(params.query){const q=params.query.toLowerCase();matches=matches.filter(x=>x.text.toLowerCase().includes(q));}
+    if(params.paths?.length){matches=matches.filter(({entry,text})=>{
+      const linked=state.snapshot.items.filter(item=>item.sourceEntryIds.includes(entry.id)).flatMap(item=>item.dependencies.map(dep=>dep.path.replace(/\\/g,"/")));
+      if(entry.type==="message"&&entry.message.role==="toolResult"){const path=callPaths.get(entry.message.toolCallId);if(path)linked.push(path);const changes=(entry.message.details as any)?.changes;if(Array.isArray(changes))for(const change of changes)if(typeof change?.path==="string")linked.push(change.path.replace(/\\/g,"/"));}
+      return params.paths!.some(requested=>{const path=requested.replace(/\\/g,"/");return linked.some(actual=>actual===path||actual.startsWith(`${path.replace(/\/$/,"")}/`)||path.startsWith(`${actual.replace(/\/$/,"")}/`))||text.includes(path);});
+    });}
     const page=matches.slice(start,start+limit);
-    let text=page.map(e=>{if(e.type==="message"){
-      const effective=projectedById.get(e.id)?.[0]??e.message;
-      const ownEdit=state.envelope?.edits.some(edit=>edit.targetId===e.id&&effective.role==="toolResult"&&hash(effective.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text).join("\n"))===edit.replacementHash);
-      // Only an exact edit owned by this extension may be expanded back to the stored historical bytes.
-      const m=ownEdit&&e.message.role==="toolResult"?e.message:effective;
-      if(m.role==="assistant"&&m.content.some(x=>x.type==="thinking"))return `[${e.id}] assistant (thinking omitted)`;
-      if(m.role==="user"&&Array.isArray(m.content)){const safe=m.content.filter(part=>part.type==="text").map(part=>part.type==="text"?part.text:"[image omitted]").join("\n");return `[${e.id}] user: ${safe.slice(0,1800)}${m.content.some(part=>part.type==="image")?" [image omitted]":""}`;}
-      if(m.role==="toolResult"){const safe=Array.isArray(m.content)?m.content.filter(part=>part.type==="text").map(part=>part.type==="text"?part.text:"").join("\n"):String(m.content);return `[${e.id}] toolResult ${m.toolName}: ${safe.slice(0,1800)}${m.content.some((part:any)=>part.type==="image")?" [image omitted]":""}`;}
-      return `[${e.id}] ${m.role}: ${JSON.stringify(m.role==="assistant"?m.content.filter(x=>x.type!=="thinking"):m).slice(0,1800)}`;
-    }if(e.type==="custom_message")return `[${e.id}] Design Intent projection: ${e.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text).join("\n").slice(0,1200)}`;if(e.type==="compaction")return `[${e.id}] checkpoint: ${e.summary.slice(0,1200)}`;return `[${e.id}] ${e.type}: ${JSON.stringify(e).slice(0,1200)}`;}).join("\n\n");
-    const truncated=text.length>config.recallMaxTokens*4;if(truncated)text=`${text.slice(0,config.recallMaxTokens*4)}\n[Recall truncated; request the next page or a specific source.]`;
-    return {content:[{type:"text",text:text||"No matching evidence in the active projected branch."}],details:{nextCursor:start+limit<matches.length?start+limit:undefined,totalMatches:matches.length,returned:page.length,truncated}};
+    let text=page.map(x=>x.text).join("\n\n");
+    const truncated=text.length>config.recallMaxTokens*4;if(truncated)text=`${text.slice(0,config.recallMaxTokens*4)}\n[Recall response truncated; narrow the query or request fewer entries.]`;
+    const next=start+page.length<matches.length?Buffer.from(JSON.stringify({v:1,sessionId:ctx.sessionManager.getSessionId(),leafId,queryHash,projectionHash,start:start+page.length})).toString("base64url"):undefined;
+    return {content:[{type:"text",text:text||"No matching evidence in the active projected branch."}],details:{nextCursor:next,totalMatches:matches.length,returned:page.length,truncated,sourceStatuses:page.map(x=>({entryId:x.entry.id,stale:state.snapshot.items.some(item=>item.sourceEntryIds.includes(x.entry.id)&&item.status==="stale")}))}};
   }});
 
   const rebuildState=(ctx:any)=>rebuild(ctx.sessionManager.getBranch(),ctx.sessionManager.getSessionId());
   const checkpointCoverageValid=(branch:SessionEntry[],firstKeptId:string,state:ReturnType<typeof rebuild>):boolean=>{
     const cut=branch.findIndex(entry=>entry.id===firstKeptId);if(cut<0)return false;
+    const prefixIds=new Set(branch.slice(0,cut).map(entry=>entry.id));
+    for(const editEntry of branch)if(editEntry.type==="context_edit"&&prefixIds.has(editEntry.targetId)){
+      if(!editEntry.replacement)return false;
+      const content=editEntry.replacement.content;const text=typeof content==="string"?content:Array.isArray(content)&&content.every(part=>part.type==="text")?content.map(part=>part.type==="text"?part.text:"").join("\n"):undefined;
+      if(text===undefined||!state.envelope?.edits.some(edit=>edit.targetId===editEntry.targetId&&edit.replacementHash===hash(text)))return false;
+    }
     const covered=new Set(state.snapshot.items.flatMap(item=>item.sourceEntryIds));
     for(const entry of branch.slice(0,cut)){
       if(entry.type==="message"){
         const message=entry.message;
         if(message.role==="system")continue;
+        if(message.role==="user"&&Array.isArray(message.content)&&message.content.some(part=>part.type==="image"))return false;
         if(message.role==="user"||message.role==="assistant"||message.role==="bashExecution"){
           if(!covered.has(entry.id))return false;
           continue;
@@ -84,13 +121,19 @@ export default function rollingContext(pi:ExtensionAPI) {
           continue;
         }
       }
+      if(entry.type==="context_edit"){
+        if(!entry.replacement)return false;
+        const content=entry.replacement.content;const text=typeof content==="string"?content:Array.isArray(content)&&content.every(part=>part.type==="text")?content.map(part=>part.type==="text"?part.text:"").join("\n"):undefined;
+        if(text===undefined||!state.envelope?.edits.some(edit=>edit.targetId===entry.targetId&&edit.replacementHash===hash(text)))return false;
+        continue;
+      }
       if(entry.type==="custom_message"&&entry.customType==="design-intent.projection.v1"&&state.snapshot.intentRefs.length)continue;
       if(entry.type==="custom"||entry.type==="usage"||entry.type==="model_change"||entry.type==="thinking_level_change"||entry.type==="context_edit"||entry.type==="label"||entry.type==="session_info")continue;
       return false;
     }
     return true;
   };
-  const restoreMode=(ctx:any)=>{const entry=[...ctx.sessionManager.getBranch()].reverse().find((e:SessionEntry)=>e.type==="custom"&&e.customType==="rolling-context.config.v1");const saved=(entry as any)?.data?.mode;if(saved==="on"||saved==="off"||saved==="observe")mode=saved;};
+  const restoreMode=(ctx:any)=>{mode=config.mode;const entry=[...ctx.sessionManager.getBranch()].reverse().find((e:SessionEntry)=>e.type==="custom"&&e.customType==="rolling-context.config.v1");const saved=(entry as any)?.data?.mode;if(saved==="on"||saved==="off"||saved==="observe")mode=saved;};
   pi.on("session_start",(_event,ctx)=>{restoreMode(ctx);const state=rebuildState(ctx);lastStatus=`mode=${mode}; items=${state.snapshot.items.length}; diagnostics=${state.diagnostics.length}`;});
   pi.on("session_tree",(_event,ctx)=>{restoreMode(ctx);const state=rebuildState(ctx);lastStatus=`mode=${mode}; branch=${ctx.sessionManager.getLeafId()??"empty"}; items=${state.snapshot.items.length}`;});
   pi.on("turn_end",async(event,ctx)=>{
@@ -98,15 +141,27 @@ export default function rollingContext(pi:ExtensionAPI) {
     const projection=event.context.contextEntries;
     const tokens=estimateProjection(projection);
     const current=ctx.getContextUsage();
-    lastStatus=`mode=${mode}; projected≈${tokens}; usage=${current?.tokens??"unknown"}; groups=${groups(projection).length}; items=${state.snapshot.items.length}`;
-    if(mode==="observe"||mode==="off")return;
+    const contextWindow=Number.isSafeInteger(ctx.model?.contextWindow)&&ctx.model!.contextWindow>0?ctx.model!.contextWindow:current?.contextWindow;
+    const turnConfig={...config,mode,contextWindow};const budget=effectiveTarget(turnConfig);const projected=current?.tokens??tokens;
+    lastStatus=`mode=${mode}; projected≈${projected}${current?.tokens==null?" (heuristic)":""}; window=${contextWindow??"unknown"}; target=${budget}; stateBytes=${serializedStateBytes(state.envelope??state.snapshot)}; groups=${groups(projection).length}; items=${state.snapshot.items.length}`;
+    if(mode==="off")return;
     if(event.outcome!=="completed")return;
     const branch=ctx.sessionManager.getBranch();
-    const own=planTurn({entries:projection,branch,eventEntries:event.entries,baseLeaf:ctx.sessionManager.getLeafId(),config:{...config,mode},state,sessionId:ctx.sessionManager.getSessionId()});
-    if(!own.length)return;
+    const own=planTurn({entries:projection,branch,eventEntries:event.entries,baseLeaf:ctx.sessionManager.getLeafId(),config:turnConfig,state,sessionId:ctx.sessionManager.getSessionId(),currentTokens:current?.tokens});
+    const analysis=analyzeGroups(projection,state.snapshot);
+    if(!own.length){if(mode==="observe")lastStatus+=`; observe: no state/capsule/checkpoint changes proposed; groups=${analysis.length}; writes=0`;return;}
     const candidate=[...event.entries,...own];
     const header=ctx.sessionManager.getHeader();
-    if(!header||!previewDrafts(ctx.cwd,header,branch,candidate)){lastStatus+="; plan rejected by projection validation";return;}
+    const preview=header?previewDrafts(ctx.cwd,header,branch,candidate):undefined;
+    if(mode==="observe"){
+      const counts=new Map<string,number>();for(const group of analysis)for(const reason of group.reasons)counts.set(reason,(counts.get(reason)??0)+1);
+      const eligible=analysis.filter(group=>group.reasons.length===0).length;
+      const editedIds=new Set(own.filter(x=>x.type==="context_edit").map(x=>x.targetId));const scheduledGroups=analysis.filter(group=>group.resultIds.some(id=>editedIds.has(id))).length;
+      lastStatus+=`; observe: reserve=${config.reserveTokens}; headroom≈${budget-projected}; eligibleGroups=${eligible}; protection=${JSON.stringify(Object.fromEntries(counts))}; candidateEdits=${editedIds.size}; eligibleWithoutEdit=${Math.max(0,eligible-scheduledGroups)} (saving threshold/already projected); checkpoint=${own.some(x=>x.type==="compaction")}; projectionValid=${!!preview}; writes=0`;
+      return;
+    }
+    if(!own.length)return;
+    if(!preview){lastStatus+="; plan rejected by projection validation";return;}
     // Ensure inherited custom/context transformations don't invalidate original task/user content.
     const projectedUsers=projection.flatMap(e=>e.messages.filter(m=>m.role==="user"));
     if(projectedUsers.length===0){lastStatus+="; no user anchor";return;}
@@ -118,20 +173,38 @@ export default function rollingContext(pi:ExtensionAPI) {
     const state=rebuildState(ctx);lastStatus+=`; settled revision=${state.snapshot.revision}`;
   });
   pi.on("session_before_compact",async(event,ctx)=>{
-    if(!manualCheckpoint||event.reason!=="manual"||ctx.sessionManager.getSessionId()!==manualCheckpoint.sessionId||ctx.sessionManager.getLeafId()!==manualCheckpoint.leafId)return;
+    const explicit=!!manualCheckpoint;
+    if(explicit&&(event.reason!=="manual"||ctx.sessionManager.getSessionId()!==manualCheckpoint!.sessionId||ctx.sessionManager.getLeafId()!==manualCheckpoint!.leafId)){
+      ctx.ui.notify("Rolling checkpoint cancelled because the session branch changed before compaction.","warning");return {cancel:true};
+    }
+    // Overflow recovery is deliberately left to the host. User-supplied compact instructions
+    // are never replaced; the explicit Rolling command's own instructions are the exception.
+    if(!explicit&&(event.reason==="overflow"||!!event.customInstructions)){
+      lastStatus+=`; native compact delegated reason=${event.reason}; customInstructions=${!!event.customInstructions}`;return;
+    }
     const state=rebuildState(ctx);
-    const summary=renderCheckpoint(state.snapshot);
     const firstKeptEntryId=event.preparation.firstKeptEntryId;
     if(!firstKeptEntryId||!checkpointCoverageValid(event.branchEntries,firstKeptEntryId,state)){
-      ctx.ui.notify("Rolling checkpoint cancelled: the task state does not cover every context entry before the proposed boundary. Native compaction is not substituted automatically.","warning");
-      return {cancel:true};
+      if(explicit){ctx.ui.notify("Rolling checkpoint cancelled: the task state does not cover every context entry before the proposed boundary.","warning");return {cancel:true};}
+      lastStatus+=`; native compact delegated: checkpoint coverage unknown at ${firstKeptEntryId??"missing boundary"}`;return;
     }
-    const planId=hash([manualCheckpoint,summary]).slice(0,20);
-    const envelope=state.envelope??{schemaVersion:1 as const,revision:state.snapshot.revision+1,planId,baseLeafId:manualCheckpoint.leafId,snapshot:{...state.snapshot,revision:state.snapshot.revision+1},edits:[]};
-    return {compaction:{summary,firstKeptEntryId,tokensBefore:event.preparation.tokensBefore,details:{type:"rolling-context.checkpoint.v1",stateEnvelope:envelope,stateRevision:envelope.revision,planId}}};
+    const summary=renderCheckpoint(state.snapshot);
+    const cut=event.branchEntries.findIndex(entry=>entry.id===firstKeptEntryId);
+    const keptIds=new Set(event.branchEntries.slice(cut).map(entry=>entry.id));
+    const keptTokens=estimateProjection(ctx.sessionManager.buildSessionProjection().entries.filter(entry=>keptIds.has(entry.sourceEntry.id)));
+    if(keptTokens+Math.ceil(summary.length/4)>=event.preparation.tokensBefore){
+      if(explicit){ctx.ui.notify("Rolling checkpoint cancelled: the validated state does not reduce the estimated context size.","warning");return {cancel:true};}
+      lastStatus+=`; native compact delegated: checkpoint has no estimated net saving`;return;
+    }
+    const leafId=ctx.sessionManager.getLeafId();const sessionId=ctx.sessionManager.getSessionId();
+    const planId=hash([sessionId,leafId,firstKeptEntryId,summary]).slice(0,20);
+    const revision=state.snapshot.revision+1;const summaryHash=hash(summary);
+    const envelope={schemaVersion:1 as const,revision,planId,baseLeafId:leafId,snapshot:{...state.snapshot,revision},edits:state.envelope?.edits??[],checkpoint:{firstKeptEntryId,summaryHash}};
+    if(serializedStateBytes(envelope)>MAX_STATE_BYTES){if(explicit){ctx.ui.notify("Rolling Context state exceeds 128 KiB; checkpoint cancelled.","error");return {cancel:true};}lastStatus+="; native compact delegated: state exceeds 128 KiB";return;}
+    return {compaction:{summary,firstKeptEntryId,tokensBefore:event.preparation.tokensBefore,details:{type:"rolling-context.checkpoint.v1",stateEnvelope:envelope,stateRevision:revision,planId,firstKeptEntryId,summaryHash}}};
   });
-  pi.on("session_compact",()=>{manualCheckpoint=undefined;});
-  pi.on("session_compact_failed",()=>{manualCheckpoint=undefined;});
+  pi.on("session_compact",event=>{manualCheckpoint=undefined;lastStatus+=`; compacted reason=${event.reason}; fromExtension=${event.fromExtension}`;});
+  pi.on("session_compact_failed",event=>{manualCheckpoint=undefined;lastStatus+=`; compact failed reason=${event.reason}; aborted=${event.aborted}; ${event.errorMessage??"no error detail"}`;});
 
   pi.registerCommand("rolling-context",{description:"Inspect or control Rolling Context",handler:async(args,ctx)=>{
     const [verb,...rest]=args.trim().split(/\s+/);const value=rest.join(" ");
@@ -142,7 +215,8 @@ export default function rollingContext(pi:ExtensionAPI) {
       const id=rest[0];if(!id){ctx.ui.notify(`Usage: /rolling-context ${verb} ITEM_ID`,"warning");return;}
       const state=rebuildState(ctx);const item=state.snapshot.items.find(candidate=>candidate.id===id);if(!item){ctx.ui.notify(`Unknown active-branch item ${id}`,"error");return;}
       item.pinned=verb==="pin";state.snapshot.revision++;
-      const envelope={schemaVersion:1 as const,revision:state.snapshot.revision,planId:hash([ctx.sessionManager.getSessionId(),ctx.sessionManager.getLeafId(),id,verb,state.snapshot.revision]).slice(0,24),baseLeafId:ctx.sessionManager.getLeafId(),snapshot:state.snapshot,edits:state.envelope?.edits??[]};
+      const envelope={schemaVersion:1 as const,revision:state.snapshot.revision,planId:hash([ctx.sessionManager.getSessionId(),ctx.sessionManager.getLeafId(),id,verb,state.snapshot.revision]).slice(0,24),baseLeafId:ctx.sessionManager.getLeafId(),snapshot:state.snapshot,edits:state.envelope?.edits??[],checkpoint:state.envelope?.checkpoint};
+      if(serializedStateBytes(envelope)>MAX_STATE_BYTES){ctx.ui.notify("Rolling Context state exceeds 128 KiB; pin state was not written.","error");return;}
       pi.appendEntry("rolling-context.state.v1",envelope);ctx.ui.notify(`${verb}ned ${id}`,"info");return;
     }
     if(verb==="checkpoint"){

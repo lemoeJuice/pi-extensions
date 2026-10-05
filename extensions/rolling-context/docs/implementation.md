@@ -2,7 +2,7 @@
 
 状态：本文是实现蓝图；当前代码是**受限 MVP**，不是本文所有 P0/P1 能力的完整交付。已接入根包清单、提供 note/recall/状态命令、分支回放、工具结果证据、保守裁剪规划及 checkpoint callback。实现集中在 `index.ts`、`lib.ts`，函数/字段与本文拟议接口可能不同。上层决策见 [design.md](design.md)，双插件边界见[集成说明](../../design-intent/docs/integration.md)。
 
-当前明确限制：首版默认 observe，`--rolling-context-mode on` opt-in；预算采用配置阈值和粗略 token 估算，尚未接入模型实际窗口/usage 自适应、提取器、完整 recall 分页索引或穷尽所有宿主扩展消息类型。checkpoint 只在来源覆盖、非多模态和候选预算净收益都可验证时尝试，否则保留上下文/交由原生 compact；这可能导致超预算但避免静默丢失。
+当前明确限制：首版默认 observe，`--rolling-context-mode on` opt-in；预算使用宿主 `contextWindow`/usage（不可用时回退启发式），扣除 reserve 与安全余量，但仍非 provider 精确 tokenizer；cacheRead 感知批处理/epoch、提取器、持久检索索引和对所有宿主扩展消息类型的适配尚未实现。checkpoint 只在来源覆盖、非多模态和候选预算净收益都可验证时尝试，否则保留上下文/交由原生 compact；这可能导致超预算但避免静默丢失。
 
 ## 1. 实现约束与宿主基线
 
@@ -113,7 +113,7 @@ P2 再引入完整快照 + 有序 delta 的判别联合，在 checkpoint 或每 
 
 ## 4. 任务身份与笔记工具
 
-MVP 每个会话分支维护一个 active task，首次用户 entry 生成 `taskId = "RC-T-" + entryId`。后续 user/steering 默认延续，不凭关键词自动宣布旧任务完成；主题不明时保护旧约束。新独立任务优先使用新会话，细粒度任务切换留后续实现。
+MVP 每个会话分支维护一个 active task，首次用户 entry 生成 `taskId = "RC-T-" + entryId`。后续 user/steering 默认延续，不凭关键词自动宣布旧任务完成；主题不明时保护旧约束。新独立任务优先使用新会话或 `/tree` 分支，细粒度任务切换留后续实现。状态没有淘汰/LRU：若完整 envelope 超过 128 KiB，整批 planner 写入被拒绝并保留原上下文，不会静默丢用户约束或 pinned 事实。
 
 `context_note` 参数：
 
@@ -245,9 +245,9 @@ coverage 不是泛用“已总结”标记：
 
 ## 10. 原生 compact 与用户命令
 
-`session_before_compact` 默认返回 undefined。仅 snapshot 覆盖 preparation 要收起的范围、无未知摘要、原文/保护组/intent 标签完整时提供自定义 compaction。hook 使用 preparation.tokensBefore 和安全 firstKeptEntryId；成功前不标记归档。
+`session_before_compact` 默认返回 undefined。manual/threshold 仅在 snapshot 覆盖 preparation 的整个收起范围、无图片/未知摘要/未识别 context edit，且粗略预算有净收益时提供自定义 compaction。hook 使用 preparation.tokensBefore 和 branch 中安全的 firstKeptEntryId；只有宿主真正提交 matching compaction 后才标记归档。无法证明安全或有收益时记录诊断并委托原生行为。
 
-用户 `/compact` 带 customInstructions 时，MVP 不猜语义，直接委托原生逻辑。overflow/recovery 覆盖不足同样委托。默认不返回 cancel。
+用户 `/compact` 带 customInstructions 时，MVP 不猜语义，直接委托原生逻辑。overflow/recovery 始终委托宿主。显式 `/rolling-context checkpoint` 若分支/覆盖或净收益校验失败会取消，避免静默替换为另一种 compact；其他 native compact 校验失败时不拦截宿主。失败、取消和宿主成功均更新 status 诊断。
 
 `/rolling-context checkpoint` 走命令专属流程：
 
