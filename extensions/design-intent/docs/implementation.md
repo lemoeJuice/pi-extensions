@@ -2,7 +2,7 @@
 
 状态：本文是实现蓝图；当前代码为已接入包清单的**受限 MVP**，具备版本化存储/查询/提案/显式审批、哈希复核、文件锁及原子替换。模块集中于 `index.ts`、`lib.ts`，不是本文所有建议能力均已交付。上层决策见 [design.md](design.md)，职责边界见 [integration.md](integration.md)。
 
-当前限制：项目根固定为受信任的 `ctx.cwd`，不扫描仓库父目录；文件检查只读取用户选定路径并返回 `unknown`，不会生成 Git diff 或自动判定 pass/violation；审批 UI 显示候选记录/关系的变更说明，非交互审批使用 `--design-intent-confirm PROPOSAL:ACTION:SOURCE_HASH:CANDIDATE_HASH` 精确绑定参数。目录 fsync、外部写入 CAS 和多进程崩溃恢复仍受普通文件系统约束。
+当前限制：项目根固定为受信任的 `ctx.cwd`，不扫描仓库父目录；文件检查只读取用户选定路径并返回 `unknown`，不会生成 Git diff 或自动判定 pass/violation；审批 UI 显示候选记录/关系的变更说明，非交互审批使用 `--design-intent-confirm PROPOSAL:ACTION:SOURCE_HASH:CANDIDATE_HASH` 精确绑定参数。Store 读取使用 no-follow fd 和 1 MiB bounded read；但 Node 的 path-based rename API 不提供 openat/renameat 目录句柄 CAS，父目录被恶意并发替换及非协作写入仍有窄竞态。目录 fsync、外部写入 CAS 和多进程崩溃恢复仍受普通文件系统约束。
 
 ## 1. MVP 的固定选择
 
@@ -157,17 +157,17 @@ interface IntentProjection {
 }
 ```
 
-工具返回 `content` 中的可读投影、同 schema 的 `structuredContent`，以及 `details: { type: "design-intent.query-result.v1", projection }`。get 使用相同外层结果，可另附完整 record 分页；历史 status 必须明确显示，不能把 superseded statement 混入当前约束区。
+工具返回 `content` 中的可读投影、同 schema 的 `structuredContent`，以及 `details: { type: "design-intent.query-result.v1", projection }`。query 项包含来源/关系摘要，并在当前页补直接 dependency/conflict endpoint；get 返回完整单条 record（包括历史 status、scope、关系、sources、review、revision），不把 superseded statement 混入当前约束区。
 
 入口 custom_message 使用 `customType: "design-intent.projection.v1"`、content 为人类可读视图、details 为该 envelope。Rolling Context 只识别这一小契约，不 import store/query 模块。
 
 默认 query 1500、入口投影 1000、get 3000 估算 tokens。声明过长时用**原文摘录**与 mustExpand 标记，不用自由摘要改写 invariant；所有省略、未展开 dependency/conflict 和 token 不足必须列诊断。尤其全局约束无法全部纳入时，truncated=true，不宣称“相关约束已完整提供”。
 
-cursor 编码查询 hash、sourceHash 与下一记录/正文偏移。文件内容变化后旧 cursor 失效，要求重新 query/get，不能跨版本拼接正文。
+opaque cursor 编码查询参数 hash、canonical storePath、raw sourceHash、预算和下一页 offset。文件内容、查询条件或预算变化后旧 cursor 失效，返回 `STALE_QUERY_CURSOR`，要求重新 query；cursor 不作为授权凭据。get 是完整单记录读取，不分页。
 
 ## 7. 提案持久化与分支恢复
 
-`design_intent_propose` 参数是 draft record（kind/title/statement/rationale/scope/关系/source），不含 status、review、正式 DI ID。固定权限仅为“生成提案”。
+`design_intent_propose` 参数是 draft record（kind/title/statement/rationale/scope/关系/source），不含 status、review、正式 DI ID。创建提案时对当前 source revision 校验所有关系端点存在且 accepted；批准时锁内重新验证候选与冲突/依赖，再展示会受 supersede 影响而进入 needs-review 的既有记录。固定权限仅为“生成提案”。
 
 ```ts
 interface Proposal {
@@ -261,7 +261,11 @@ rename 前失败/取消：不增长磁盘 revision，不改变旧状态。rename
 
 ## 10. 实际修改检查
 
-`design_intent_check` 参数：intent、paths、可选 intentIds 和范围 `working-tree/index/base-commit`。MVP 默认当前工作树；自定义 commit/ref 必须验证为受限参数，不能拼接用户 shell 字符串。
+当前实现的 `design_intent_check` 参数只有 intent、paths、可选 intentIds；不支持 `working-tree/index/base-commit` 范围。它仅逐文件调用授权 `read` 工具，不执行 git/bash，也不推断 staged/untracked/完整变更集。拒绝绝对路径、NUL 和 `..`；只读取所选 accepted intent 覆盖的 project-relative path。
+
+当前所有语义结论均为 `unknown`。输出的 `complete` 只表示所选文件证据完整收集（非拒绝、非截断且 intent source 未变化），**不**表示意图符合。拒绝/缺失/截断证据不会给通过；检查前后 raw source hash 不同会把本次结果标 stale 并要求重试。未发现适用 intent、未授权或 ID 缺失也保持 unknown。
+
+以下 Git diff/index/untracked 覆盖步骤仍是后续蓝图，当前未实现：
 
 工具流程：
 
