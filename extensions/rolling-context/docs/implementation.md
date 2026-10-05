@@ -2,7 +2,34 @@
 
 状态：本文是实现蓝图；当前代码是**受限 MVP**，不是本文所有 P0/P1 能力的完整交付。已接入根包清单、提供 note/recall/状态命令、分支回放、工具结果证据、保守裁剪规划及 checkpoint callback。实现集中在 `index.ts`、`lib.ts`，函数/字段与本文拟议接口可能不同。上层决策见 [design.md](design.md)，双插件边界见[集成说明](../../design-intent/docs/integration.md)。
 
-当前明确限制：首版默认 observe，`--rolling-context-mode on` opt-in；预算使用宿主 `contextWindow`/usage（不可用时回退启发式），扣除 reserve 与安全余量，但仍非 provider 精确 tokenizer；cacheRead 感知批处理/epoch、提取器、持久检索索引和对所有宿主扩展消息类型的适配尚未实现。checkpoint 只在来源覆盖、非多模态和候选预算净收益都可验证时尝试，否则保留上下文/交由原生 compact；这可能导致超预算但避免静默丢失。
+当前明确限制：首版默认 observe，`--rolling-context-mode on` opt-in；预算使用宿主 projection 估算与 `contextWindow`，扣除 reserve 与安全余量，仍非 provider 精确 tokenizer。已实现 cacheRead 感知批处理、完整 turn 时钟、warm 驻留与低频 checkpoint、轻量工作状态、自己的 cold evidence recall 及 daemon Graph View。提取器、持久检索索引和对所有宿主扩展消息类型的适配尚未实现。checkpoint 只在连续性笔记、来源覆盖、非多模态和候选预算净收益都可验证时尝试，否则保留上下文/交由原生 compact；这可能导致超预算但避免静默丢失。
+
+## 当前实现的生命周期修正
+
+实现继续集中在 `lib.ts` / `index.ts`，没有按下文蓝图拆出 registry、planner 类或独立数据库，也不更改 Design Intent。
+
+1. `turnClock(branch)` 读取 completed-turn telemetry；`lastWarmTurn` 从实际已提交且 hash 匹配的 edit 元数据恢复，`lastCheckpointTurn` / epoch 从实际匹配的 Rolling compaction 恢复。只有 state、没有 edit/checkpoint 不推进对应生命周期。没有完成 turn 记录的旧历史不换算成 entry 数。
+2. 普通批次间隔 4 turn，累计 saving 2048；高 cacheRead 时普通门槛翻倍。soft 压力可提前到至少 2 turn / 基础 saving 的一半；hard 才允许无间隔紧急处理。具体预算当前为 `target=effectiveTarget(config)`、`soft=1.2*target`、`hard=window-reserve-max(2048,5% window)`；窗口未知则不推断 hard 压力。
+3. `planTurn` 先 preview inherited + warm drafts，基于 **afterWarmTokens** 判断 checkpoint；再 preview 完整 checkpoint（包括宿主系统 checkpoint），验证净收益和目标预算。`currentTokens` 不参与候选容量判断。
+4. checkpoint 默认间隔 16 completed turn，普通冷藏只跨越已驻留 warm 至少 16 turn 的工具组；最新三组、未消费组、pin/活跃路径依赖仍受保护。无法满足预算时保留 warm，不立即收走新 capsule。显式 manual / hard 是受保护规则约束的例外；overflow 委托宿主。
+5. MemorySnapshot 不再追加 assistant 报告或工具输出正文。project/change/test 按工作键更新，普通工作地图每类最多 32 项，coverage 只留最近 64 个轻量来源 disposition。旧来源直接按 branch 搜索，不要求永远留在 snapshot。用户原文、显式活跃 task-decision 和 pin 不被容量策略静默删除；这些真正不可压缩的状态仍可能触发 128 KiB 安全拒绝，报告 `planRejectedReason` / `attemptedStateBytes`。
+6. active warm edit 元数据只保存 `targetId/originalHash/replacementHash/warmTurn`，不复制 capsule 正文。兼容旧 state 的 `replacement`，下次保存去掉。冷藏后的 edit 从新 envelope 移出，所有权证据仍在早期 append-only state/edit 里；hard 同轮生成后冷藏的 edit 在该轮 envelope 留下声明。
+7. `ownedEdits` 顺序校验声明、实际 edit 和原始来源 hash；任何 foreign edit 历史的 target 不恢复 raw。`recallProjection` 只撤销 hash/边界/快照一致的 Rolling compaction，再由宿主重放完整 branch 的 context edits，当前 live projection 优先。存在任何 foreign compaction 时不撤销冷藏，缺失来源返回 denied。绝不读取外部 fullOutputPath 或当前项目文件。
+
+普通 capsule 落盘后不再生成第二版；无 prefix mutation 时，state/telemetry custom entries 不改变模型前缀。真实价格/cache 收益仍需 provider A/B 实测，不能由 synthetic fixture 宣称已经获得。
+
+### Telemetry 与 daemon Graph View
+
+每个 `turn_end(outcome="completed")` 的列表末尾附 `customType: "rolling-context.telemetry.v1"`。保留 inherited drafts；observe/off 只写非 context metrics，不写候选 state/edit/checkpoint。用 messageEntryId 去重；aborted/error 不推进完整 turn 时钟。
+
+字段：`turn/epoch/mode`、`rawTokens/projectedTokens/effectiveTokens/afterWarmTokens/afterCheckpointTokens`、`hotTokens/warmTokens/checkpointTokens/otherTokens`、`capsulesCreated/capsuleTokensSaved/checkpointCreated/checkpointReason`、`stateBytes`、`input/cacheRead/cacheWrite/providerContextTokens`，以及拒绝时的 `attemptedStateBytes/planRejectedReason`。
+
+- raw 是当前 branch 的原始 message history 估算，不含 state/telemetry；projected 是边界前有效 projection；effective 是通过 preview 验证且当前 mode 允许提交的投影。after-warm / after-checkpoint 是本轮候选阶段，observe 时不代表已执行。
+- warm 分量是已验证 capsule 的工具结果；仍保持原文的 assistant/tool-call 骨架计 hot；compactionSummary 计 checkpoint，system/未知贡献计 other。分量之和等于 effective estimate。
+- stateBytes 是工作 snapshot/envelope 的 JSON UTF-8 bytes，不是 JSONL 总大小。usage 只取本轮 assistant 实际提供的字段，未知为 null。
+- 数值在本 handler 的已验证边界上测量，宿主边界不是文件事务。后续扩展若撤销/重写草稿，该测量不是最终授权证明；后续生命周期仍从实际 branch 重建。崩溃且未写到 telemetry 不伪造该轮样本。
+- daemon 复用 history.js 的 session root、header ID 与 parent-chain 校验，只读导出数值白名单。`GET /api/sessions/:id/context-telemetry` 提供样本及 compaction 事件；`/s/:id/context` 显示三张 SVG 图，缺值断线、unknown usage 显示 `—`。session 页面有 Context Graph 链接，5 秒刷新，不请求模型；没有数据显示空态。
+- Rolling Context 不依赖 daemon。telemetry 随 session/fork/tree 生命周期走，没有外部正文存储。权限工具流程仍生效；无法观察的请求级过滤不能被当作已验证兼容，foreign compaction 不允许反向恢复。
 
 ## 1. 实现约束与宿主基线
 
@@ -113,7 +140,7 @@ P2 再引入完整快照 + 有序 delta 的判别联合，在 checkpoint 或每 
 
 ## 4. 任务身份与笔记工具
 
-MVP 每个会话分支维护一个 active task，首次用户 entry 生成 `taskId = "RC-T-" + entryId`。后续 user/steering 默认延续，不凭关键词自动宣布旧任务完成；主题不明时保护旧约束。新独立任务优先使用新会话或 `/tree` 分支，细粒度任务切换留后续实现。状态没有淘汰/LRU：若完整 envelope 超过 128 KiB，整批 planner 写入被拒绝并保留原上下文，不会静默丢用户约束或 pinned 事实。
+MVP 每个会话分支维护一个 active task，首次用户 entry 生成 `taskId = "RC-T-" + entryId`。后续 user/steering 默认延续，不凭关键词自动宣布旧任务完成；主题不明时保护旧约束。新独立任务优先使用新会话或 `/tree` 分支，细粒度任务切换留后续实现。普通历史工具/assistant 正文不作为永久状态；工作地图按键更新并有数量边界。若不可压缩的用户约束、活跃决策或 pin 仍使 envelope 超过 128 KiB，整批 planner 写入被拒绝并保留原上下文，不静默丢保护事实。
 
 `context_note` 参数：
 
@@ -183,8 +210,8 @@ interface ExecutionGroup {
 ```text
 ensureRebuilt → 读取 event.context + inherited entries
 → 关联当前组和更早组 → 抽取/失效/合并笔记
-→ 保护集合 → 预算评估 → 批量选择胶囊
-→ 若仍超 soft：尝试 checkpoint
+→ 保护集合 → 批次间隔/cache/累计收益评估 → 选择胶囊
+→ preview after-warm → 若仍超目标且满足 checkpoint cadence / warm 驻留：尝试 checkpoint
 → 模拟 + 协议/语义校验 → 返回状态、edit、可选 compaction
 ```
 
@@ -261,7 +288,7 @@ status/inspect/pin/on/off/observe 命令等 idle 后执行。配置和 pin 保�
 
 ## 11. 预算、cache 与配置
 
-沿用 design 中 A/B/soft/hard 公式。实现拆为 `estimateConversation()`、`estimateSystem()` 和 `computeBudget()`；同一 system/tool 状态只计一次，保留 per-message 开销和非 ASCII/图片误差余量。
+A/B/soft/hard 是完整蓝图；当前具体公式见本文开头的生命周期修正。后续实现可拆为 `estimateConversation()`、`estimateSystem()` 和 `computeBudget()`；同一 system/tool 状态只计一次，保留 per-message 开销和非 ASCII/图片误差余量。
 
 公共 `estimateTokens()` 是粗略 heuristic，不等于 provider tokenizer；对未知角色返回 unknown，不把 undefined 当 0。usage 仅校准同类未修改输入，不能用旧 request usage 给新 checkpoint 保证容量。
 
@@ -271,7 +298,7 @@ status/inspect/pin/on/off/observe 命令等 idle 后执行。配置和 pin 保�
 
 ```text
 mode=observe                    targetTokens=32768
-keepRecentGroups=3              minCheckpointTurns=8
+keepRecentGroups=3              minCheckpointTurns=16
 minSavingTokens=256              minBatchSavingTokens=2048
 recallMaxTokens=2000             recallMaxEntries=8
 extractor=disabled              reserveTokens=未配置
@@ -279,7 +306,7 @@ extractor=disabled              reserveTokens=未配置
 
 用 `registerFlag` 的 string/boolean 类型解析，例如 `--rolling-context-mode`、`--rolling-context-target`、`--rolling-context-reserve`；数值严格解析为有界 safe integer。未知值或负数报错，不静默吞掉。会话命令覆盖保存为 config custom entry，不修改原生 settings。
 
-每次完整边界可以计算，但普通胶囊批次至少间隔 4 个完整回合且达到批量收益；超 soft 时允许提前处理。checkpoint 默认间隔 8 回合，硬容量压力优先安全兜底。epoch 只在 compaction 真正存在时递增。
+每次完整边界可以计算，但普通胶囊批次至少间隔 4 个完整 turn 且达到批量收益；soft 可提前到至少 2 turn / 基础收益的一半。checkpoint 默认间隔 16 turn，普通 warm 驻留同样至少 16 turn；hard 压力优先安全兜底。epoch 只在匹配 compaction 真正存在时递增。配置 flag 为 `--rolling-context-warm-interval`、`--rolling-context-batch-saving`、`--rolling-context-checkpoint-interval`，后者绝不是 branch entry 数。
 
 cache 优化首版是可解释阈值，不建立复杂预测模型：高 cacheRead 比例时提高普通批次门槛；容量余量不足不能仅为了 cache 延迟。分别记录输入/cacheRead/cacheWrite、维护延迟、回退原因和召回成本；P2 提取成本独立列出，不能藏在主 agent usage 中。
 

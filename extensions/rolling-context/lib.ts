@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 export const STATE_TYPE = "rolling-context.state.v1";
 export const NOTE_TYPE = "rolling-context.note.v1";
 export const CHECKPOINT_TYPE = "rolling-context.checkpoint.v1";
+export const TELEMETRY_TYPE = "rolling-context.telemetry.v1";
 export const MAX_STATE_BYTES=128*1024;
 export function serializedStateBytes(value:unknown):number{return new TextEncoder().encode(JSON.stringify(value)).byteLength;}
 
@@ -35,7 +36,7 @@ export interface MemorySnapshot {
 export interface StateEnvelope {
   schemaVersion: 1; revision: number; planId: string; baseLeafId: string | null;
   snapshot: MemorySnapshot;
-  edits: Array<{targetId:string; originalHash:string; replacementHash:string; replacement:string}>;
+  edits: Array<{targetId:string; originalHash:string; replacementHash:string; replacement?:string; warmTurn?:number}>;
   checkpoint?: {firstKeptEntryId:string; summaryHash:string};
 }
 export interface RollingConfig {
@@ -45,7 +46,64 @@ export interface RollingConfig {
   contextWindow?: number;
   minSavingTokens: number;
   minCheckpointTurns: number;
+  minWarmTurns?: number;
+  minBatchSavingTokens?: number;
   recallMaxTokens: number;
+}
+export interface PlanMetrics {
+  afterWarmTokens?:number;
+  afterCheckpointTokens?:number;
+  attemptedStateBytes?:number;
+  rejection?:string;
+}
+function replacementText(entry:Extract<SessionEntry,{type:"context_edit"}>):string|undefined {
+  const content=entry.replacement?.content;
+  return typeof content==="string"?content:Array.isArray(content)&&content.every(p=>p.type==="text")?content.map(p=>p.type==="text"?p.text:"").join("\n"):undefined;
+}
+export function ownedCheckpoint(entry:SessionEntry):boolean {
+  if(entry.type!=="compaction")return false;
+  const d=entry.details as any, c=d?.stateEnvelope?.checkpoint;
+  return d?.type===CHECKPOINT_TYPE&&d.firstKeptEntryId===entry.firstKeptEntryId&&d.summaryHash===hash(entry.summary)&&c?.firstKeptEntryId===entry.firstKeptEntryId&&c?.summaryHash===d.summaryHash;
+}
+// Ownership is append-order evidence, not a capsule-looking string. A foreign edit
+// anywhere in a source's history permanently prevents raw restoration.
+export function ownedEdits(branch:SessionEntry[]):Map<string,StateEnvelope["edits"][number]> {
+  const sources=new Map(branch.map(entry=>[entry.id,entry]));
+  const declared=new Map<string,StateEnvelope["edits"][number]>(),owned=new Map<string,StateEnvelope["edits"][number]>(),foreign=new Set<string>();
+  for(const entry of branch){
+    const envelope=entry.type==="custom"&&entry.customType===STATE_TYPE?entry.data as StateEnvelope:ownedCheckpoint(entry)?(entry as any).details.stateEnvelope as StateEnvelope:undefined;
+    if(envelope?.schemaVersion===1&&Array.isArray(envelope.edits))for(const edit of envelope.edits){
+      declared.set(edit.targetId,edit);
+      const actual=owned.get(edit.targetId);
+      if(actual&&actual.originalHash===edit.originalHash&&actual.replacementHash===edit.replacementHash&&actual.warmTurn===undefined&&edit.warmTurn!==undefined)owned.set(edit.targetId,{...actual,warmTurn:edit.warmTurn});
+    }
+    if(entry.type!=="context_edit")continue;
+    const edit=declared.get(entry.targetId),text=replacementText(entry);
+    const source=sources.get(entry.targetId);
+    const original=source?.type==="message"&&source.message.role==="toolResult"?textContent(source.message):undefined;
+    if(!edit||text===undefined||hash(text)!==edit.replacementHash||original===undefined||hash(original)!==edit.originalHash)foreign.add(entry.targetId);
+    if(!foreign.has(entry.targetId)&&edit)owned.set(entry.targetId,edit);else owned.delete(entry.targetId);
+  }
+  return owned;
+}
+export function turnClock(branch:SessionEntry[]):{turn:number;lastWarmTurn:number;lastCheckpointTurn:number;epoch:number} {
+  let turn=0,lastCheckpointTurn=0,epoch=0;
+  for(const entry of branch){
+    if(entry.type==="custom"&&entry.customType===TELEMETRY_TYPE){const n=(entry.data as any)?.turn;if(Number.isSafeInteger(n)&&n>turn)turn=n;}
+    if(ownedCheckpoint(entry)){epoch++;const n=(entry as any).details.turn;lastCheckpointTurn=Number.isSafeInteger(n)?n:turn;}
+  }
+  const lastWarmTurn=Math.max(0,...[...ownedEdits(branch).values()].map(e=>e.warmTurn??0));
+  return {turn,lastWarmTurn,lastCheckpointTurn,epoch};
+}
+export function recallProjection(cwd:string,header:any,branch:SessionEntry[],live:ProjectedSessionEntry[]):ProjectedSessionEntry[] {
+  // Foreign compactions may encode redaction/permissions. Never undo them.
+  if(!header||branch.some(e=>e.type==="compaction"&&!ownedCheckpoint(e)))return live;
+  const filtered=branch.filter(e=>!ownedCheckpoint(e)).map((e,i,all)=>({...e,parentId:i?all[i-1].id:null}));
+  try{
+    const restored=SessionManager.inMemory(cwd,undefined,[header,...filtered]).buildSessionProjection().entries;
+    const visible=new Map(live.map(e=>[e.sourceEntry.id,e]));
+    return restored.map(e=>visible.get(e.sourceEntry.id)??e);
+  }catch{return live;}
 }
 export interface Group {
   assistantId: string; resultIds: string[]; callIds: string[]; complete: boolean; consumed: boolean;
@@ -61,6 +119,30 @@ export function effectiveTarget(config:RollingConfig):number{
 export function emptySnapshot(taskId = "") : MemorySnapshot {
   return { schemaVersion:1, revision:0, coveredThroughEntryId:"", items:[], intentRefs:[], focus:{taskId,nextSteps:[],openQuestions:[]}, coverage:[] };
 }
+export function boundMemory(snapshot:MemorySnapshot):void {
+  snapshot.items=snapshot.items.filter(i=>i.pinned||(!i.id.startsWith("rc-assistant-")&&i.status!=="superseded"&&i.status!=="resolved"));
+  for(const item of snapshot.items){
+    if(!item.pinned&&item.id.startsWith("rc-evidence-"))item.text=`Historical source=${item.sourceEntryIds[0]}; paths=${item.dependencies.map(d=>d.path).join(",")}; recall for exact evidence, not current filesystem truth.`;
+    if(!item.pinned&&item.id.startsWith("rc-bash-"))item.text=`Historical shell source=${item.sourceEntryIds[0]}; recall for exact evidence.`;
+  }
+  // These are a bounded working map, not a permanent evidence ledger. L0 still
+  // contains every retired source. Explicit constraints/decisions/pins are exempt.
+  for(const kind of ["project","change","test"] as const){
+    const items=snapshot.items.filter(i=>i.kind===kind&&!i.pinned);
+    const retired=new Set(items.slice(0,Math.max(0,items.length-32)).map(i=>i.id));
+    snapshot.items=snapshot.items.filter(i=>!retired.has(i.id));
+  }
+  snapshot.coverage=snapshot.coverage.slice(-64);
+  snapshot.focus.nextSteps=snapshot.items.filter(i=>i.status==="active"&&i.key.startsWith("next-step:")).slice(-3).map(i=>i.text);
+}
+export function contextComposition(entries:ProjectedSessionEntry[],warmIds:Set<string>):{hotTokens:number;warmTokens:number;checkpointTokens:number;otherTokens:number} {
+  const result={hotTokens:0,warmTokens:0,checkpointTokens:0,otherTokens:0};
+  for(const entry of entries)for(const message of entry.messages){
+    const key=message.role==="compactionSummary"?"checkpointTokens":warmIds.has(entry.sourceEntry.id)?"warmTokens":["user","assistant","toolResult","bashExecution"].includes(message.role)?"hotTokens":"otherTokens";
+    result[key]+=estimateTokens(message);
+  }
+  return result;
+}
 function validSnapshot(x: unknown): x is MemorySnapshot {
   if (!x || typeof x !== "object") return false;
   const s=x as MemorySnapshot;
@@ -74,7 +156,7 @@ export function rebuild(branch: SessionEntry[], sessionId: string): {snapshot:Me
     if (entry.type === "custom" && entry.customType === STATE_TYPE) {
       const candidate=entry.data as StateEnvelope;
       if (!candidate || candidate.schemaVersion!==1 || !validSnapshot(candidate.snapshot) || !Array.isArray(candidate.edits)) { diagnostics.push(`Invalid rolling state at ${entry.id}`); continue; }
-      if (candidate.revision >= snapshot.revision) { snapshot=candidate.snapshot; envelope=candidate; }
+      if (candidate.revision >= snapshot.revision) { snapshot=structuredClone(candidate.snapshot); envelope=candidate; }
     }
     if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "context_note") {
       const note=(entry.message.details as any);
@@ -87,6 +169,7 @@ export function rebuild(branch: SessionEntry[], sessionId: string): {snapshot:Me
         if(old)old.status="superseded";
       }
       const item:MemoryItem={id:String(note.noteId||entry.id),key:`${note.kind}:${note.key||note.noteId||entry.id}`,kind:note.kind==="task-decision"?"task-decision":note.kind==="focus"?"focus":"task",text:note.text,status:"active",authority:"agent-report",sourceEntryIds:[entry.id],taskId,dependencies:Array.isArray(note.paths)?note.paths.map((path:string)=>({path})):[],observedAtEntryId:entry.id,pinned:false};
+      if(note.kind!=="task-decision")for(const old of snapshot.items)if(old.authority==="agent-report"&&old.status==="active"&&old.key.startsWith(`${note.kind}:`)&&old.id!==item.id&&!old.pinned)old.status="superseded";
       if (!snapshot.items.some(i=>i.id===item.id)) snapshot.items.push(item);
       if (note.kind==="next-step") snapshot.focus.nextSteps=[...snapshot.focus.nextSteps,item.text].slice(-3);
     }
@@ -94,7 +177,7 @@ export function rebuild(branch: SessionEntry[], sessionId: string): {snapshot:Me
     if (entry.type === "compaction" && (entry.details as any)?.type===CHECKPOINT_TYPE) {
       const details=entry.details as any;const data=details.stateEnvelope as StateEnvelope|undefined;const actualSummaryHash=hash(entry.summary);
       const validCheckpoint=data&&data.checkpoint?.firstKeptEntryId===entry.firstKeptEntryId&&data.checkpoint?.summaryHash===actualSummaryHash&&details.firstKeptEntryId===entry.firstKeptEntryId&&details.summaryHash===actualSummaryHash;
-      if(data&&validCheckpoint&&validSnapshot(data.snapshot)&&data.revision>=snapshot.revision){snapshot=data.snapshot;envelope=data;}
+      if(data&&validCheckpoint&&validSnapshot(data.snapshot)&&data.revision>=snapshot.revision){snapshot=structuredClone(data.snapshot);envelope=data;}
       else diagnostics.push(`Checkpoint metadata does not match compaction entry ${entry.id}`);
     }
   }
@@ -159,6 +242,11 @@ function capsuleSafe(group:Group):boolean {
     return false;
   });
 }
+function checkpointSafe(group:Group):boolean {
+  return capsuleSafe(group)||group.complete&&group.consumed&&group.results.every(r=>!r.message.isError&&(
+    r.message.toolName==="context_note"&&(r.message.details as any)?.type===NOTE_TYPE||
+    ["design_intent_query","design_intent_get"].includes(r.message.toolName)&&(r.message.details as any)?.projection?.availability==="ready"));
+}
 export function analyzeGroups(entries:ProjectedSessionEntry[],snapshot:MemorySnapshot):Array<{assistantId:string;resultIds:string[];reasons:string[]}>{
   const all=groups(entries),recent=new Set(all.filter(group=>group.complete).slice(-3).map(group=>group.assistantId));
   const pinned=new Set(snapshot.items.filter(item=>item.pinned).flatMap(item=>item.sourceEntryIds));
@@ -200,20 +288,31 @@ export function makeCapsule(group:Group, entries:SessionEntry[], onlyResultId?:s
 export function renderCheckpoint(snapshot:MemorySnapshot):string {
   const active=snapshot.items.filter(i=>i.status==="active"||i.status==="stale");
   const by=(kind:MemoryItem["kind"])=>active.filter(i=>i.kind===kind).map(i=>`- ${i.text}${i.status==="stale"?" (待核验)":""}`).join("\n")||"- 无";
-  return ["[Rolling Context checkpoint v1]",`目标/焦点：${snapshot.focus.taskId||"当前任务"}`,"用户约束与任务计划：",by("constraint"),by("task"),"文件/项目观察与工具证据（带来源，需按当前状态核验）：",by("project"),"相关 Design Intent（只读历史投影；设计敏感操作前必须重新查询当前文件）：",snapshot.intentRefs.length?snapshot.intentRefs.map(i=>`- ${i.id} @ ${i.storeRevision} (${i.sourceHash.slice(0,12)})${i.projection?`: ${i.projection}`:""}`).join("\n"):"- 未查询或未配置", "当前任务执行决策 (task-decision)：",by("task-decision"),"修改/验证/错误状态：",[...by("change").split("\n"),...by("test").split("\n")].join("\n"),"下一步：",snapshot.focus.nextSteps.map((s,i)=>`${i+1}. ${s}`).join("\n")||"- 未指定","历史证据仅可按当前分支来源召回；过期/待核验内容不可视为当前事实。"].join("\n");
+  return ["[Rolling Context checkpoint v1]",`目标/焦点：${snapshot.focus.taskId||"当前任务"}`,"用户约束与任务计划：",by("constraint"),by("task"),"当前焦点：",by("focus"),"阻塞/待确认：",snapshot.focus.openQuestions.join("\n")||"- 未记录","文件/项目观察与工具证据（带来源，需按当前状态核验）：",by("project"),"相关 Design Intent（只读历史投影；设计敏感操作前必须重新查询当前文件）：",snapshot.intentRefs.length?snapshot.intentRefs.map(i=>`- ${i.id} @ ${i.storeRevision} (${i.sourceHash.slice(0,12)})${i.projection?`: ${i.projection}`:""}`).join("\n"):"- 未查询或未配置", "当前任务执行决策 (task-decision)：",by("task-decision"),"修改/验证/错误状态：",[...by("change").split("\n"),...by("test").split("\n")].join("\n"),"下一步：",snapshot.focus.nextSteps.map((s,i)=>`${i+1}. ${s}`).join("\n")||"- 未指定","历史证据仅可按当前分支来源召回；过期/待核验内容不可视为当前事实。"].join("\n");
 }
 export function estimateProjection(entries:ProjectedSessionEntry[]):number {
   return entries.reduce((sum,e)=>sum+e.messages.reduce((n,m)=>n+estimateTokens(m),0),0);
 }
-export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEntry[];eventEntries:SessionBoundaryDraft[];baseLeaf:string|null;config:RollingConfig;state:ReturnType<typeof rebuild>;sessionId:string;currentTokens?:number|null}):SessionBoundaryDraft[] {
+export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEntry[];eventEntries:SessionBoundaryDraft[];baseLeaf:string|null;config:RollingConfig;state:ReturnType<typeof rebuild>;sessionId:string;currentTokens?:number|null;turn?:number;cache?:{input?:number;cacheRead?:number};metrics?:PlanMetrics;preview?:(drafts:SessionBoundaryDraft[])=>ProjectedSessionEntry[]|undefined}):SessionBoundaryDraft[] {
   const {entries,branch,eventEntries,baseLeaf,config,state,sessionId}=args;
   if(config.mode==="off")return [];
   const drafts:SessionBoundaryDraft[]=[];
+  const clock=turnClock(branch),turn=args.turn??clock.turn+1;
+  const committed=ownedEdits(branch);
+  const target=effectiveTarget(config),soft=Math.ceil(target*1.2);
+  const hard=config.contextWindow===undefined?Infinity:Math.max(0,config.contextWindow-config.reserveTokens-Math.max(2048,Math.ceil(config.contextWindow*0.05)));
+  const projectedTokens=estimateProjection(entries); // Usage is the previous request, never the candidate budget.
+  const emergency=projectedTokens>hard;
+  const preview=args.preview??((ds:SessionBoundaryDraft[])=>previewDrafts("/tmp",{type:"session",version:3,id:sessionId,timestamp:new Date(0).toISOString(),cwd:"/tmp"},branch,[...eventEntries,...ds]) as ProjectedSessionEntry[]|undefined);
   let snapshot=structuredClone(state.snapshot);
+  const foreignTargets=new Set([...branch,...eventEntries].filter(e=>e.type==="context_edit"&&!committed.has(e.targetId)).map(e=>e.type==="context_edit"?e.targetId:""));
+  snapshot.items=snapshot.items.filter(i=>!i.sourceEntryIds.some(id=>foreignTargets.has(id)));
+  if(foreignTargets.size)snapshot.intentRefs=[]; // Older references have no source-entry field; revoke conservatively.
+  boundMemory(snapshot);
   if(!snapshot.focus.taskId){const firstUser=entries.find(e=>e.messages.some(m=>m.role==="user"));if(firstUser)snapshot.focus.taskId=`RC-T-${firstUser.sourceEntry.id}`;}
   for(const projected of entries){
     for(const message of projected.messages){
-      const projection=message.role==="custom"&&message.customType==="design-intent.projection.v1"
+      const projection=foreignTargets.has(projected.sourceEntry.id)?undefined:message.role==="custom"&&message.customType==="design-intent.projection.v1"
         ? message.details as any
         : message.role==="toolResult"&&["design_intent_query","design_intent_get"].includes(message.toolName)
           ? (message.details as any)?.projection
@@ -235,64 +334,81 @@ export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEnt
   }
   const toolGroups=groups(entries);
   const groupAnalysis=analyzeGroups(entries,snapshot);const groupReasons=new Map(groupAnalysis.map(group=>[group.assistantId,group.reasons]));
-  const edits=state.envelope?.edits? [...state.envelope.edits]:[];
+  const edits=[...committed.values()].filter(edit=>entries.some(e=>e.sourceEntry.id===edit.targetId&&e.messages.length)).map(({replacement,...edit})=>({...edit,warmTurn:edit.warmTurn??clock.turn}));
+  const candidates:Array<{edit:StateEnvelope["edits"][number];draft:SessionBoundaryDraft;saving:number}>=[];
+  const coveredIndex=branch.findIndex(e=>e.id===snapshot.coveredThroughEntryId);
+  const newSource=(id:string)=>coveredIndex<0||branch.findIndex(e=>e.id===id)>coveredIndex;
+  const upsert=(item:MemoryItem)=>{const index=snapshot.items.findIndex(i=>i.key===item.key&&!i.pinned);if(index>=0)snapshot.items.splice(index,1);snapshot.items.push(item);};
   for(const group of toolGroups) {
-    if(!group.consumed) continue;
+    if(!group.complete) continue;
     for(const result of group.results) {
       const capsuleAllowed=(groupReasons.get(group.assistantId)?.length??1)===0;
-      const capsule=capsuleAllowed?makeCapsule(group,branch,result.id):undefined;
+      const foreignEdit=branch.some(e=>e.type==="context_edit"&&e.targetId===result.id)&&!committed.has(result.id);
+      if(foreignEdit||foreignTargets.has(result.id))continue;
+      const source=branch.find(e=>e.id===result.id);
+      const raw=source?.type==="message"&&source.message.role==="toolResult"?textContent(source.message):undefined;
+      const capsule=capsuleAllowed&&!foreignEdit&&!committed.has(result.id)&&raw===textContent(result.message)?makeCapsule(group,branch,result.id):undefined;
       const original=textContent(result.message);
       if(original===undefined)continue;
       const call=group.message.content.find((part):part is Extract<typeof part,{type:"toolCall"}>=>part.type==="toolCall"&&part.id===result.message.toolCallId);
       const args=call?JSON.stringify(call.arguments).slice(0,400):"{}";
-      const output=original.length>1400?`${original.slice(0,1000)}\n[… output abbreviated; source ${result.id} …]\n${original.slice(-300)}`:original;
-      const evidenceText=`[${result.message.toolName} evidence; call args=${args}; source entry=${result.id}; isError=${result.message.isError}]\n${output}`;
+      const evidenceText=`Historical ${result.message.toolName} source=${result.id}; args=${args}; error=${result.message.isError}; contentHash=${hash(original).slice(0,16)}. Recall for exact evidence; not current filesystem truth.`;
       const changes=(result.message.details as any)?.changes;
       const changedPaths=Array.isArray(changes)?changes.map((change:any)=>change?.path).filter((path:any):path is string=>typeof path==="string"):[];
-      if(result.message.toolName==="edit"&&changedPaths.length){
+      if(newSource(result.id)&&result.message.toolName==="edit"&&changedPaths.length){
         for(const item of snapshot.items)if((item.dependencies.some(dep=>changedPaths.includes(dep.path))||item.kind==="test"&&item.dependencies.length===0)&&(item.kind==="project"||item.kind==="test"))item.status="stale";
-        const changeItem:MemoryItem={id:`rc-change-${result.id}`,key:`change:${result.id}`,kind:"change",text:`Edit reported changes to ${changedPaths.join(", ")}; source ${result.id}. This does not imply tests passed.`,status:"active",authority:"tool-evidence",sourceEntryIds:[result.id],taskId:snapshot.focus.taskId,dependencies:changedPaths.map(path=>({path})),observedAtEntryId:result.id,pinned:false};
-        if(!snapshot.items.some(i=>i.id===changeItem.id))snapshot.items.push(changeItem);
+        const changeItem:MemoryItem={id:`rc-change-${result.id}`,key:`change:${changedPaths.slice().sort().join(",")}`,kind:"change",text:`Edit reported changes to ${changedPaths.join(", ")}; source ${result.id}. This does not imply tests passed.`,status:"active",authority:"tool-evidence",sourceEntryIds:[result.id],taskId:snapshot.focus.taskId,dependencies:changedPaths.map(path=>({path})),observedAtEntryId:result.id,pinned:false};
+        upsert(changeItem);
       }
       const command=call&&typeof call.arguments.command==="string"?call.arguments.command:"";
       const isTestCommand=/\b(test|vitest|jest|pytest|cargo test|go test|npm run test|pnpm test)\b/i.test(command);
       const knownReadOnly=/^\s*(?:pwd|ls|find|rg|grep|git\s+(?:status|diff|log|show)|cat|head|tail|sed\s+-n)\b/i.test(command);
-      if(result.message.toolName==="bash"&&!knownReadOnly&&!isTestCommand){for(const item of snapshot.items)if(item.kind==="project"||item.kind==="test")item.status="stale";}
-      if(result.message.toolName==="bash"&&isTestCommand){
-        const testItem:MemoryItem={id:`rc-test-${result.id}`,key:`test:${result.id}`,kind:"test",text:`Test command evidence: ${command.slice(0,300)}; tool error=${result.message.isError}; output source=${result.id}. Scope and current file version still require verification.`,status:result.message.isError?"stale":"active",authority:"tool-evidence",sourceEntryIds:[result.id],taskId:snapshot.focus.taskId,dependencies:changedPaths.map(path=>({path})),observedAtEntryId:result.id,pinned:false};
-        if(!snapshot.items.some(i=>i.id===testItem.id))snapshot.items.push(testItem);
+      if(newSource(result.id)&&result.message.toolName==="bash"&&!knownReadOnly&&!isTestCommand){for(const item of snapshot.items)if(item.kind==="project"||item.kind==="test")item.status="stale";}
+      if(newSource(result.id)&&result.message.toolName==="bash"&&isTestCommand){
+        const testItem:MemoryItem={id:`rc-test-${result.id}`,key:`test:${command.slice(0,300)}`,kind:"test",text:`Test command evidence: ${command.slice(0,300)}; tool error=${result.message.isError}; output source=${result.id}. Scope and current file version still require verification.`,status:result.message.isError?"stale":"active",authority:"tool-evidence",sourceEntryIds:[result.id],taskId:snapshot.focus.taskId,dependencies:changedPaths.map(path=>({path})),observedAtEntryId:result.id,pinned:false};
+        upsert(testItem);
       }
       const dependencies=changedPaths.length?changedPaths.map(path=>({path})):call&&typeof call.arguments.path==="string"?[{path:call.arguments.path}]:[];
-      const evidenceItem:MemoryItem={id:`rc-evidence-${result.id}`,key:`source:${result.id}`,kind:"project",text:evidenceText,status:"active",authority:"tool-evidence",sourceEntryIds:[result.id,group.assistantId],taskId:snapshot.focus.taskId,dependencies,observedAtEntryId:result.id,pinned:false};
-      if(!snapshot.items.some(i=>i.id===evidenceItem.id))snapshot.items.push(evidenceItem);
+      const evidenceItem:MemoryItem={id:`rc-evidence-${result.id}`,key:`project:${dependencies.map(d=>d.path).join(",")||result.message.toolName}`,kind:"project",text:evidenceText,status:"active",authority:"tool-evidence",sourceEntryIds:[result.id,group.assistantId],taskId:snapshot.focus.taskId,dependencies,observedAtEntryId:result.id,pinned:false};
+      if(newSource(result.id))upsert(evidenceItem);
       if(!capsule||original.length-capsule.length<config.minSavingTokens*4)continue;
       if(edits.some(e=>e.targetId===result.id&&e.replacementHash===hash(capsule)))continue;
-      const edit={targetId:result.id,originalHash:hash(original),replacementHash:hash(capsule),replacement:capsule};
-      edits.push(edit);drafts.push({type:"context_edit",targetId:result.id,replacement:{content:[{type:"text",text:capsule}]}});
+      const edit={targetId:result.id,originalHash:hash(original),replacementHash:hash(capsule),warmTurn:turn};
+      const replacement={...result.message,content:[{type:"text" as const,text:capsule}]};
+      candidates.push({edit,draft:{type:"context_edit",targetId:result.id,replacement:{content:replacement.content}},saving:estimateTokens(result.message)-estimateTokens(replacement)});
     }
   }
-  for(const projected of entries){
-    for(const message of projected.messages){
-      if(message.role==="assistant"){
-        const text=message.content.filter(part=>part.type==="text").map(part=>part.type==="text"?part.text:"").join("\n").trim();
-        if(!snapshot.items.some(item=>item.sourceEntryIds.includes(projected.sourceEntry.id))){
-          const report=text?`[Assistant task report; source ${projected.sourceEntry.id}] ${text.slice(0,1400)}`:`[Assistant turn structure covered by tool evidence; source ${projected.sourceEntry.id}]`;
-          snapshot.items.push({id:`rc-assistant-${projected.sourceEntry.id}`,key:`assistant:${projected.sourceEntry.id}`,kind:"task",text:report,status:"active",authority:"agent-report",sourceEntryIds:[projected.sourceEntry.id],taskId:snapshot.focus.taskId,dependencies:[],observedAtEntryId:projected.sourceEntry.id,pinned:false});
-        }
-      }else if((message as any).role==="bashExecution"){
-        const b=message as any;if(b.output&&!snapshot.items.some(item=>item.id===`rc-bash-${projected.sourceEntry.id}`))snapshot.items.push({id:`rc-bash-${projected.sourceEntry.id}`,key:`bash:${projected.sourceEntry.id}`,kind:"project",text:`[Historical shell evidence; source ${projected.sourceEntry.id}; command=${String(b.command).slice(0,300)}; exit=${b.exitCode??"unknown"}] ${String(b.output).slice(0,900)}`,status:"active",authority:"tool-evidence",sourceEntryIds:[projected.sourceEntry.id],taskId:snapshot.focus.taskId,dependencies:[],observedAtEntryId:projected.sourceEntry.id,pinned:false});
-      }
-    }
+  // Aging is recalculated each turn; prefix mutation is a batch, not housekeeping.
+  const saving=candidates.reduce((n,c)=>n+c.saving,0);
+  const cache=args.cache;
+  const totalInput=cache?.input!==undefined&&cache.cacheRead!==undefined?cache.input+cache.cacheRead:undefined;
+  const highCache=totalInput!==undefined&&totalInput>0&&cache!.cacheRead!/totalInput>=0.8;
+  const batchThreshold=(config.minBatchSavingTokens??2048)*(highCache?2:1);
+  const sinceWarm=turn-clock.lastWarmTurn;
+  const normalBatch=sinceWarm>=(config.minWarmTurns??4)&&saving>=batchThreshold;
+  const pressureBatch=projectedTokens>soft&&sinceWarm>=Math.max(2,Math.ceil((config.minWarmTurns??4)/2))&&saving>=(config.minBatchSavingTokens??2048)/2;
+  if(candidates.length&&(emergency||pressureBatch||normalBatch)){
+    for(const candidate of candidates){edits.push(candidate.edit);drafts.push(candidate.draft);}
   }
-  const projectedTokens=Number.isSafeInteger(args.currentTokens)&&args.currentTokens!>=0?args.currentTokens!:estimateProjection(entries);
-  const target=effectiveTarget(config);
-  const maybeCheckpoint=projectedTokens>target&&branch.length>config.minCheckpointTurns;
+  const afterWarm=preview(drafts);
+  if(!afterWarm)return [];
+  const afterWarmTokens=estimateProjection(afterWarm);
+  if(args.metrics)args.metrics.afterWarmTokens=afterWarmTokens;
+  const maybeCheckpoint=afterWarmTokens>target&&(emergency||turn-clock.lastCheckpointTurn>=config.minCheckpointTurns);
+  boundMemory(snapshot);
+  // Generic assistant/tool history stays in L0, not a second transcript in L1.
+  const covered=new Set(entries.filter(e=>e.messages.length>0&&e.messages.every(m=>m.role==="system"||m.role==="assistant"||m.role==="user"||m.role==="bashExecution"||m.role==="toolResult")).map(e=>e.sourceEntry.id));
   let checkpoint:StateEnvelope["checkpoint"];
   if(maybeCheckpoint) {
     const latest=entries.filter(e=>e.messages.some(m=>m.role==="user")).at(-1);
     const latestIndex=latest?entries.findIndex(e=>e.sourceEntry.id===latest.sourceEntry.id):-1;
     const recentIds=new Set(toolGroups.filter(group=>group.complete).slice(-3).map(group=>group.assistantId));
-    const protectedIndices=toolGroups.filter(group=>!group.complete||!group.consumed||recentIds.has(group.assistantId)).map(group=>entries.findIndex(e=>e.sourceEntry.id===group.assistantId)).filter(index=>index>=0);
+    const protectedIndices=toolGroups.filter(group=>!group.complete||!group.consumed||recentIds.has(group.assistantId)||(groupReasons.get(group.assistantId)??[]).some(r=>r==="PINNED_SOURCE"||r==="ACTIVE_PATH_DEPENDENCY")||(!emergency&&capsuleSafe(group)&&group.resultIds.some(id=>!committed.has(id)||turn-(committed.get(id)?.warmTurn??turn)<config.minCheckpointTurns))).map(group=>entries.findIndex(e=>e.sourceEntry.id===group.assistantId)).filter(index=>index>=0);
+    for(const item of snapshot.items.filter(i=>i.pinned&&i.authority!=="user"))for(const id of item.sourceEntryIds){
+      const group=toolGroups.find(g=>g.resultIds.includes(id));
+      const index=entries.findIndex(e=>e.sourceEntry.id===(group?.assistantId??id));
+      if(index>=0)protectedIndices.push(index);
+    }
     const firstKeptIndex=protectedIndices.length?Math.min(...protectedIndices):(latestIndex<0?entries.length:latestIndex);
     const firstKept=entries[firstKeptIndex]?.sourceEntry.id;
     const hasImage=entries.slice(0,firstKeptIndex).some(e=>e.messages.some(m=>m.role==="user"&&Array.isArray(m.content)&&m.content.some(c=>c.type==="image")));
@@ -303,49 +419,59 @@ export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEnt
     const hasForeignEdit=rawCutIndex<0||eventEntries.some(draft=>draft.type==="context_edit")||Array.from(rawPrefixIds).some(targetId=>{
       const edit=latestEdits.get(targetId);if(!edit)return false;if(!edit.replacement)return true;
       const content=edit.replacement.content;const text=typeof content==="string"?content:Array.isArray(content)&&content.every(part=>part.type==="text")?content.map(part=>part.type==="text"?part.text:"").join("\n"):undefined;
-      return text===undefined||!edits.some(owned=>owned.targetId===targetId&&owned.replacementHash===hash(text));
+      return text===undefined||committed.get(targetId)?.replacementHash!==hash(text);
     });
     const hasExistingCompaction=[...eventEntries,...drafts].some(d=>d.type==="compaction");
-    const covered=new Set(snapshot.items.flatMap(item=>item.sourceEntryIds));
     const unknownToolCrossed=toolGroups.some(group=>{
       const groupIndex=entries.findIndex(entry=>entry.sourceEntry.id===group.assistantId);
-      return groupIndex>=0&&groupIndex<firstKeptIndex&&!capsuleSafe(group);
+      return groupIndex>=0&&groupIndex<firstKeptIndex&&!checkpointSafe(group);
     });
     const contentCovered=!unknownToolCrossed&&entries.slice(0,firstKeptIndex).every(entry=>entry.messages.every(message=>{
       if(message.role==="system")return true;
       if(message.role==="custom")return message.customType==="design-intent.projection.v1"&&snapshot.intentRefs.some(ref=>ref.id);
-      if(message.role==="compactionSummary"||message.role==="branchSummary")return false;
+      if(message.role==="compactionSummary")return ownedCheckpoint(entry.sourceEntry);
+      if(message.role==="branchSummary")return false;
       return covered.has(entry.sourceEntry.id);
     }));
-    if(firstKept&&!hasImage&&!hasForeign&&!hasForeignEdit&&!hasExistingCompaction&&contentCovered) {
+    if(firstKept&&!hasImage&&!hasForeign&&!hasForeignEdit&&!hasExistingCompaction&&contentCovered&&snapshot.items.some(i=>i.authority==="agent-report"&&i.status==="active"&&!i.id.startsWith("rc-assistant-"))) {
       const summary=renderCheckpoint(snapshot);
-      const keptTokens=estimateProjection(entries.slice(firstKeptIndex));
+      const keptTokens=estimateProjection(afterWarm.filter(e=>entries.slice(firstKeptIndex).some(k=>k.sourceEntry.id===e.sourceEntry.id)));
       const candidateTokens=keptTokens+Math.ceil(summary.length/4);
-      if(candidateTokens<projectedTokens&&candidateTokens<=target){
-        const candidate={type:"compaction" as const,summary,firstKeptEntryId:firstKept,details:{type:CHECKPOINT_TYPE,planId:hash([sessionId,baseLeaf,snapshot.revision,summary]).slice(0,24),stateRevision:snapshot.revision,firstKeptEntryId:firstKept,summaryHash:hash(summary)}};
+      if(candidateTokens<afterWarmTokens&&candidateTokens<=target){
+        const candidate={type:"compaction" as const,summary,firstKeptEntryId:firstKept,details:{type:CHECKPOINT_TYPE,turn,reason:emergency?"hard":"after-warm-budget",planId:hash([sessionId,baseLeaf,snapshot.revision,summary]).slice(0,24),stateRevision:snapshot.revision,firstKeptEntryId:firstKept,summaryHash:hash(summary)}};
         drafts.push(candidate); checkpoint={firstKeptEntryId:firstKept,summaryHash:hash(summary)};
+        const checked=preview(drafts);
+        if(!checked||estimateProjection(checked)>target||estimateProjection(checked)>=afterWarmTokens){drafts.pop();checkpoint=undefined;}
       }
     }
   }
   const sourceIndices=new Map(entries.map((entry,index)=>[entry.sourceEntry.id,index]));
   const retainedFrom=checkpoint?entries.findIndex(entry=>entry.sourceEntry.id===checkpoint!.firstKeptEntryId):Number.POSITIVE_INFINITY;
-  const dispositions=new Map<string,"retained"|"extracted">();
+  const dispositions=new Map<string,"retained"|"extracted"|"recall-only">();
+  for(const id of covered)dispositions.set(id,"recall-only");
   for(const item of snapshot.items)for(const sourceEntryId of item.sourceEntryIds){
     const index=sourceIndices.get(sourceEntryId);
     if(index!==undefined)dispositions.set(sourceEntryId,checkpoint&&index>=retainedFrom?"retained":"extracted");
   }
-  snapshot.coverage=[...dispositions].map(([sourceEntryId,disposition])=>({sourceEntryId,disposition}));
+  snapshot.coverage=[...dispositions].slice(-64).map(([sourceEntryId,disposition])=>({sourceEntryId,disposition}));
   snapshot.coveredThroughEntryId=entries.filter(entry=>entry.messages.length>0).at(-1)?.sourceEntry.id??snapshot.coveredThroughEntryId;
-  if(!drafts.length&&hash(snapshot)===hash(state.snapshot))return [];
+  boundMemory(snapshot);
+  if(checkpoint){const cut=branch.findIndex(e=>e.id===checkpoint!.firstKeptEntryId);const cold=new Set(branch.slice(0,cut).map(e=>e.id));for(let i=edits.length-1;i>=0;i--)if(cold.has(edits[i].targetId)&&edits[i].warmTurn!==turn)edits.splice(i,1);}
+  if(!drafts.length&&hash(snapshot)===hash(state.snapshot)&&hash(edits)===hash(state.envelope?.edits??[]))return [];
   snapshot.revision=state.snapshot.revision+1;
   const planId=hash([sessionId,baseLeaf,snapshot.revision,edits.map(e=>e.replacementHash),checkpoint]).slice(0,24);
   const envelope:StateEnvelope={schemaVersion:1,revision:snapshot.revision,planId,baseLeafId:baseLeaf,snapshot,edits,checkpoint:checkpoint??state.envelope?.checkpoint};
-  if(serializedStateBytes(envelope)>MAX_STATE_BYTES)return [];
-  for(const draft of drafts)if(draft.type==="compaction"&&(draft.details as any)?.type===CHECKPOINT_TYPE)(draft.details as any).stateEnvelope=envelope;
+  const stateBytes=serializedStateBytes(envelope);
+  if(args.metrics)args.metrics.attemptedStateBytes=stateBytes;
+  if(stateBytes>MAX_STATE_BYTES){if(args.metrics)args.metrics.rejection="STATE_SIZE_LIMIT";return [];}
+  const finalProjection=preview(drafts);
+  if(!finalProjection||checkpoint&&estimateProjection(finalProjection)>target){if(args.metrics)args.metrics.rejection="INVALID_FINAL_PROJECTION";return [];}
+  if(args.metrics)args.metrics.afterCheckpointTokens=estimateProjection(finalProjection);
+  for(const draft of drafts)if(draft.type==="compaction"&&(draft.details as any)?.type===CHECKPOINT_TYPE)Object.assign(draft.details as object,{stateEnvelope:envelope,stateRevision:envelope.revision,planId:envelope.planId});
   drafts.unshift({type:"custom",customType:STATE_TYPE,data:envelope});
   return drafts;
 }
-export function previewDrafts(cwd:string,header:any,branch:SessionEntry[],drafts:SessionBoundaryDraft[]):SessionEntry[]|undefined {
+export function previewDrafts(cwd:string,header:any,branch:SessionEntry[],drafts:SessionBoundaryDraft[]):ProjectedSessionEntry[]|undefined {
   try {
     const manager=SessionManager.inMemory(cwd,undefined,[header,...branch]);
     for(const draft of drafts) {

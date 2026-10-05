@@ -1,6 +1,6 @@
 import type { ExtensionAPI, SessionBoundaryDraft, SessionEntry, ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { analyzeGroups, effectiveTarget, emptySnapshot, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, serializedStateBytes, MAX_STATE_BYTES, type RollingConfig } from "./lib.ts";
+import { analyzeGroups, boundMemory, effectiveTarget, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, serializedStateBytes, MAX_STATE_BYTES, TELEMETRY_TYPE, contextComposition, ownedEdits, ownedCheckpoint, recallProjection, turnClock, type PlanMetrics, type RollingConfig } from "./lib.ts";
 
 const NoteParams=Type.Object({intent:Type.String({minLength:1}),kind:Type.Union([Type.Literal("plan"),Type.Literal("task-decision"),Type.Literal("focus"),Type.Literal("next-step")]),text:Type.String({minLength:1,maxLength:2000}),replaces:Type.Optional(Type.Array(Type.String(),{maxItems:8})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:12}))},{additionalProperties:false});
 const RecallParams=Type.Object({intent:Type.String({minLength:1}),entryId:Type.Optional(Type.String()),itemId:Type.Optional(Type.String()),query:Type.Optional(Type.String({maxLength:300})),paths:Type.Optional(Type.Array(Type.String({minLength:1,maxLength:256}),{maxItems:12})),cursor:Type.Optional(Type.String({maxLength:2048})),limit:Type.Optional(Type.Number({minimum:1,maximum:8}))},{additionalProperties:false});
@@ -13,7 +13,7 @@ function parseConfig(pi:ExtensionAPI):RollingConfig {
     const n=Number(raw);if(!Number.isSafeInteger(n)||n<min||n>max)throw new Error(`Invalid --${name}: expected integer ${min}..${max}`);return n;
   };
   if(!["observe","on","off"].includes(mode))throw new Error("--rolling-context-mode must be observe, on, or off");
-  return {mode:mode as RollingConfig["mode"],targetTokens:number("rolling-context-target",32768,2048),reserveTokens:number("rolling-context-reserve",16384),minSavingTokens:number("rolling-context-min-saving",256),minCheckpointTurns:number("rolling-context-checkpoint-interval",8),recallMaxTokens:number("rolling-context-recall-tokens",2000,100,10000)};
+  return {mode:mode as RollingConfig["mode"],targetTokens:number("rolling-context-target",32768,2048),reserveTokens:number("rolling-context-reserve",16384),minSavingTokens:number("rolling-context-min-saving",256),minCheckpointTurns:number("rolling-context-checkpoint-interval",16),minWarmTurns:number("rolling-context-warm-interval",4,1),minBatchSavingTokens:number("rolling-context-batch-saving",2048,1),recallMaxTokens:number("rolling-context-recall-tokens",2000,100,10000)};
 }
 
 export default function rollingContext(pi:ExtensionAPI) {
@@ -21,7 +21,9 @@ export default function rollingContext(pi:ExtensionAPI) {
   pi.registerFlag("rolling-context-target",{type:"string",default:"32768",description:"Target context token estimate"});
   pi.registerFlag("rolling-context-reserve",{type:"string",default:"16384",description:"Conservative output reserve in tokens"});
   pi.registerFlag("rolling-context-min-saving",{type:"string",default:"256",description:"Minimum token saving per tool result"});
-  pi.registerFlag("rolling-context-checkpoint-interval",{type:"string",default:"8",description:"Minimum branch entries before checkpoint"});
+  pi.registerFlag("rolling-context-checkpoint-interval",{type:"string",default:"16",description:"Minimum completed turns since the last Rolling checkpoint; also minimum warm residence"});
+  pi.registerFlag("rolling-context-warm-interval",{type:"string",default:"4",description:"Minimum completed turns between normal capsule batches"});
+  pi.registerFlag("rolling-context-batch-saving",{type:"string",default:"2048",description:"Minimum cumulative estimated token saving per normal batch"});
   pi.registerFlag("rolling-context-recall-tokens",{type:"string",default:"2000",description:"Maximum recall response estimate"});
   const config=parseConfig(pi);
   let mode=config.mode;
@@ -44,19 +46,21 @@ export default function rollingContext(pi:ExtensionAPI) {
   pi.registerTool({name:"context_recall",label:"Context recall",description:"Search or retrieve limited evidence from the active session branch. Historical content is not current filesystem truth.",parameters:RecallParams,annotations:{readOnlyHint:true,openWorldHint:false},async execute(_id,params,_signal,_update,ctx){
     const branch=ctx.sessionManager.getBranch();
     const projection=ctx.sessionManager.buildSessionProjection();
-    const projectedById=new Map(projection.entries.map(e=>[e.sourceEntry.id,e.messages]));
-    const visibleIds=new Set(projection.entries.filter(e=>e.messages.length>0).map(e=>e.sourceEntry.id));
+    const authorized=recallProjection(ctx.cwd,ctx.sessionManager.getHeader(),branch,projection.entries);
+    const ownedSources=ownedEdits(branch);
+    const projectedById=new Map(authorized.map(e=>[e.sourceEntry.id,e.messages]));
+    const visibleIds=new Set(authorized.filter(e=>e.messages.length>0).map(e=>e.sourceEntry.id));
     const state=rebuild(branch,ctx.sessionManager.getSessionId());
     if(params.paths?.some(path=>path.startsWith("/")||path.includes("\0")||path.split(/[\\/]/).includes("..")))throw new Error("Recall paths must be project-relative and cannot traverse directories");
     const selectors=[params.entryId,params.itemId,params.query].filter(Boolean);if(selectors.length>1)throw new Error("Use only one of entryId, itemId or query; paths may be combined as a filter");
     const perEntryChars=Math.max(64,Math.min(1600,config.recallMaxTokens*4-300));
     const limit=Math.min(params.limit??5,Math.max(1,Math.floor(config.recallMaxTokens*4/1800)));const leafId=ctx.sessionManager.getLeafId();
-    const projectionHash=hash(projection.entries.map(e=>[e.sourceEntry.id,e.messages]));
+    const projectionHash=hash(authorized.map(e=>[e.sourceEntry.id,e.messages]));
     const queryHash=hash({entryId:params.entryId,itemId:params.itemId,query:params.query?.toLowerCase(),paths:params.paths?.map(p=>p.replace(/\\/g,"/")).sort(),limit});
     let start=0;
     if(params.cursor){try{const decoded=JSON.parse(Buffer.from(params.cursor,"base64url").toString("utf8"));if(decoded.v!==1||decoded.sessionId!==ctx.sessionManager.getSessionId()||decoded.leafId!==leafId||decoded.queryHash!==queryHash||decoded.projectionHash!==projectionHash||!Number.isSafeInteger(decoded.start)||decoded.start<0)throw new Error();start=decoded.start;}catch{throw new Error("STALE_RECALL_CURSOR: branch, projection or query changed; start a new recall request");}}
     const callPaths=new Map<string,string>();
-    for(const entry of projection.entries)for(const message of entry.messages)if(message.role==="assistant")for(const part of message.content)if(part.type==="toolCall"&&typeof part.arguments.path==="string")callPaths.set(part.id,part.arguments.path.replace(/\\/g,"/"));
+    for(const entry of authorized)for(const message of entry.messages)if(message.role==="assistant")for(const part of message.content)if(part.type==="toolCall"&&typeof part.arguments.path==="string")callPaths.set(part.id,part.arguments.path.replace(/\\/g,"/"));
     const candidates=branch.filter(e=>visibleIds.has(e.id)&&(e.type==="message"||e.type==="custom_message"&&e.customType==="design-intent.projection.v1"||e.type==="compaction"));
     if(params.entryId&&branch.some(entry=>entry.id===params.entryId)&&!visibleIds.has(params.entryId))return{content:[{type:"text",text:`[${params.entryId}] Source is absent from the current authorized projection; content withheld.`}],details:{denied:true,reason:"SOURCE_NOT_IN_CURRENT_PROJECTION",returned:0}};
     const render=(entry:SessionEntry):string=>{
@@ -68,7 +72,7 @@ export default function rollingContext(pi:ExtensionAPI) {
           let effective=message;
           if(message.role==="toolResult"&&(typeof message.content==="string"||Array.isArray(message.content))){
             const effectiveText=typeof message.content==="string"?message.content:message.content.every((part:any)=>part.type==="text")?message.content.map((part:any)=>part.text).join("\n"):undefined;
-            const owned=effectiveText!==undefined&&state.envelope?.edits.some(edit=>edit.targetId===entry.id&&hash(effectiveText)===edit.replacementHash);
+            const owned=effectiveText!==undefined&&ownedSources.get(entry.id)?.replacementHash===hash(effectiveText);
             if(owned&&entry.message.role==="toolResult")effective=entry.message;
           }
           if(message.role==="user"){const text=typeof message.content==="string"?message.content:message.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text).join("\n");return `${prefix} user: ${text.slice(0,perEntryChars)}${Array.isArray(message.content)&&message.content.some((part:any)=>part.type==="image")?" [image omitted]":""}`;}
@@ -106,7 +110,7 @@ export default function rollingContext(pi:ExtensionAPI) {
       const content=editEntry.replacement.content;const text=typeof content==="string"?content:Array.isArray(content)&&content.every(part=>part.type==="text")?content.map(part=>part.type==="text"?part.text:"").join("\n"):undefined;
       if(text===undefined||!state.envelope?.edits.some(edit=>edit.targetId===editEntry.targetId&&edit.replacementHash===hash(text)))return false;
     }
-    const covered=new Set(state.snapshot.items.flatMap(item=>item.sourceEntryIds));
+    const covered=new Set([...state.snapshot.items.flatMap(item=>item.sourceEntryIds),...state.snapshot.coverage.map(c=>c.sourceEntryId)]);
     for(const entry of branch.slice(0,cut)){
       if(entry.type==="message"){
         const message=entry.message;
@@ -128,6 +132,7 @@ export default function rollingContext(pi:ExtensionAPI) {
         continue;
       }
       if(entry.type==="custom_message"&&entry.customType==="design-intent.projection.v1"&&state.snapshot.intentRefs.length)continue;
+      if(ownedCheckpoint(entry))continue;
       if(entry.type==="custom"||entry.type==="usage"||entry.type==="model_change"||entry.type==="thinking_level_change"||entry.type==="context_edit"||entry.type==="label"||entry.type==="session_info")continue;
       return false;
     }
@@ -142,33 +147,50 @@ export default function rollingContext(pi:ExtensionAPI) {
     const tokens=estimateProjection(projection);
     const current=ctx.getContextUsage();
     const contextWindow=Number.isSafeInteger(ctx.model?.contextWindow)&&ctx.model!.contextWindow>0?ctx.model!.contextWindow:current?.contextWindow;
-    const turnConfig={...config,mode,contextWindow};const budget=effectiveTarget(turnConfig);const projected=current?.tokens??tokens;
+    const turnConfig={...config,mode,contextWindow};const budget=effectiveTarget(turnConfig);const projected=tokens;
     lastStatus=`mode=${mode}; projected≈${projected}${current?.tokens==null?" (heuristic)":""}; window=${contextWindow??"unknown"}; target=${budget}; stateBytes=${serializedStateBytes(state.envelope??state.snapshot)}; groups=${groups(projection).length}; items=${state.snapshot.items.length}`;
-    if(mode==="off")return;
     if(event.outcome!=="completed")return;
     const branch=ctx.sessionManager.getBranch();
-    const own=planTurn({entries:projection,branch,eventEntries:event.entries,baseLeaf:ctx.sessionManager.getLeafId(),config:turnConfig,state,sessionId:ctx.sessionManager.getSessionId(),currentTokens:current?.tokens});
-    const analysis=analyzeGroups(projection,state.snapshot);
-    if(!own.length){if(mode==="observe")lastStatus+=`; observe: no state/capsule/checkpoint changes proposed; groups=${analysis.length}; writes=0`;return;}
-    const candidate=[...event.entries,...own];
+    if(branch.some(e=>e.type==="custom"&&e.customType===TELEMETRY_TYPE&&(e.data as any)?.messageEntryId===event.messageEntryId))return;
+    const clock=turnClock(branch),turn=clock.turn+1;
     const header=ctx.sessionManager.getHeader();
-    const preview=header?previewDrafts(ctx.cwd,header,branch,candidate):undefined;
+    const previewPlan=(ds:SessionBoundaryDraft[])=>header?previewDrafts(ctx.cwd,header,branch,[...event.entries,...ds]) as ProjectedSessionEntry[]|undefined:undefined;
+    const usage=event.message.role==="assistant"?event.message.usage:undefined;
+    const planning:PlanMetrics={};
+    const own=mode==="off"?[]:planTurn({entries:projection,branch,eventEntries:event.entries,baseLeaf:ctx.sessionManager.getLeafId(),config:turnConfig,state,sessionId:ctx.sessionManager.getSessionId(),turn,cache:usage,metrics:planning,preview:previewPlan});
+    if(planning.rejection)lastStatus+=`; plan rejected: ${planning.rejection}; attemptedStateBytes=${planning.attemptedStateBytes??"unknown"}`;
+    const preview=previewPlan(own);
+    const valid=!!preview&&projection.some(e=>e.messages.some(m=>m.role==="user"||m.role==="compactionSummary"));
+    const applied=mode==="on"&&valid?own:[];
+    const effective=applied.length?preview!:projection;
+    const afterWarm=previewPlan(own.filter(d=>d.type!=="compaction"));
+    const editDrafts=applied.filter(d=>d.type==="context_edit");
+    const checkpoint=applied.find(d=>d.type==="compaction");
+    const envelope=applied.find(d=>d.type==="custom"&&d.customType==="rolling-context.state.v1");
+    const warmIds=new Set(ownedEdits(branch).keys());for(const d of editDrafts)warmIds.add(d.targetId);
+    const metric=(value:unknown)=>typeof value==="number"&&Number.isFinite(value)?value:null;
+    const telemetry={type:TELEMETRY_TYPE,turn,messageEntryId:event.messageEntryId,epoch:clock.epoch+(checkpoint?1:0),mode,
+      tokenBasis:"host-estimate",rawTokens:estimateProjection(branch.filter((e):e is Extract<SessionEntry,{type:"message"}>=>e.type==="message").map(e=>({sourceEntry:e,messages:[e.message]}))),
+      projectedTokens:tokens,effectiveTokens:estimateProjection(effective),afterWarmTokens:planning.afterWarmTokens??(afterWarm?estimateProjection(afterWarm):null),afterCheckpointTokens:planning.afterCheckpointTokens??(preview?estimateProjection(preview):null),
+      ...contextComposition(effective,warmIds),capsulesCreated:editDrafts.length,capsuleTokensSaved:applied.length&&afterWarm?tokens-estimateProjection(afterWarm):0,
+      checkpointCreated:!!checkpoint,checkpointReason:checkpoint?(checkpoint.details as any)?.reason??null:null,
+      stateBytes:serializedStateBytes(envelope?.data??state.envelope??state.snapshot),input:metric(usage?.input),cacheRead:metric(usage?.cacheRead),cacheWrite:metric(usage?.cacheWrite),
+      providerContextTokens:metric(current?.tokens),planValid:valid,attemptedStateBytes:planning.attemptedStateBytes??null,planRejectedReason:planning.rejection??null};
+    const result={entries:[...event.entries,...applied,{type:"custom" as const,customType:TELEMETRY_TYPE,data:telemetry}]};
+    const analysis=analyzeGroups(projection,state.snapshot);
+    if(!own.length)return result;
     if(mode==="observe"){
       const counts=new Map<string,number>();for(const group of analysis)for(const reason of group.reasons)counts.set(reason,(counts.get(reason)??0)+1);
       const eligible=analysis.filter(group=>group.reasons.length===0).length;
       const editedIds=new Set(own.filter(x=>x.type==="context_edit").map(x=>x.targetId));const scheduledGroups=analysis.filter(group=>group.resultIds.some(id=>editedIds.has(id))).length;
       lastStatus+=`; observe: reserve=${config.reserveTokens}; headroom≈${budget-projected}; eligibleGroups=${eligible}; protection=${JSON.stringify(Object.fromEntries(counts))}; candidateEdits=${editedIds.size}; eligibleWithoutEdit=${Math.max(0,eligible-scheduledGroups)} (saving threshold/already projected); checkpoint=${own.some(x=>x.type==="compaction")}; projectionValid=${!!preview}; writes=0`;
-      return;
+      return result;
     }
-    if(!own.length)return;
-    if(!preview){lastStatus+="; plan rejected by projection validation";return;}
-    // Ensure inherited custom/context transformations don't invalidate original task/user content.
-    const projectedUsers=projection.flatMap(e=>e.messages.filter(m=>m.role==="user"));
-    if(projectedUsers.length===0){lastStatus+="; no user anchor";return;}
-    return {entries:candidate};
+    if(!preview){lastStatus+="; plan rejected by projection validation";return result;}
+    return result;
   });
   pi.on("agent_before_settle",async(event,ctx)=>{
-    if(event.outcome!=="completed"||config.mode!=="on")return;
+    if(event.outcome!=="completed"||mode!=="on")return;
     // turn_end handles normal incremental updates; final boundary intentionally avoids a second compaction.
     const state=rebuildState(ctx);lastStatus+=`; settled revision=${state.snapshot.revision}`;
   });
@@ -182,12 +204,20 @@ export default function rollingContext(pi:ExtensionAPI) {
     if(!explicit&&(event.reason==="overflow"||!!event.customInstructions)){
       lastStatus+=`; native compact delegated reason=${event.reason}; customInstructions=${!!event.customInstructions}`;return;
     }
+    const clock=turnClock(ctx.sessionManager.getBranch());
+    if(!explicit&&(mode!=="on"||clock.turn-clock.lastCheckpointTurn<config.minCheckpointTurns)){lastStatus+="; native compact delegated: Rolling checkpoint cadence";return;}
     const state=rebuildState(ctx);
     const firstKeptEntryId=event.preparation.firstKeptEntryId;
     if(!firstKeptEntryId||!checkpointCoverageValid(event.branchEntries,firstKeptEntryId,state)){
       if(explicit){ctx.ui.notify("Rolling checkpoint cancelled: the task state does not cover every context entry before the proposed boundary.","warning");return {cancel:true};}
       lastStatus+=`; native compact delegated: checkpoint coverage unknown at ${firstKeptEntryId??"missing boundary"}`;return;
     }
+    const warm=ownedEdits(event.branchEntries);
+    const proposedCut=event.branchEntries.findIndex(e=>e.id===firstKeptEntryId);
+    const prefix=new Set(event.branchEntries.slice(0,proposedCut).map(e=>e.id));
+    const oldGroups=groups(ctx.sessionManager.buildSessionProjection().entries).filter(g=>prefix.has(g.assistantId));
+    if(!explicit&&oldGroups.some(g=>g.results.some(r=>["read","bash","edit"].includes(r.message.toolName)&&(!warm.has(r.id)||clock.turn-(warm.get(r.id)?.warmTurn??clock.turn)<config.minCheckpointTurns)))){lastStatus+="; native compact delegated: hot evidence / warm residence";return;}
+    boundMemory(state.snapshot);
     const summary=renderCheckpoint(state.snapshot);
     const cut=event.branchEntries.findIndex(entry=>entry.id===firstKeptEntryId);
     const keptIds=new Set(event.branchEntries.slice(cut).map(entry=>entry.id));
@@ -199,9 +229,9 @@ export default function rollingContext(pi:ExtensionAPI) {
     const leafId=ctx.sessionManager.getLeafId();const sessionId=ctx.sessionManager.getSessionId();
     const planId=hash([sessionId,leafId,firstKeptEntryId,summary]).slice(0,20);
     const revision=state.snapshot.revision+1;const summaryHash=hash(summary);
-    const envelope={schemaVersion:1 as const,revision,planId,baseLeafId:leafId,snapshot:{...state.snapshot,revision},edits:state.envelope?.edits??[],checkpoint:{firstKeptEntryId,summaryHash}};
+    const envelope={schemaVersion:1 as const,revision,planId,baseLeafId:leafId,snapshot:{...state.snapshot,revision},edits:[...warm.values()].filter(e=>keptIds.has(e.targetId)).map(({replacement,...edit})=>edit),checkpoint:{firstKeptEntryId,summaryHash}};
     if(serializedStateBytes(envelope)>MAX_STATE_BYTES){if(explicit){ctx.ui.notify("Rolling Context state exceeds 128 KiB; checkpoint cancelled.","error");return {cancel:true};}lastStatus+="; native compact delegated: state exceeds 128 KiB";return;}
-    return {compaction:{summary,firstKeptEntryId,tokensBefore:event.preparation.tokensBefore,details:{type:"rolling-context.checkpoint.v1",stateEnvelope:envelope,stateRevision:revision,planId,firstKeptEntryId,summaryHash}}};
+    return {compaction:{summary,firstKeptEntryId,tokensBefore:event.preparation.tokensBefore,details:{type:"rolling-context.checkpoint.v1",turn:clock.turn,reason:explicit?"manual":event.reason,stateEnvelope:envelope,stateRevision:revision,planId,firstKeptEntryId,summaryHash}}};
   });
   pi.on("session_compact",event=>{manualCheckpoint=undefined;lastStatus+=`; compacted reason=${event.reason}; fromExtension=${event.fromExtension}`;});
   pi.on("session_compact_failed",event=>{manualCheckpoint=undefined;lastStatus+=`; compact failed reason=${event.reason}; aborted=${event.aborted}; ${event.errorMessage??"no error detail"}`;});

@@ -6,7 +6,7 @@ const path = require('node:path');
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
 const MAX_TEXT_CHARS = 30000;
 
-async function readHistory(sessionFile, sessionId, leafId, { before, limit = 50 } = {}) {
+async function readBranch(sessionFile, sessionId, leafId) {
   if (typeof sessionFile !== 'string' || !sessionFile) throw httpError(404, 'Session history is unavailable');
   const sessionsRoot = path.resolve(process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'), 'sessions');
   let root, file;
@@ -28,6 +28,7 @@ async function readHistory(sessionFile, sessionId, leafId, { before, limit = 50 
   const header = entries.find(entry => entry.type === 'session');
   if (!header || header.id !== sessionId) throw httpError(403, 'Session ID does not match the history file');
   const byId = new Map(entries.filter(entry => entry.type !== 'session').map(entry => [entry.id, entry]));
+  if (leafId && !byId.has(leafId)) throw httpError(409, 'Active branch leaf is not available in the session file yet');
   let cursor = byId.has(leafId) ? leafId : entries.at(-1)?.id;
   const branch = [];
   const visited = new Set();
@@ -38,6 +39,11 @@ async function readHistory(sessionFile, sessionId, leafId, { before, limit = 50 
     cursor = entry.parentId;
   }
   branch.reverse();
+  return branch;
+}
+
+async function readHistory(sessionFile, sessionId, leafId, { before, limit = 50 } = {}) {
+  const branch = await readBranch(sessionFile, sessionId, leafId);
   const messages = branch.filter(entry => entry.type === 'message' && entry.message && ['user', 'assistant', 'toolResult'].includes(entry.message.role));
   let end = messages.length;
   if (before) {
@@ -106,4 +112,28 @@ function sanitizeMessage(message) {
   return result;
 }
 function httpError(status, message) { const error = new Error(message); error.status = status; return error; }
-module.exports = { findSessionFile, readHistory };
+async function readTelemetry(sessionFile, sessionId, leafId) {
+  const branch = await readBranch(sessionFile, sessionId, leafId);
+  const numeric = ['turn','epoch','rawTokens','projectedTokens','effectiveTokens','afterWarmTokens','afterCheckpointTokens','hotTokens','warmTokens','checkpointTokens','otherTokens','capsulesCreated','capsuleTokensSaved','stateBytes','attemptedStateBytes','cacheRead','cacheWrite','input','providerContextTokens'];
+  const turns = branch.filter(e => e.type === 'custom' && e.customType === 'rolling-context.telemetry.v1').map(e => {
+    const d = e.data || {}, row = {};
+    for (const key of numeric) row[key] = typeof d[key] === 'number' && Number.isFinite(d[key]) && d[key] >= 0 ? d[key] : null;
+    row.mode = ['on','off','observe'].includes(d.mode) ? d.mode : 'unknown';
+    row.checkpointCreated = d.checkpointCreated === true;
+    row.planRejectedReason = ['STATE_SIZE_LIMIT','INVALID_FINAL_PROJECTION'].includes(d.planRejectedReason) ? d.planRejectedReason : null;
+    row.checkpointReason = ['hard','after-warm-budget','manual','threshold','overflow'].includes(d.checkpointReason) ? d.checkpointReason : null;
+    return row;
+  }).filter(row => Number.isSafeInteger(row.turn) && row.turn > 0);
+  const checkpoints = branch.filter(e => e.type === 'compaction').map(e => {
+    const d = e.details, c = d?.stateEnvelope?.checkpoint;
+    const summaryHash = require('node:crypto').createHash('sha256').update(e.summary || '').digest('hex');
+    const rolling = d?.type === 'rolling-context.checkpoint.v1' && d.firstKeptEntryId === e.firstKeptEntryId && d.summaryHash === summaryHash && c?.firstKeptEntryId === e.firstKeptEntryId && c?.summaryHash === summaryHash;
+    return {
+      turn: Number.isSafeInteger(d?.turn) ? d.turn : null,
+      rolling,
+      reason: ['hard','after-warm-budget','manual','threshold','overflow'].includes(d?.reason) ? d.reason : null,
+    };
+  });
+  return { turns, checkpoints, tokenBasis: 'host-estimate', rawBasis: 'raw message history (system/user/assistant/tool)', snapshotTimestamp: branch.at(-1)?.timestamp || null };
+}
+module.exports = { findSessionFile, readHistory, readTelemetry };

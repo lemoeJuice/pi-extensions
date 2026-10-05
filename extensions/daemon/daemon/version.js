@@ -5,7 +5,7 @@ const path = require('node:path');
 
 function getDaemonVersion() {
   const root = __dirname;
-  const files = ['main.js', 'version.js', 'registry.js', 'history.js', '../web/index.html'];
+  const files = ['main.js', 'version.js', 'registry.js', 'history.js', '../web/index.html', '../web/context.html', '../web/context-graph.js'];
   const hash = crypto.createHash('sha256');
   for (const file of files) {
     hash.update(path.relative(root, path.resolve(root, file)));

@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { WebSocketServer, WebSocket } = require('ws');
 const { Registry } = require('./registry');
-const { findSessionFile, readHistory } = require('./history');
+const { findSessionFile, readHistory, readTelemetry } = require('./history');
 const { getDaemonVersion } = require('./version');
 const host = process.env.PI_REMOTE_HOST || '100.64.209.124';
 const port = Number(process.env.PI_REMOTE_PORT || 4317);
@@ -19,6 +19,14 @@ const server = http.createServer((req, res) => {
   const json = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(body)); };
   if (url.pathname === '/health') return json(200, { ok: true, daemonVersion, pid: process.pid });
   if (req.method === 'GET' && url.pathname === '/api/sessions') return json(200, registry.list().map(({ events, activeEvents, ...s }) => s));
+  const telemetry = url.pathname.match(/^\/api\/sessions\/([^/]+)\/context-telemetry$/);
+  if (req.method === 'GET' && telemetry) {
+    const sessionId = decodeURIComponent(telemetry[1]), state = registry.sessions.get(sessionId);
+    return Promise.resolve(state?.sessionFile || findSessionFile(sessionId))
+      .then(file => readTelemetry(file, sessionId, state?.leafId))
+      .then(result => json(200, result))
+      .catch(error => json(error.status || 500, { error: error.message || 'Could not read telemetry' }));
+  }
   const history = url.pathname.match(/^\/api\/sessions\/([^/]+)\/history$/);
   if (req.method === 'GET' && history) {
     const sessionId = decodeURIComponent(history[1]);
@@ -72,6 +80,12 @@ const server = http.createServer((req, res) => {
       const result = registry.respondApproval(decodeURIComponent(approval[1]), value.requestId, value.choice);
       return result.error ? json(409, result) : json(202, { ok: true });
     }); return;
+  }
+  if (req.method === 'GET' && /^\/s\/[^/]+\/context$/.test(url.pathname)) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return fs.createReadStream(path.join(__dirname, '../web/context.html')).pipe(res);
+  }
+  if (req.method === 'GET' && url.pathname === '/context-graph.js') {
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }); return fs.createReadStream(path.join(__dirname, '../web/context-graph.js')).pipe(res);
   }
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/s/'))) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return fs.createReadStream(path.join(__dirname, '../web/index.html')).pipe(res);

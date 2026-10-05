@@ -11,3 +11,7 @@
 项目级长期设计由独立的 [Design Intent](../design-intent/README.md) 管理；两者边界见[简短集成说明](../design-intent/docs/integration.md)。
 
 可用工具：`context_note`、`context_recall`。可用命令：`/rolling-context status|inspect|on|off|observe|pin|unpin|checkpoint`。MVP 不启用小模型提取；面对未覆盖上下文、图片、未知扩展消息或不安全 checkpoint 时保守回退。功能边界详见 [`docs/implementation.md`](docs/implementation.md)。
+
+默认 hot→warm 批次至少间隔 4 个完整 turn，累计节省 2048 估算 tokens；checkpoint 与普通 warm 最短驻留为 16 turn。可用 `--rolling-context-warm-interval`、`--rolling-context-batch-saving`、`--rolling-context-checkpoint-interval` 调整。先 preview after-warm 再判断 checkpoint；高缓存命中时普通收益门槛翻倍。已有 capsule 不重复摘要。
+
+每个 completed turn 保存不进模型 context 的 telemetry（observe/off 也记录）。现有 daemon 的 session 页面点击 **Context Graph**，或访问 `/s/<sessionId>/context`，查看 context size、composition、stateBytes 及事件标记。未知 usage 不猜为 0；图表 token 数为宿主估算。自己的 checkpoint 收起的来源可按需召回，但不撤销 foreign compaction 或其他插件的隐藏/脱敏。

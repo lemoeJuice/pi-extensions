@@ -226,6 +226,16 @@ read src/auth.ts，观察范围 1–180，版本 sha256:…。
 
 用软阈值和回落目标形成滞回；每次处理一批而不是每删几十 token 就刷新记忆。普通回合可以检查，不必每回合改变输入前缀。任务完成、失败解决、工作焦点切换可触发语义检查点，但受最小间隔约束。
 
+当前调度的具体落地（不改变上述分层与职责）：
+
+- aging 每个完整 turn 重新计算；普通 hot→warm 默认至少间隔 **4 turn**，累计候选节省达到 **2048 估算 tokens** 才批量写入。已提交 capsule 不再改写。
+- 本轮 usage 的 `cacheRead / (input + cacheRead) >= 80%` 时，普通批次收益门槛翻倍；未知 usage 不推断缓存状态。跨 soft 可以提前处理，但仍至少间隔 2 turn 且达到基础收益门槛的一半，避免高水位下每轮修改一个旧结果。
+- 必须先 preview hot→warm 后的 projection，基于 **after-warm tokens** 判断 checkpoint。上一请求 usage、raw history 大小都不是候选投影预算。
+- checkpoint 默认最少间隔 **16 turn**，普通 warm→cold 同时要求来源已经驻留 warm 至少 16 turn。刚创建的 warm 不会同轮或下一轮被自动收走；checkpoint 是低频 epoch transition。
+- hard 压力可绕过时间间隔和 warm 驻留限制，但不能绕过协议、原文、pin、覆盖及授权保护。overflow 仍交给宿主；显式确认的 manual checkpoint 是用户请求的例外，不是普通 housekeeping。
+
+这里的 turn 是宿主 `turn_end(outcome="completed")`（一次 assistant response 及其直接工具批次），不是一次用户输入，也不是 branch entry 数。时钟从当前 branch 的完成回合 custom 记录恢复；epoch 及 checkpoint 时钟只承认实际匹配的 compaction entry。
+
 ## 6. 增量提取：规则优先、模型辅助
 
 ### 默认路径
@@ -323,6 +333,14 @@ hard = A
 因此默认采用 epoch：在一个 epoch 内保留稳定检查点和自然追加的活跃窗口；有明确收益时批量胶囊化，达到软阈值或任务里程碑再换检查点。规则检查可以频繁，前缀修改要稀疏。
 
 按 provider 记录 `input/output/cacheRead/cacheWrite` 与总成本；另计提取器成本、维护延迟、召回重读成本。优化目标是任务总成本和延迟，而非单次输入 token 最小。缓存命中高、工作集稳定时可以延迟换 epoch，但不能超过安全容量。
+
+### 当前可观测性与 Graph View
+
+每个完整 turn 追加 `rolling-context.telemetry.v1` custom entry，不进入模型 context，也不改变已有 prompt 前缀。记录原始/有效/候选投影 token 估算、hot/warm/checkpoint/other 分量、批次及 checkpoint 事件、工作 envelope 字节数和可获得的本轮 usage。未知值使用 null，不把未知缓存数据记为 0。
+
+现有 daemon 只读消费当前 branch 的数值：session 页面提供 **Context Graph** 链接，显示 context size、composition、stateBytes 三张图和事件标记。Rolling Context 不导入 daemon，也不要求 daemon 存在才能运行。observe/off 同样记录 metrics；observe 的候选大小不是已提交的有效大小。
+
+图表是宿主估算及已验证边界的测量，不是 provider 精确 tokenizer 或价格预测。manual/native hook 的 compaction 另有事件索引，下一完整 turn 反映其投影及 epoch；foreign compaction 不冒充 Rolling epoch。无持久 session 时 telemetry 随进程消失，不另存 transcript。
 
 ## 9. 回合处理流程与持久化
 

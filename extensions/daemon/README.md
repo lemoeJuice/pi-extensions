@@ -43,6 +43,7 @@ Pi itself owns the JSONL session files, which the daemon only reads.
 - `GET /api/sessions`
 - `GET /api/sessions/:sessionId`
 - `GET /api/sessions/:sessionId/history?limit=60&before=<entryId>`
+- `GET /api/sessions/:sessionId/context-telemetry` (numeric Rolling Context metrics from the active branch)
 - `POST /api/sessions/:sessionId/messages` with `{ "text": "..." }`
 - `POST /api/sessions/:sessionId/abort` to stop the current Pi generation
 - `POST /api/sessions/:sessionId/commands` with `{ "name": "...", "args": "..." }`
@@ -65,3 +66,18 @@ Provider and tool errors are shown in the conversation. The footer shows the
 active fast-mode status when the installed fast-mode extension exposes its
 statusline segment. Commands are dispatched back through Pi's
 extension/prompt command expansion rather than executed by the daemon.
+
+### Rolling Context Graph View
+
+Click **Context Graph** in a session header, or open `/s/<sessionId>/context`.
+The page plots raw/effective context size with hot→warm/checkpoint markers,
+hot/warm/checkpoint/other composition, and working-state bytes over completed turns.
+It includes a turn detail table and refreshes every five seconds. No chart dependency,
+model call, or duplicate history store is introduced. Rolling Context runs independently
+of the daemon.
+
+Tokens are host estimates; missing usage stays unknown rather than zero. Observe-mode
+candidate sizes are not applied effective sizes. With no samples the page shows an empty
+state. The API shares history's session-root/header-ID checks and only exports typed
+numeric/enum fields, not evidence text. An active leaf not yet available on disk returns
+409 instead of guessing another branch.

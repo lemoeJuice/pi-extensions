@@ -5,15 +5,15 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import rollingContext from '../extensions/rolling-context/index.ts';
 import designIntent from '../extensions/design-intent/index.ts';
 import { emptyStore, serializeStore, sha } from '../extensions/design-intent/lib.ts';
-import { rebuild } from '../extensions/rolling-context/lib.ts';
+import { rebuild, hash } from '../extensions/rolling-context/lib.ts';
 
-function mockPi(){
+function mockPi(overrides={}){
  const tools=new Map(),commands=new Map(),events=new Map(),flags=new Map(),appended=[];
  return{tools,commands,events,flags,appended,
   registerTool(tool){assert.ok(!tools.has(tool.name));tools.set(tool.name,tool);},
   registerCommand(name,command){commands.set(name,command);},
   registerFlag(name,definition){flags.set(name,definition);},
-  getFlag(name){return flags.get(name)?.default;},
+  getFlag(name){return overrides[name]??flags.get(name)?.default;},
   on(name,handler){const handlers=events.get(name)||[];handlers.push(handler);events.set(name,handlers);},
   appendEntry(customType,data){appended.push({customType,data});},
  };
@@ -30,14 +30,14 @@ test('both context extensions register their public tools, commands, and lifecyc
  assert.ok(design.events.has('before_agent_start'));
 });
 
-test('observe reports a simulated plan but never submits session drafts',async()=>{
+test('observe reports a simulated plan and submits only non-context telemetry',async()=>{
  const cwd='/tmp/rolling-context-observe-test';const header={type:'session',version:3,id:'observe-session',timestamp:new Date().toISOString(),cwd};
  const branch=[{type:'message',id:'u1',parentId:null,timestamp:'',message:{role:'user',content:'Inspect the module',timestamp:0}},{type:'message',id:'a1',parentId:'u1',timestamp:'',message:{role:'assistant',content:[{type:'text',text:'I will inspect it.'}],stopReason:'stop',timestamp:0}}];
  const manager=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);const pi=mockPi();rollingContext(pi);
  const notices=[];const ctx={cwd,sessionManager:manager,getContextUsage:()=>undefined,ui:{notify:(text)=>notices.push(text)}};
  const before=manager.getBranch().length;const handler=pi.events.get('turn_end')[0];
- const result=await handler({outcome:'completed',entries:[],context:{contextEntries:manager.buildSessionProjection().entries}},ctx);
- assert.equal(result,undefined);assert.equal(manager.getBranch().length,before);
+ const result=await handler({outcome:'completed',messageEntryId:manager.getBranch().at(-1).id,message:manager.getBranch().at(-1).message,entries:[],context:{contextEntries:manager.buildSessionProjection().entries}},ctx);
+ assert.deepEqual(result.entries.map(d=>d.customType),['rolling-context.telemetry.v1']);assert.equal(manager.getBranch().length,before);
  await pi.commands.get('rolling-context').handler('status',ctx);
  assert.match(notices.at(-1),/observe:.*writes=0/);assert.match(notices.at(-1),/projectionValid=true/);
 });
@@ -50,8 +50,8 @@ test('on-mode turn boundary returns replayable edits without breaking tool pairi
   push({type:'message',id:`result-${i}`,timestamp:'',message:{role:'toolResult',toolCallId:`read-${i}`,toolName:'read',content:[{type:'text',text:`file ${i}: ${'content '.repeat(500)}`}],isError:false,timestamp:0}});
   push({type:'message',id:`done-${i}`,timestamp:'',message:{role:'assistant',content:[{type:'text',text:`Read file ${i}`}],stopReason:'stop',timestamp:0}});
  }
- const manager=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);const pi=mockPi();rollingContext(pi);const notices=[];const ctx={cwd,sessionManager:manager,getContextUsage:()=>({tokens:20000,contextWindow:128000}),ui:{notify:text=>notices.push(text)}};
- await pi.commands.get('rolling-context').handler('on',ctx);const event={outcome:'completed',entries:[],context:{contextEntries:manager.buildSessionProjection().entries}};const result=await pi.events.get('turn_end')[0](event,ctx);
+ const manager=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);const pi=mockPi({'rolling-context-warm-interval':'1','rolling-context-batch-saving':'1'});rollingContext(pi);const notices=[];const ctx={cwd,sessionManager:manager,getContextUsage:()=>({tokens:20000,contextWindow:128000}),ui:{notify:text=>notices.push(text)}};
+ await pi.commands.get('rolling-context').handler('on',ctx);const event={outcome:'completed',messageEntryId:manager.getBranch().at(-1).id,message:manager.getBranch().at(-1).message,entries:[],context:{contextEntries:manager.buildSessionProjection().entries}};const result=await pi.events.get('turn_end')[0](event,ctx);
  assert.ok(result?.entries?.some(entry=>entry.type==='context_edit'));assert.equal(manager.getBranch().length,branch.length);
  for(const draft of result.entries){if(draft.type==='custom')manager.appendCustomEntry(draft.customType,draft.data);else if(draft.type==='context_edit')manager.appendContextEdit(draft.targetId,draft.replacement);else if(draft.type==='compaction')manager.appendCompaction(draft.summary,draft.firstKeptEntryId,0,draft.details,true,draft.usage);}
  const projection=manager.buildSessionProjection().entries;const calls=projection.flatMap(entry=>entry.messages).filter(message=>message.role==='assistant').flatMap(message=>message.content.filter(part=>part.type==='toolCall'));const results=projection.flatMap(entry=>entry.messages).filter(message=>message.role==='toolResult');
@@ -76,11 +76,12 @@ test('compact hook uses a covered state checkpoint only when safe and preserves 
  ];
  const manager=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);
  const snapshot={schemaVersion:1,revision:1,coveredThroughEntryId:'result',items:[
-  {id:'user-request',key:'user-request',kind:'user-constraint',text:'Inspect the module and preserve its API',status:'active',authority:'user',sourceEntryIds:['u'],taskId:'RC-T-u',dependencies:[],observedAtEntryId:'u',pinned:false},
+  {id:'user-request',key:'user-request',kind:'constraint',text:'Inspect the module and preserve its API',status:'active',authority:'user',sourceEntryIds:['u'],taskId:'RC-T-u',dependencies:[],observedAtEntryId:'u',pinned:false},
   {id:'source-evidence',key:'file:src/module.ts',kind:'project',text:'module source available',status:'active',authority:'tool-evidence',sourceEntryIds:['call','result'],taskId:'RC-T-u',dependencies:[{path:'src/module.ts'}],observedAtEntryId:'result',pinned:false},
  ],intentRefs:[],focus:{taskId:'RC-T-u',nextSteps:[],openQuestions:[]},coverage:[]};
- manager.appendCustomEntry('rolling-context.state.v1',{schemaVersion:1,revision:1,planId:'covered',baseLeafId:manager.getLeafId(),snapshot,edits:[]});
- const pi=mockPi();rollingContext(pi);const notices=[];const ctx={cwd,sessionManager:manager,getContextUsage:()=>undefined,ui:{notify:(text)=>notices.push(text)}};
+ manager.appendCustomEntry('rolling-context.state.v1',{schemaVersion:1,revision:1,planId:'covered',baseLeafId:manager.getLeafId(),snapshot,edits:[{targetId:'result',originalHash:hash(branch[2].message.content[0].text),replacementHash:hash('Historical module source; recall result'),warmTurn:0}]});
+ manager.appendContextEdit('result',{content:[{type:'text',text:'Historical module source; recall result'}]});
+ const pi=mockPi({'rolling-context-mode':'on','rolling-context-checkpoint-interval':'0'});rollingContext(pi);const notices=[];const ctx={cwd,sessionManager:manager,getContextUsage:()=>undefined,ui:{notify:(text)=>notices.push(text)}};
  const handler=pi.events.get('session_before_compact')[0];const event={reason:'threshold',willRetry:false,branchEntries:manager.getBranch(),preparation:{firstKeptEntryId:'done',tokensBefore:100000},signal:new AbortController().signal};
  const result=await handler(event,ctx);assert.ok(result?.compaction);assert.equal(result.compaction.firstKeptEntryId,'done');
  manager.appendCompaction(result.compaction.summary,result.compaction.firstKeptEntryId,result.compaction.tokensBefore,result.compaction.details,true);assert.equal(rebuild(manager.getBranch(),manager.getSessionId()).envelope.checkpoint.firstKeptEntryId,'done');
@@ -124,7 +125,7 @@ test('Rolling Context retains Design Intent as a read-only reference and never e
  push({type:'message',id:'a',timestamp:'',message:{role:'assistant',content:[{type:'text',text:'I will update the adapter.'}],stopReason:'stop',timestamp:0}});
  const manager=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);const pi=mockPi();rollingContext(pi);await pi.commands.get('rolling-context').handler('on',{sessionManager:manager,ui:{notify:()=>{}}});
  const ctx={cwd,sessionManager:manager,getContextUsage:()=>undefined,ui:{notify:()=>{}}};const projectionEntries=manager.buildSessionProjection().entries;
- const plan=await pi.events.get('turn_end')[0]({outcome:'completed',entries:[],context:{contextEntries:projectionEntries}},ctx);const envelope=plan?.entries?.find(entry=>entry.type==='custom'&&entry.customType==='rolling-context.state.v1')?.data;
+ const plan=await pi.events.get('turn_end')[0]({outcome:'completed',messageEntryId:'a',message:branch.at(-1).message,entries:[],context:{contextEntries:projectionEntries}},ctx);const envelope=plan?.entries?.find(entry=>entry.type==='custom'&&entry.customType==='rolling-context.state.v1')?.data;
  assert.ok(envelope);assert.deepEqual(envelope.snapshot.intentRefs.map(ref=>ref.id),['DI-0001']);assert.ok(envelope.snapshot.items.some(item=>item.kind==='task-decision'&&item.authority==='agent-report'));assert.equal(await readFile(storePath,'utf8'),before);
 });
 
@@ -138,11 +139,40 @@ test('recall filters current projection, omits multimodal payloads, and rejects 
   push({type:'message',id:`done-${n}`,timestamp:'',message:{role:'assistant',content:[{type:'thinking',thinking:'private reasoning'},{type:'text',text:`Finished ${n}`}],stopReason:'stop',timestamp:0}});
  }
  const manager=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);manager.appendCustomEntry('rolling-context.state.v1',{schemaVersion:1,revision:1,planId:'stale-source',baseLeafId:manager.getLeafId(),snapshot:{schemaVersion:1,revision:1,coveredThroughEntryId:'done-b',items:[{id:'stale-a',key:'file:src/a.ts',kind:'project',text:'Old file observation',status:'stale',authority:'tool-evidence',sourceEntryIds:['result-a'],taskId:'RC-T-u',dependencies:[{path:'src/a.ts'}],observedAtEntryId:'result-a',pinned:false}],intentRefs:[],focus:{taskId:'RC-T-u',nextSteps:[],openQuestions:[]},coverage:[]},edits:[]});const pi=mockPi();rollingContext(pi);const tool=pi.tools.get('context_recall');
- const ctx={sessionManager:manager};
+ const ctx={cwd,sessionManager:manager};
  const alpha=await tool.execute('q1',{intent:'Find alpha evidence',query:'alpha'},undefined,undefined,ctx);assert.match(alpha.content[0].text,/alpha evidence/);assert.match(alpha.content[0].text,/stale/);assert.doesNotMatch(alpha.content[0].text,/beta evidence|base64secret|private reasoning/);
  const beta=await tool.execute('q2',{intent:'Find beta file',paths:['src/b.ts']},undefined,undefined,ctx);assert.match(beta.content[0].text,/beta evidence/);assert.doesNotMatch(beta.content[0].text,/alpha evidence/);
  const first=await tool.execute('q3',{intent:'Page branch history',limit:2},undefined,undefined,ctx);assert.ok(first.details.nextCursor);
  manager.appendContextEdit('result-a',{content:[{type:'text',text:'changed projection'}]});
  await assert.rejects(()=>tool.execute('q4',{intent:'Continue old page',limit:2,cursor:first.details.nextCursor},undefined,undefined,ctx),/STALE_RECALL_CURSOR/);
  manager.appendContextEdit('result-a',null);const denied=await tool.execute('q5',{intent:'Request hidden source',entryId:'result-a'},undefined,undefined,ctx);assert.equal(denied.details.denied,true);assert.doesNotMatch(denied.content[0].text,/alpha evidence/);
+});
+
+test('completed-turn telemetry is non-context, branch-local, usage-aware and idempotent; aborted turns do not advance',async()=>{
+ const cwd='/tmp/rolling-telemetry-test',manager=SessionManager.inMemory(cwd,{id:'telemetry'},[]);manager.appendMessage({role:'user',content:'Inspect',timestamp:0});
+ const usage={input:123,cacheRead:456,cacheWrite:78,output:10,totalTokens:667,cost:{input:0,cacheRead:0,cacheWrite:0,output:0,total:0}};
+ manager.appendMessage({role:'assistant',content:[{type:'text',text:'Done'}],stopReason:'stop',usage,timestamp:0});
+ const pi=mockPi({'rolling-context-mode':'off'});rollingContext(pi);const ctx={cwd,sessionManager:manager,getContextUsage:()=>undefined};const handler=pi.events.get('turn_end')[0];
+ const event={outcome:'completed',messageEntryId:manager.getLeafId(),message:manager.getBranch().at(-1).message,entries:[{type:'custom',customType:'foreign.metadata',data:{keep:true}}],context:{contextEntries:manager.buildSessionProjection().entries}};
+ assert.equal(await handler({...event,outcome:'aborted'},ctx),undefined);
+ const result=await handler(event,ctx);assert.equal(result.entries[0],event.entries[0]);const record=result.entries.at(-1);assert.equal(record.customType,'rolling-context.telemetry.v1');assert.equal(record.data.turn,1);assert.equal(record.data.cacheRead,456);assert.equal(record.data.input,123);assert.equal(record.data.providerContextTokens,null);assert.equal(record.data.checkpointCreated,false);
+ const before=manager.buildSessionProjection().messages;manager.appendCustomEntry(record.customType,record.data);assert.deepEqual(manager.buildSessionProjection().messages,before);assert.equal(await handler(event,ctx),undefined);
+});
+
+test('context_recall retrieves own cold original evidence but never undoes foreign redactions or compaction',async()=>{
+ const cwd='/tmp/rolling-cold-tool',manager=SessionManager.inMemory(cwd,{id:'cold-recall'},[]);
+ const userId=manager.appendMessage({role:'user',content:'Inspect',timestamp:0});
+ const original='Cold original file evidence';const resultId=manager.appendMessage({role:'toolResult',toolCallId:'read',toolName:'read',content:[{type:'text',text:original}],isError:false,timestamp:0});
+ const kept=manager.appendMessage({role:'assistant',content:[{type:'text',text:'Continue'}],stopReason:'stop',timestamp:0});
+ const snapshot={schemaVersion:1,revision:1,coveredThroughEntryId:kept,items:[],intentRefs:[],focus:{taskId:`RC-T-${userId}`,nextSteps:[],openQuestions:[]},coverage:[]};
+ const capsule='Historical source; recall for exact output';const envelope={schemaVersion:1,revision:1,planId:'warm',baseLeafId:kept,snapshot,edits:[{targetId:resultId,originalHash:hash(original),replacementHash:hash(capsule),warmTurn:1}]};
+ manager.appendCustomEntry('rolling-context.state.v1',envelope);manager.appendContextEdit(resultId,{content:[{type:'text',text:capsule}]});
+ const summary='Checkpoint',cp={...envelope,checkpoint:{firstKeptEntryId:kept,summaryHash:hash(summary)}};
+ manager.appendCompaction(summary,kept,100,{type:'rolling-context.checkpoint.v1',turn:10,stateEnvelope:cp,firstKeptEntryId:kept,summaryHash:hash(summary)},true);
+ const pi=mockPi();rollingContext(pi);const tool=pi.tools.get('context_recall'),ctx={cwd,sessionManager:manager};
+ const recall=async()=>tool.execute('q',{intent:'Retrieve old evidence',entryId:resultId},undefined,undefined,ctx);
+ assert.match((await recall()).content[0].text,/Cold original file evidence/);
+ manager.appendContextEdit(resultId,{content:[{type:'text',text:'[redacted]'}]});const redacted=await recall();assert.match(redacted.content[0].text,/redacted/);assert.doesNotMatch(redacted.content[0].text,/Cold original/);
+ manager.appendContextEdit(resultId,null);assert.equal((await recall()).details.denied,true);
+ manager.appendCompaction('Foreign compaction',kept,100,{},false);assert.equal((await recall()).details.denied,true);
 });

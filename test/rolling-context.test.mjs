@@ -35,13 +35,13 @@ test('planner preserves the three newest groups and pinned/path-dependent eviden
  const branch=repeatedReadHistory(6);const entries=branch.map(e=>({sourceEntry:e,messages:[e.message]}));const state=rebuild(branch,'s');
  state.snapshot.items.push({id:'decision-path',key:'decision-path',kind:'task-decision',text:'Need exact source',status:'active',authority:'agent-report',sourceEntryIds:['note'],taskId:'RC-T-u0',dependencies:[{path:'src/0.ts'}],observedAtEntryId:'note',pinned:false});
  state.snapshot.items.push({id:'pinned-source',key:'pin',kind:'project',text:'Keep this result',status:'active',authority:'tool-evidence',sourceEntryIds:['result-1'],taskId:'RC-T-u0',dependencies:[],observedAtEntryId:'result-1',pinned:true});
- const plan=planTurn({entries,branch,eventEntries:[],baseLeaf:branch.at(-1).id,config:{mode:'on',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state,sessionId:'s'});
+ const plan=planTurn({entries,branch,eventEntries:[],baseLeaf:branch.at(-1).id,config:{mode:'on',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minWarmTurns:1,minBatchSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state,sessionId:'s'});
  assert.deepEqual(plan.filter(x=>x.type==='context_edit').map(x=>x.targetId),['result-2']);
 });
 
 test('observe can inspect candidates without changing the off-mode invariant',()=>{
  const branch=repeatedReadHistory(4);const entries=branch.map(e=>({sourceEntry:e,messages:[e.message]}));const state=rebuild(branch,'s');
- const base={entries,branch,eventEntries:[],baseLeaf:branch.at(-1).id,config:{mode:'observe',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state,sessionId:'s'};
+ const base={entries,branch,eventEntries:[],baseLeaf:branch.at(-1).id,config:{mode:'observe',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minWarmTurns:1,minBatchSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state,sessionId:'s'};
  const observed=planTurn(base);assert.ok(observed.some(x=>x.type==='context_edit'));assert.ok(analyzeGroups(entries,state.snapshot).some(g=>g.reasons.includes('RECENT_GROUP')));
  assert.deepEqual(planTurn({...base,config:{...base.config,mode:'off'}}),[]);
 });
@@ -56,14 +56,14 @@ test('effective context budget honors model window, reserve, and unknown-window 
 
 test('oversized task state causes the complete boundary plan to be rejected',()=>{
  const branch=[user('large-user','x'.repeat(140000)),assistant('large-assistant','stop',[{type:'text',text:'response'}])];const entries=branch.map(e=>({sourceEntry:e,messages:[e.message]}));
- const plan=planTurn({entries,branch,eventEntries:[],baseLeaf:'large-assistant',config:{mode:'on',targetTokens:1000000,reserveTokens:0,contextWindow:2000000,minSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state:rebuild(branch,'s'),sessionId:'s'});
+ const plan=planTurn({entries,branch,eventEntries:[],baseLeaf:'large-assistant',config:{mode:'on',targetTokens:1000000,reserveTokens:0,contextWindow:2000000,minSavingTokens:1,minWarmTurns:1,minBatchSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state:rebuild(branch,'s'),sessionId:'s'});
  assert.deepEqual(plan,[]);
 });
 
 test('rebuild reconciles planned edits against the active branch projection',()=>{
  const cwd='/tmp/rolling-context-reconcile-test';const header={type:'session',version:3,id:'reconcile-session',timestamp:new Date().toISOString(),cwd};
  const branch=repeatedReadHistory(4);const entries=branch.map(e=>({sourceEntry:e,messages:[e.message]}));const state=rebuild(branch,'reconcile-session');
- const plan=planTurn({entries,branch,eventEntries:[],baseLeaf:branch.at(-1).id,config:{mode:'on',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state,sessionId:'reconcile-session'});
+ const plan=planTurn({entries,branch,eventEntries:[],baseLeaf:branch.at(-1).id,config:{mode:'on',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minWarmTurns:1,minBatchSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state,sessionId:'reconcile-session'});
  const stateDraft=plan.find(x=>x.type==='custom'),editDraft=plan.find(x=>x.type==='context_edit');assert.ok(stateDraft&&editDraft);
  const partial=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);partial.appendCustomEntry(stateDraft.customType,stateDraft.data);
  const partialState=rebuild(partial.getBranch(),'reconcile-session');assert.equal(partialState.envelope.edits.length,0);assert.ok(partialState.diagnostics.some(x=>x.includes('not active')));
@@ -71,7 +71,7 @@ test('rebuild reconciles planned edits against the active branch projection',()=
  const committedState=rebuild(committed.getBranch(),'reconcile-session');assert.equal(committedState.envelope.edits.length,1);
  const projection=committed.buildSessionProjection().entries.find(entry=>entry.sourceEntry.id===editDraft.targetId);assert.equal(projection.messages[0].role,'toolResult');assert.ok(Array.isArray(projection.messages[0].content));
  const replayBranch=committed.getBranch();const replayState=rebuild(replayBranch,'reconcile-session');
- const replayPlan=planTurn({entries:committed.buildSessionProjection().entries,branch:replayBranch,eventEntries:[],baseLeaf:committed.getLeafId(),config:{mode:'on',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state:replayState,sessionId:'reconcile-session'});assert.equal(replayPlan.length,0,JSON.stringify(replayPlan.map(x=>({type:x.type,targetId:x.targetId,customType:x.customType}))));
+ const replayPlan=planTurn({entries:committed.buildSessionProjection().entries,branch:replayBranch,eventEntries:[],baseLeaf:committed.getLeafId(),config:{mode:'on',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minWarmTurns:1,minBatchSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state:replayState,sessionId:'reconcile-session'});assert.equal(replayPlan.length,0,JSON.stringify(replayPlan.map(x=>({type:x.type,targetId:x.targetId,customType:x.customType}))));
  committed.appendContextEdit(editDraft.targetId,{content:[{type:'text',text:'replacement by another extension'}]});
  const overwritten=rebuild(committed.getBranch(),'reconcile-session');assert.equal(overwritten.envelope.edits.length,0);assert.ok(overwritten.diagnostics.some(x=>x.includes('not active')));
 });
@@ -167,7 +167,7 @@ test('one branch remains a single task scope rather than guessing from later use
  const branch=[user('u1','Inspect component A'),user('u2','Now inspect unrelated component B')];
  const state=rebuild(branch,'session');assert.equal(state.snapshot.focus.taskId,'RC-T-u1');
  const entries=branch.map(e=>({sourceEntry:e,messages:[e.message]}));
- const plan=planTurn({entries,branch,eventEntries:[],baseLeaf:'u2',config:{mode:'on',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state,sessionId:'session'});
+ const plan=planTurn({entries,branch,eventEntries:[],baseLeaf:'u2',config:{mode:'on',targetTokens:100000,reserveTokens:0,minSavingTokens:1,minWarmTurns:1,minBatchSavingTokens:1,minCheckpointTurns:100,recallMaxTokens:2000},state,sessionId:'session'});
  const snapshot=plan.find(d=>d.type==='custom')?.data.snapshot;
  assert.ok(snapshot.items.filter(item=>item.authority==='user').every(item=>item.taskId==='RC-T-u1'));
 });

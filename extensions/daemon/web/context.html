@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Rolling Context · Pi Remote</title>
+<style>
+body{font:15px system-ui;background:#faf7fb;color:#342b3e;margin:0 auto;padding:24px;max-width:1150px}a{color:#7355a0}h1{margin-bottom:8px}p{color:#756a80}section{background:white;border:1px solid #e6deec;border-radius:12px;padding:18px;margin:20px 0}svg{width:100%;height:auto;min-height:190px}svg text{fill:#74677e;font-size:12px}svg .grid{stroke:#ece7ef}svg .warm-event{stroke:#bc7e29;stroke-dasharray:3 4}svg .checkpoint-event{stroke:#bb4779;stroke-dasharray:7 4}.legend{display:flex;flex-wrap:wrap;gap:16px}.legend span:before{content:'●';color:var(--color);margin-right:5px}table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:6px;text-align:right;border-bottom:1px solid #eee}.table{max-height:260px;overflow:auto}#status{min-height:22px}button{padding:8px 12px;float:right}
+</style></head><body>
+<a id="back">← Session</a><button id="refresh">Refresh</button><h1>Rolling Context Graph</h1>
+<p>Active branch · completed turns · host token estimates, not provider-exact counts. Missing data is shown as a gap/—. Raw includes stored message history; effective includes the canonical projected context. Other/unmanaged includes system contributions.</p>
+<div id="status" role="status">Loading…</div>
+<section><h2>Context size over turns</h2><div id="size"></div><p>Dashed markers: gold = hot→warm batch; pink = Rolling checkpoint / epoch transition.</p></section>
+<section><h2>Context composition</h2><div id="composition"></div></section>
+<section><h2>Memory state size</h2><div id="memory"></div><p>Serialized working envelope bytes; excludes raw JSONL and telemetry. Constraints, explicit active decisions and pins are never silently discarded to meet a limit.</p></section>
+<section><h2>Turn details</h2><div id="details" class="table"></div></section>
+<script src="/context-graph.js"></script>
+<script>
+const sid=decodeURIComponent(location.pathname.split('/')[2]);document.querySelector('#back').href='/s/'+encodeURIComponent(sid);
+async function refresh(){try{const r=await fetch('/api/sessions/'+encodeURIComponent(sid)+'/context-telemetry');const data=await r.json();if(!r.ok)throw new Error(data.error||'Telemetry unavailable');PiContextGraph.render(document,data);document.querySelector('#status').textContent=data.turns.length?`${data.turns.length} completed turns · last mode ${data.turns.at(-1).mode} · ${data.checkpoints.length} recorded compactions (foreign compactions are not Rolling epochs)`:'No telemetry yet. Complete a turn with the updated Rolling Context extension loaded.'}catch(e){document.querySelector('#status').textContent=e.message}}
+document.querySelector('#refresh').onclick=refresh;refresh();setInterval(()=>{if(!document.hidden)refresh()},5000);
+</script></body></html>

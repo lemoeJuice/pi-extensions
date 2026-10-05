@@ -9,13 +9,14 @@
 ### A. Rolling Context 安全裁剪基础
 
 - [x] **RC-01：建立裁剪保护集合。** 保留最近 3 个完整工具组；未消费、不完整、错误、未知工具默认保护；`pinned` 项和 `context_note.paths` 精确依赖能阻止相关来源缩减。只对明确安全的 `read`、仓库 `edit` 和只读搜索/测试结果启用胶囊；胶囊携带调用参数/路径、来源和召回方式。添加每条规则的 planner 测试。
-- [x] **RC-02：完成 observe 诊断。** observe 只规划、不写任何 state/edit/compact 草稿；报告候选数量、保护原因、预算和拒绝原因。验证状态不改变。
+- [x] **RC-02：完成 observe 诊断。** observe 只规划、不写任何 state/edit/compact 草稿；报告候选数量、保护原因、预算和拒绝原因。现在每个完整 turn 仅追加不进模型 context 的 telemetry，工作状态与模型前缀不改变。
 - [x] **RC-03：校验状态与已提交投影。** 恢复时依据 branch 中真实的 context edit/compaction 对账；未提交、被覆盖或不匹配的编辑/检查点不得作为已成功归档。已测 state-only、重复规划、外部覆盖、compaction 前后及 `/tree` 切支。
 - [x] **RC-04：强化 recall。** 支持路径/来源/关键词筛选及受限分页；cursor 绑定 session、leaf、查询和投影版本；结果标明历史、stale、截断或拒绝状态。只返回当前授权投影，不通过旧状态绕过脱敏。
 - [x] **RC-05：收敛预算安全边界。** 读取宿主模型窗口与 usage；usage 缺失时显示 heuristic。动态扣除输出 reserve 和保守 headroom；候选必须有估算净收益；持久状态超过 128 KiB 时整批放弃。token 估算仍不是 provider 精确 tokenizer。
 - [x] **RC-06：补齐 compact 生命周期。** manual/threshold 仅在分支覆盖完整、无图片/未知摘要/外部编辑且估算有净收益时提供结构化检查点；显式 checkpoint 不安全时取消。用户 custom instructions、overflow recovery、覆盖未知或无净收益时委托原生 compact。失败/取消不推进 checkpoint，并记入 status。真实宿主 lifecycle 仍待 INT-02。
 - [x] **RC-07：任务/事实生命周期与测试。** 验证用户约束、单分支 task scope、pin/unpin、路径编辑失效、无范围测试结果的保守失效、assistant/tool evidence 权威差异、图片/未知扩展内容对 checkpoint 的保护，以及超过 128 KiB 整批拒绝。细粒度任务切换不支持：新任务应开 session 或显式换 branch。
-- [~] **RC-08：缓存与批量调度（P2，暂缓）。** `ContextUsage` 仅公开 tokens/contextWindow/percent；assistant message 虽可能含 cacheRead/cacheWrite，但只有最近一次 provider 调用数据，不足以校准下一批上下文维护成本/缓存命中。暂不据此调整 epoch 或批次，避免把单次 usage 当稳定信号。
+- [x] **RC-08：缓存与批量调度（确定性规则路径）。** 已实现完整 turn 时钟、累计 saving、4-turn 普通批次、soft 滞回、16-turn checkpoint / warm 驻留及 after-warm preview 预算。当前 assistant usage 的高 cacheRead 仅提高普通批次门槛，不预测下一次缓存收益；无数据不猜。已有 warm 不重复写。100-turn 多 epoch 模拟、hard 特例、soft 批处理和分支恢复测试通过；真实 provider 成本 A/B 仍待实测。
+- [x] **RC-09：轻量工作状态、cold recall 与 telemetry / Graph。** 按键更新有界 project/change/test 地图，去掉 assistant/tool 正文副本与 envelope capsule 副本；用户原文、活跃显式决策及 pin 仍保护。只撤销自有且 hash/边界一致的冷藏，重放所有外部 edits；foreign compaction 不撤销。daemon 只读当前 branch 数值，提供三张 SVG 图及事件/usage 表。新增 recall 工具、遥测、daemon API/页面回归测试。
 
 ### B. Design Intent 完整查询与写入边界
 
@@ -28,14 +29,14 @@
 ### C. 双扩展集成与交付
 
 - [x] **INT-01：验证单一来源边界。** Rolling Context 从 Design Intent 查询结果提取只读 `{storePath, revision, sourceHash, id, projection}` 引用；task-decision 和 checkpoint 仍留在分支 state。集成测试确认 `.pi/design-intent.json` 字节不变；Design Intent 扩展不导入/读取 RC state。
-- [x] **INT-02：SessionManager/扩展回调集成（受限完成）。** 验证 turn-boundary 草稿回放/工具配对、observe 无写入、compact 提交后 checkpoint 恢复、customInstructions 保留、`/tree` 模式和状态恢复、双扩展注册及 DI 单一来源边界。使用真实内存 SessionManager，但 Pi API 是测试 double；真实 AgentSession/TUI 时序仍未覆盖。
+- [x] **INT-02：SessionManager/扩展回调集成（受限完成）。** 验证 turn-boundary 草稿回放/工具配对、observe 仅非 context metrics、compact 提交后 checkpoint 恢复、customInstructions 保留、`/tree` 模式和状态恢复、双扩展注册及 DI 单一来源边界。使用真实内存 SessionManager，但 Pi API 是测试 double；真实 AgentSession/TUI 时序仍未覆盖。
 - [ ] **INT-03：静态类型及交付验证（进行中）。** 完整 Node tests、Pi CLI 扩展发现、esbuild 和 `git diff --check`；若没有 TypeScript 编译器则明确 blocked，不以 esbuild 代替 typecheck。
 
 ## 已完成的前置核对
 
 - [x] 已审阅两个总体设计和实现蓝图，确认当前交付是受限 MVP。
 - [x] 已修复默认 observe 启动后通过 `/rolling-context on` 无法启用维护的问题（提交 `45175b6`）。
-- [x] 受限 MVP 初始基线 24 项 Node 测试通过；本轮累计 **50 项**测试通过。Pi CLI 曾确认能发现两个入口；本轮两个入口均 esbuild bundle 通过，`git diff --check` 通过。当前环境无 `tsc`，正式 typecheck 未完成。
+- [x] 受限 MVP 初始基线 24 项 Node 测试通过；生命周期修正后完整 Node suite **64/64** 通过，Rolling Context esbuild bundle 与 `git diff --check` 通过。Pi CLI 曾确认能发现两个入口。当前环境无 `tsc`，正式 typecheck 未完成；真实 provider/cache A/B 和 AgentSession/TUI e2e 不冒称已完成。
 
 ## 决策与限制记录
 
