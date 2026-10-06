@@ -37,7 +37,7 @@ export function contractOf(value: unknown): string | undefined {
   return typeof contract === "string" ? contract : undefined;
 }
 
-/** Fail extension initialization instead of silently wiring an incompatible tool. */
+/** Validate after runtime binding (e.g. session_start), never in an extension factory. */
 export function requireToolContract(
   pi: ExtensionAPI | ToolRegistry,
   consumer: string,
@@ -55,7 +55,7 @@ export function requireToolContract(
   }
 }
 
-/** Optional integration may be absent, but a discovered incompatible provider is an error. */
+/** Runtime-only: absence is allowed, but a discovered incompatible provider is an error. */
 export function checkOptionalToolContract(
   pi: ExtensionAPI | ToolRegistry,
   consumer: string,
