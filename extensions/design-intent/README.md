@@ -10,3 +10,5 @@
 - [Rolling Context 设计](../rolling-context/docs/design.md)
 
 项目级真相保存在项目文件中，须显式批准；会话中的临时选择不能自动成为项目设计。可用工具 `design_intent_query/get/propose/check`；命令 `/design-intent` 提供查询与审批。自然语言一致性检查目前只返回带证据的 `unknown`，不声称自动证明架构符合。
+
+提案产生后，若 Pi Remote daemon 可用，会在对应 session 页面排队显示独立的 Design Intent 审批对话框；即使页面当时未打开，进入该 session 页面后仍会重放待处理请求。网页仅把 Accept/Reject 决定送回 Pi 扩展；候选 hash、当前 branch、项目源版本和文件锁仍由扩展复核，daemon 不直接写意图文件。Reject 必须提供理由。

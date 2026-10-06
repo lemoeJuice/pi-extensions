@@ -43,6 +43,18 @@ class Registry {
     for (const i of s.instances.values()) i.writable = s.instances.size === 1;
     s.lastActivityAt = Date.now(); this.broadcastList();
   }
+  subscribe(ws, sessionId) {
+    const client = { ws, sessionId };
+    this.clients.add(client);
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'session_available', sessionId }));
+      for (const approval of session.approvals.values()) {
+        if (ws.readyState === 1) ws.send(JSON.stringify(approval.payload));
+      }
+    }
+    return client;
+  }
   getSession(sessionId) {
     const s = this.sessions.get(sessionId); if (!s) return null;
     const instances = [...s.instances.values()];
@@ -107,30 +119,57 @@ class Registry {
     const s = this.sessions.get(sessionId);
     const instance = s?.instances.get(instanceId);
     if (!s || !instance || !request?.requestId) return false;
-    const clients = [...this.clients].filter(client => client.sessionId === sessionId && client.ws.readyState === 1);
-    if (!clients.length) return false;
-    const payload = { type: 'approval_request', sessionId, requestId: request.requestId, toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior, timestamp: Date.now() };
-    const timer = setTimeout(() => this.respondApproval(sessionId, requestIdSafe(request.requestId), 'Deny'), 120000);
+    if (s.approvals.has(request.requestId)) return false;
+    const kind = request.kind === 'design-intent' ? 'design-intent' : 'permission';
+    if (kind === 'design-intent' && (typeof request.proposalId !== 'string' || typeof request.proposalHash !== 'string' || typeof request.sourceHash !== 'string')) return false;
+    const payload = kind === 'design-intent'
+      ? { type: 'approval_request', kind, sessionId, requestId: request.requestId, proposalId: request.proposalId, proposalHash: request.proposalHash, storePath: request.storePath, baseRevision: request.baseRevision, sourceHash: request.sourceHash, candidateHash: request.candidateHash, statement: request.statement, rationale: request.rationale, effects: request.effects, acceptDiff: request.acceptDiff, acceptUnavailable: request.acceptUnavailable, timestamp: Date.now() }
+      : { type: 'approval_request', kind, sessionId, requestId: request.requestId, toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior, timestamp: Date.now() };
+    const timer = setTimeout(() => {
+      if (kind === 'design-intent') this.expireApproval(sessionId, instanceId, request.requestId);
+      else this.respondApproval(sessionId, request.requestId, 'Deny');
+    }, 120000);
     s.approvals.set(request.requestId, { instanceId, timer, payload });
-    for (const client of clients) client.ws.send(JSON.stringify(payload));
+    for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(JSON.stringify(payload));
     return true;
   }
-  respondApproval(sessionId, requestId, choice) {
+  respondApproval(sessionId, requestId, choice, reason) {
     const s = this.sessions.get(sessionId);
     const approval = s?.approvals.get(requestId);
     const instance = approval && s.instances.get(approval.instanceId);
     if (!s || !approval || !instance || instance.ws.readyState !== 1) return { error: 'Approval request is no longer active' };
+    const choices = approval.payload.kind === 'design-intent' ? ['Accept', 'Reject'] : ['Allow once', 'Switch to auto', 'Deny'];
+    if (!choices.includes(choice)) return { error: 'Invalid approval choice' };
+    if (approval.payload.kind === 'design-intent' && choice === 'Reject' && (typeof reason !== 'string' || !reason.trim() || reason.length > 4000)) return { error: 'A rejection reason of at most 4000 characters is required' };
+    try { instance.ws.send(JSON.stringify({ type: 'approval_choice', requestId, choice, ...(reason ? { reason } : {}) })); }
+    catch (error) { return { error: String(error) }; }
     clearTimeout(approval.timer);
     s.approvals.delete(requestId);
-    try {
-      instance.ws.send(JSON.stringify({ type: 'approval_choice', requestId, choice }));
-      this.broadcastApprovalResolved(sessionId, requestId);
-    }
-    catch (error) { return { error: String(error) }; }
+    this.broadcastApprovalResolved(sessionId, requestId, { choice });
     return {};
   }
-  broadcastApprovalResolved(sessionId, requestId) {
-    const frame = JSON.stringify({ type: 'approval_resolved', sessionId, requestId });
+  dismissApproval(sessionId, instanceId, requestId) {
+    const s = this.sessions.get(sessionId), approval = s?.approvals.get(requestId);
+    if (!s || !approval || approval.instanceId !== instanceId) return false;
+    clearTimeout(approval.timer); s.approvals.delete(requestId);
+    this.broadcastApprovalResolved(sessionId, requestId, { dismissed: true });
+    return true;
+  }
+  expireApproval(sessionId, instanceId, requestId) {
+    const s = this.sessions.get(sessionId), approval = s?.approvals.get(requestId);
+    if (!s || !approval || approval.instanceId !== instanceId) return false;
+    const instance = s.instances.get(instanceId);
+    clearTimeout(approval.timer); s.approvals.delete(requestId);
+    if (instance?.ws.readyState === 1) instance.ws.send(JSON.stringify({ type: 'approval_expired', requestId }));
+    this.broadcastApprovalResolved(sessionId, requestId, { expired: true });
+    return true;
+  }
+  broadcastApprovalResolved(sessionId, requestId, result = {}) {
+    const frame = JSON.stringify({ type: 'approval_resolved', sessionId, requestId, ...result });
+    for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(frame);
+  }
+  broadcastApprovalOutcome(sessionId, requestId, outcome) {
+    const frame = JSON.stringify({ type: 'approval_resolved', sessionId, requestId, outcome });
     for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(frame);
   }
   resolveRequest(requestId, result) {
@@ -143,5 +182,4 @@ class Registry {
   }
 }
 function rank(status) { return ({ waiting: 0, running: 1, idle: 2, error: 3, conflict: 4, offline: 5 })[status] ?? 6; }
-function requestIdSafe(value) { return typeof value === 'string' ? value : ''; }
 module.exports = { Registry };

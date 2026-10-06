@@ -9,6 +9,7 @@ import { rebuild, hash } from '../extensions/rolling-context/lib.ts';
 
 function mockPi(overrides={}){
  const tools=new Map(),commands=new Map(),events=new Map(),flags=new Map(),appended=[];
+ events.emit=(name,payload)=>{for(const handler of events.get(name)||[])handler(payload);};
  return{tools,commands,events,flags,appended,
   registerTool(tool){assert.ok(!tools.has(tool.name));tools.set(tool.name,tool);},
   registerCommand(name,command){commands.set(name,command);},
@@ -107,6 +108,22 @@ test('design_intent_get returns the complete record and current source identity'
  const manager=SessionManager.inMemory(cwd,{id:'design-intent-get-session'},[]);const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;const ctx={cwd,sessionManager:manager,isProjectTrusted:()=>true,hasUI:false};
  const result=await pi.tools.get('design_intent_get').execute('get-1',{intent:'Inspect full record',id:'DI-0001'},undefined,undefined,ctx);const record=result.details.projection.items[0];
  assert.equal(record.scope.paths[0],'src/api.ts');assert.deepEqual(record.sources,[{kind:'user',ref:'request-1'}]);assert.equal(record.review.note,'Explicitly approved');assert.equal(record.createdInRevision,2);assert.equal(result.details.projection.sourceHash.length,64);
+});
+
+test('remote Design Intent approval commits only the current branch proposal matching its preview hash',async()=>{
+ const cwd='/tmp/design-intent-web-approval-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
+ const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;let approval;pi.events.set('pi-remote:design-intent-approval-request',[request=>{approval=request;}]);
+ const branch=[];const sessionManager={getSessionId:()=> 'remote-approval-session',getLeafId:()=>branch.at(-1)?.id??'root',getBranch:()=>branch};const notices=[];
+ const ctx={cwd,sessionManager,isProjectTrusted:()=>true,hasUI:false,waitForIdle:async()=>{},hasPendingMessages:()=>false,ui:{notify:(message,type)=>notices.push({message,type})}};
+ const result=await pi.tools.get('design_intent_propose').execute('propose-remote-1',{intent:'Preserve the API',kind:'invariant',title:'Stable interface',statement:'Keep the public interface stable',rationale:'Existing clients depend on it.'},undefined,undefined,ctx);
+ assert.equal(result.details.type,'design-intent.proposal.v1');assert.equal(approval.proposalId,result.details.proposalId);assert.match(approval.acceptDiff,/candidate hash/);assert.equal(typeof approval.candidateHash,'string');
+ branch.push({type:'message',id:'proposal-result',message:{role:'toolResult',toolCallId:'propose-remote-1',toolName:'design_intent_propose',details:result.details}});
+ const outcome=await approval.respond('Accept');assert.equal(outcome.ok,true);assert.match(outcome.message,/accept committed/i);
+ const committed=JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8'));assert.equal(committed.records.length,1);assert.equal(committed.records[0].status,'accepted');assert.equal(committed.records[0].review.note,'Approved by user through Pi Remote');assert.equal(pi.appended.at(-1).customType,'design-intent.review.v1');assert.ok(notices.some(item=>/committed/.test(item.message)));
+ const rejected=await pi.tools.get('design_intent_propose').execute('propose-remote-2',{intent:'Consider replacing the interface',kind:'alternative',title:'Replacement interface',statement:'Replace the public interface',rationale:'A proposed alternative.',supersedes:['DI-0001']},undefined,undefined,ctx);
+ const rejection=approval;assert.equal(rejection.proposalId,rejected.details.proposalId);branch.push({type:'message',id:'proposal-result-2',message:{role:'toolResult',toolCallId:'propose-remote-2',toolName:'design_intent_propose',details:rejected.details}});
+ const rejectedOutcome=await rejection.respond('Reject','This would break existing clients.');assert.equal(rejectedOutcome.ok,true);
+ const afterReject=JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8'));assert.equal(afterReject.records[0].status,'accepted');assert.equal(afterReject.records[1].status,'rejected');assert.deepEqual(afterReject.records[1].supersedes,[]);assert.match(afterReject.records[1].review.note,/This would break existing clients/);
 });
 
 test('design_intent_check bounds paths and reports denied, truncated, and stale evidence as unknown',async()=>{

@@ -47,6 +47,7 @@ Pi itself owns the JSONL session files, which the daemon only reads.
 - `POST /api/sessions/:sessionId/messages` with `{ "text": "..." }`
 - `POST /api/sessions/:sessionId/abort` to stop the current Pi generation
 - `POST /api/sessions/:sessionId/commands` with `{ "name": "...", "args": "..." }`
+- `POST /api/sessions/:sessionId/approvals` with `{ "requestId": "...", "choice": "...", "reason": "..."? }`
 - `WS /internal` for Pi extension clients
 - `WS /ws/sessions/:sessionId` for session event streams
 
@@ -58,10 +59,16 @@ The session page renders streamed thinking in a collapsed section, pages
 read-only history from the registered session's active branch, and swaps the
 Send button for Stop while Pi is generating. Type `/` to filter available
 commands; selecting one opens a dialog to edit its arguments and apply it.
-Manual permission reviews are presented simultaneously in Pi's local UI and
-the connected session page; the first response wins and dismisses the other
-prompt. The session page retries a missing session while Pi reconnects to the
-daemon.
+Manual permission reviews are presented simultaneously in Pi's local UI and the
+connected session page; the first response wins and dismisses the other prompt.
+Approval requests remain queued in daemon memory for up to two minutes when the
+target session page is not open; opening that session page replays the pending
+prompt. Design Intent proposals also open a distinct browser review dialog with
+the source version, acceptance candidate diff, and explicit accept/reject
+actions. The browser sends its decision back to the originating Pi extension;
+only Pi revalidates the active proposal and writes the project store. Rejecting
+requires a reason and does not apply proposed relationships. The session page
+retries a missing session while Pi reconnects to the daemon.
 Provider and tool errors are shown in the conversation. The footer shows the
 active fast-mode status when the installed fast-mode extension exposes its
 statusline segment. Commands are dispatched back through Pi's

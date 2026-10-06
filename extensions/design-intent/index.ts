@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { markContract, DESIGN_INTENT_PROJECTION_CONTRACT, DESIGN_INTENT_READ_CONTRACT } from "../shared/contracts.ts";
 import { findProject, loadStore, queryStore, deriveNeedsReview, makeProposal, parseDraft, rebuildProposals, buildCandidate, storeDiff, commitCandidate, serializeStore, sha, type IntentProjection, type IntentDraft, type ProjectIdentity, type LoadResult, type Proposal } from "./lib.ts";
@@ -48,12 +49,54 @@ export default function designIntent(pi:ExtensionAPI){
     if(loaded.state==="ready")cached={path:loaded.storePath,hash:loaded.hash,loaded};else cached=undefined;
     return{project,loaded,authorized:true};
   };
+  const remoteReviews=new Map<string,{requestId:string;proposal:Proposal;sessionId:string;ctx:ExtensionContext;reviewedAt:string;acceptCandidateHash?:string}>();
+  function dismissRemoteReview(proposalId:string){const pending=remoteReviews.get(proposalId);if(!pending)return;remoteReviews.delete(proposalId);pi.events.emit("pi-remote:approval-dismiss",{requestId:pending.requestId});}
+  async function applyRemoteReview(pending:{requestId:string;proposal:Proposal;sessionId:string;ctx:ExtensionContext;reviewedAt:string;acceptCandidateHash?:string},choice:string,reason?:string){
+    if(remoteReviews.get(pending.proposal.proposalId)!==pending)return{ok:false,message:"This Design Intent approval is no longer active."};
+    remoteReviews.delete(pending.proposal.proposalId);
+    try{
+      if(choice!=="Accept"&&choice!=="Reject")throw new Error("Invalid Design Intent approval choice");
+      if(choice==="Reject"&&(!reason?.trim()||reason.length>4000))throw new Error("A rejection reason of at most 4000 characters is required");
+      const ctx=pending.ctx;await ctx.waitForIdle();if(ctx.hasPendingMessages())throw new Error("Approval cancelled because pending messages exist.");
+      if(ctx.sessionManager.getSessionId()!==pending.sessionId)throw new Error("Approval cancelled because the active session changed.");
+      const project=await projectFor(ctx);if(project.storePath!==pending.proposal.storePath)throw new Error("Approval cancelled because the project changed.");
+      const proposal=rebuildProposals(ctx.sessionManager.getBranch()).get(pending.proposal.proposalId);
+      if(!proposal||proposal.proposalHash!==pending.proposal.proposalHash)throw new Error("Approval cancelled because the proposal is no longer on the active branch or has changed.");
+      const {loaded,authorized}=await load(ctx);if(!authorized)throw new Error("Project file read is no longer authorized.");
+      const action=choice==="Reject"?"reject":"accept",note=action==="reject"?reason!.trim():"Approved by user through Pi Remote";
+      const candidate=buildCandidate(proposal,loaded,action,note,pending.reviewedAt);
+      if(action==="accept"&&candidate.candidateHash!==pending.acceptCandidateHash)throw new Error("Acceptance candidate differs from the preview. Review the proposal again.");
+      if(ctx.sessionManager.getSessionId()!==pending.sessionId||rebuildProposals(ctx.sessionManager.getBranch()).get(proposal.proposalId)?.proposalHash!==proposal.proposalHash)throw new Error("Approval cancelled because the active branch changed.");
+      const committed=await withFileMutationQueue(ctx.cwd,()=>commitCandidate(project,proposal,action,note,candidate.candidateHash,pending.reviewedAt));cached=undefined;
+      const message=`${action} committed: ${committed.record.id} · revision ${committed.store.revision}`;
+      const receipt={proposalId:proposal.proposalId,proposalHash:proposal.proposalHash,action,recordId:committed.record.id,revision:committed.store.revision,sourceHash:sha(serializeStore(committed.store))};
+      try{pi.appendEntry("design-intent.review.v1",receipt);}catch(error){const warning=`${message}; session receipt unavailable (${error instanceof Error?error.message:String(error)})`;try{ctx.ui.notify(warning,"warning");}catch{}return{ok:true,message:warning};}
+      try{ctx.ui.notify(message,"info");}catch{}
+      return{ok:true,message};
+    }catch(error){const message=error instanceof Error?error.message:String(error),uncertain=message.startsWith("COMMIT_UNCERTAIN:");try{pending.ctx.ui.notify(`Design Intent remote approval ${uncertain?"has uncertain commit status":"not committed"}: ${message}`,"error");}catch{}return{ok:false,...(uncertain?{uncertain:true}:{}),message};}
+  }
+  function requestRemoteReview(ctx:ExtensionContext,proposal:Proposal,loaded:LoadResult){
+    if(remoteReviews.has(proposal.proposalId))return;
+    const requestId=randomUUID(),reviewedAt=new Date().toISOString(),acceptNote="Approved by user through Pi Remote";
+    let acceptCandidateHash:string|undefined,acceptDiff:string|undefined,acceptUnavailable:string|undefined;
+    try{const candidate=buildCandidate(proposal,loaded,"accept",acceptNote,reviewedAt);const preview=diffProposal(proposal,candidate,loaded);if(preview.length>48000)throw new Error("The complete candidate diff exceeds the browser review limit; use /design-intent review in Pi instead.");acceptCandidateHash=candidate.candidateHash;acceptDiff=preview;}
+    catch(error){acceptUnavailable=error instanceof Error?error.message:String(error);}
+    const pending={requestId,proposal,sessionId:ctx.sessionManager.getSessionId(),ctx,reviewedAt,acceptCandidateHash};remoteReviews.set(proposal.proposalId,pending);
+    pi.events.emit("pi-remote:design-intent-approval-request",{
+      requestId,proposalId:proposal.proposalId,proposalHash:proposal.proposalHash,storePath:proposal.storePath,
+      baseRevision:proposal.baseRevision,sourceHash:proposal.baseHash,candidateHash:acceptCandidateHash,
+      statement:proposal.draft.statement,rationale:proposal.draft.rationale,acceptDiff,acceptUnavailable,
+      effects:`Accept writes only ${proposal.storePath} using the existing exclusive lock and atomic replacement. Source files are not modified. Reject adds a rejected record and does not apply proposed relationships.`,
+      onUnavailable:()=>{if(remoteReviews.get(proposal.proposalId)===pending)remoteReviews.delete(proposal.proposalId);},
+      respond:(choice:string,reason?:string)=>applyRemoteReview(pending,choice,reason),
+    });
+  }
 
   pi.registerTool({name:"design_intent_query",label:"Design Intent query",description:"Read approved project requirements, architectural invariants and design decisions relevant to this task. Results are versioned project facts; missing/unavailable is not the same as no requirements.",parameters:QueryParams,outputSchema:ProjectionSchema,annotations:{readOnlyHint:true,openWorldHint:false},async execute(_id,params,_signal,_update,ctx){const {loaded}=await load(ctx);const projection=queryStore(loaded,{text:params.text,paths:params.paths,tags:params.tags,cursor:params.cursor,limit:params.limit,maxChars:6000});return toolResult(projection);}});
 
   pi.registerTool({name:"design_intent_get",label:"Design Intent get",description:"Get the complete current project intent record, including scope, relationships, sources, review and revision. Always check the returned current source hash.",parameters:GetParams,outputSchema:ProjectionSchema,annotations:{readOnlyHint:true,openWorldHint:false},async execute(_id,params,_signal,_update,ctx){const {loaded}=await load(ctx);if(loaded.state!=="ready")return toolResult(queryStore(loaded,{}));const record=loaded.store.records.find(r=>r.id===params.id);if(!record){const p=queryStore(loaded,{});p.diagnostics.push({code:"INTENT_NOT_FOUND",message:`No record ${params.id}`});return toolResult(p);}const p:IntentProjection={type:"design-intent.projection.v1",availability:"ready",storePath:loaded.storePath,storeRevision:loaded.store.revision,sourceHash:loaded.hash,items:[{...record,needsReview:deriveNeedsReview(loaded.store,record.id),mustExpand:false}],diagnostics:[],omittedIds:[],truncated:false};return toolResult(p);}});
 
-  pi.registerTool({name:"design_intent_propose",label:"Propose Design Intent",description:"Propose a long-term project requirement/invariant/decision with rationale. This only records a branch-local proposal; it does not approve or write project files. Task-local execution decisions belong in Rolling Context instead.",parameters:DraftParams,outputSchema:ProposalSchema,exposure:"model-only",executionMode:"sequential",async execute(toolCallId,params,_signal,_update,ctx){const {project,loaded}=await load(ctx);if(loaded.state==="unavailable")throw new Error(`${loaded.code}: ${loaded.message}`);const raw={...params,scope:params.scope??{paths:[],tags:[]},supersedes:params.supersedes??[],conflictsWith:params.conflictsWith??[],dependsOn:params.dependsOn??[],sources:params.sources??[]};const draft:IntentDraft=parseDraft(raw);const proposal=makeProposal(ctx.sessionManager.getSessionId(),toolCallId,loaded,draft);const msg=`Proposal ${proposal.proposalId} saved for review only. Source revision ${proposal.baseRevision}, hash ${proposal.baseHash}. Use /design-intent review ${proposal.proposalId}; no project file was changed.`;return{content:[{type:"text",text:msg}],details:proposal,structuredContent:proposal};}});
+  pi.registerTool({name:"design_intent_propose",label:"Propose Design Intent",description:"Propose a long-term project requirement/invariant/decision with rationale. This only records a branch-local proposal; it does not approve or write project files. Task-local execution decisions belong in Rolling Context instead.",parameters:DraftParams,outputSchema:ProposalSchema,exposure:"model-only",executionMode:"sequential",async execute(toolCallId,params,_signal,_update,ctx){const {project,loaded}=await load(ctx);if(loaded.state==="unavailable")throw new Error(`${loaded.code}: ${loaded.message}`);const raw={...params,scope:params.scope??{paths:[],tags:[]},supersedes:params.supersedes??[],conflictsWith:params.conflictsWith??[],dependsOn:params.dependsOn??[],sources:params.sources??[]};const draft:IntentDraft=parseDraft(raw);const proposal=makeProposal(ctx.sessionManager.getSessionId(),toolCallId,loaded,draft);requestRemoteReview(ctx,proposal,loaded);const msg=`Proposal ${proposal.proposalId} saved for review only. Source revision ${proposal.baseRevision}, hash ${proposal.baseHash}. Use /design-intent review ${proposal.proposalId}; no project file was changed.`;return{content:[{type:"text",text:msg}],details:proposal,structuredContent:proposal};}});
 
   pi.registerTool({name:"design_intent_check",label:"Check Design Intent",description:"Compare selected current project files against relevant approved Design Intent. Reports only evidence-bounded violation/no-violation-found/unknown; not an automatic architecture gate.",parameters:CheckParams,annotations:{readOnlyHint:true,openWorldHint:false},async execute(_id,params,_signal,_update,ctx){
     const {loaded,authorized}=await load(ctx);
@@ -84,7 +127,7 @@ export default function designIntent(pi:ExtensionAPI){
     return{content:[{type:"text",text:JSON.stringify(report,null,2)}],details:report};
   }});
 
-  pi.on("session_start",()=>{cached=undefined;readApprovedSession=undefined;});pi.on("session_tree",()=>{cached=undefined;});
+  pi.on("session_start",()=>{for(const proposalId of remoteReviews.keys())dismissRemoteReview(proposalId);cached=undefined;readApprovedSession=undefined;});pi.on("session_tree",()=>{for(const proposalId of remoteReviews.keys())dismissRemoteReview(proposalId);cached=undefined;});
   pi.on("before_agent_start",async(event,ctx)=>{
     if(pi.getFlag("design-intent-inject")===false)return;
     const project=await projectFor(ctx).catch(()=>undefined);if(!project)return;
@@ -110,6 +153,7 @@ export default function designIntent(pi:ExtensionAPI){
     const reviewedAt=new Date().toISOString();let candidate;try{candidate=buildCandidate(proposal,loaded,action,note,reviewedAt);}catch(error){ctx.ui.notify(error instanceof Error?error.message:String(error),"error");return;}
     const diff=diffProposal(proposal,candidate,loaded);
     if(verb==="review"){ctx.ui.notify(diff,"info");return;}
+    dismissRemoteReview(id);
     if(ctx.hasUI){const yes=await ctx.ui.confirm(`Design Intent ${action}`,`${diff}\n\nSide effects: create .pi/ if missing; create a temporary file and exclusive lock beside the store; atomically replace ${project.storePath}. No source files are modified. Continue?`);if(!yes)return;}
     else {
       const expected=`${id}:${action}:${loaded.state==="ready"?loaded.hash:"missing"}:${candidate.candidateHash}`;

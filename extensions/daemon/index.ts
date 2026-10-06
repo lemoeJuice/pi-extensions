@@ -99,7 +99,7 @@ export default function (pi: ExtensionAPI) {
   let streamCounter = 0;
   let currentStreamId: string | undefined;
   const pendingRemoteMessages: Array<{ requestId: string; text: string }> = [];
-  const pendingApprovals = new Map<string, { request: any; delivered: boolean; cancelChoice?: string; generation: number }>();
+  const pendingApprovals = new Map<string, { request: any; delivered: boolean; cancelChoice?: string; generation: number; kind: "permission" | "design-intent" }>();
   const pendingCommandResults = new Map<string, Array<(result: string) => void>>();
 
   pi.events.on('pi-remote:command-result', (result: any) => {
@@ -126,15 +126,31 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  pi.events.on('pi-remote:approval-request', (request: any) => {
+  function sendApprovalRequest(request: any, kind: "permission" | "design-intent", publicFields: Record<string, unknown>) {
     if (socket?.readyState !== WebSocket.OPEN || typeof request?.requestId !== 'string') { request?.onUnavailable?.(); return; }
-    pendingApprovals.set(request.requestId, { request, delivered: false, generation: connectionGeneration });
+    pendingApprovals.set(request.requestId, { request, delivered: false, generation: connectionGeneration, kind });
     try {
-      socket.send(JSON.stringify({ type: 'approval_request', requestId: request.requestId, toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior }));
+      socket.send(JSON.stringify({ type: 'approval_request', requestId: request.requestId, kind, ...publicFields }));
     } catch {
       pendingApprovals.delete(request.requestId);
       request.onUnavailable?.();
     }
+  }
+
+  pi.events.on('pi-remote:approval-request', (request: any) => sendApprovalRequest(request, 'permission', {
+    toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior,
+  }));
+
+  pi.events.on('pi-remote:design-intent-approval-request', (request: any) => sendApprovalRequest(request, 'design-intent', {
+    proposalId: request.proposalId, proposalHash: request.proposalHash, storePath: request.storePath,
+    baseRevision: request.baseRevision, sourceHash: request.sourceHash, candidateHash: request.candidateHash,
+    statement: request.statement, rationale: request.rationale, effects: request.effects,
+    acceptDiff: request.acceptDiff, acceptUnavailable: request.acceptUnavailable,
+  }));
+
+  pi.events.on('pi-remote:approval-dismiss', (request: any) => {
+    if (typeof request?.requestId !== 'string' || socket?.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: 'approval_dismiss', requestId: request.requestId }));
   });
 
   pi.events.on('pi-remote:approval-cancel', (response: any) => {
@@ -192,7 +208,17 @@ export default function (pi: ExtensionAPI) {
               const pending = pendingApprovals.get(msg.requestId);
               if (!pending) return;
               pendingApprovals.delete(msg.requestId);
-              pending.request.respond?.(msg.choice);
+              if (pending.kind === 'design-intent') {
+                Promise.resolve(pending.request.respond?.(msg.choice, msg.reason)).then(outcome => {
+                  const value = outcome && typeof outcome === 'object' ? outcome : { ok: true, message: 'Design Intent decision processed' };
+                  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'approval_outcome', requestId: msg.requestId, outcome: value }));
+                }).catch(error => {
+                  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'approval_outcome', requestId: msg.requestId, outcome: { ok: false, message: error instanceof Error ? error.message : String(error) } }));
+                });
+              } else pending.request.respond?.(msg.choice);
+            } else if (msg.type === 'approval_expired') {
+              const pending = pendingApprovals.get(msg.requestId);
+              if (pending) { pendingApprovals.delete(msg.requestId); pending.request.onUnavailable?.(); }
             } else if (msg.type === 'approval_cancel_error') {
               const pending = pendingApprovals.get(msg.requestId);
               if (!pending) return;
@@ -253,7 +279,7 @@ export default function (pi: ExtensionAPI) {
             for (const [requestId, pending] of pendingApprovals) {
               if (pending.generation !== generation) continue;
               pendingApprovals.delete(requestId);
-              if (pending.delivered) pending.request.respond?.('Deny');
+              if (pending.delivered && pending.kind === 'permission') pending.request.respond?.('Deny');
               else pending.request.onUnavailable?.();
             }
             if (registered) reject(new Error('daemon disconnected')); else reject(new Error('connection closed'));
