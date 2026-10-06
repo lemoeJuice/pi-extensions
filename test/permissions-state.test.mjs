@@ -107,6 +107,33 @@ test('headless auto requires explicit scope and manual revocation during model r
   assert.match((await f.call()).reason,/revoked/);
 });
 
+test('automatic reviewer retries transient transport errors, then accepts only the exact verdict', async () => {
+  const f = await fixture(); await f.command('auto run'); let attempts = 0, prompt;
+  f.ctx.modelRegistry.streamSimple = (_model, request, options) => {
+    attempts++; prompt = request;
+    assert.equal(options.maxRetries, 0); // retryAssistantCall owns the bounded retry loop
+    return {result: async () => attempts === 1
+      ? ({stopReason:'error',errorMessage:'network error: connection reset',content:[],usage:{input:1,output:0}})
+      : ({stopReason:'stop',content:[{type:'text',text:'APPROVE'}],usage:{input:1,output:1}})};
+  };
+  assert.equal(await f.call(),undefined); assert.equal(attempts,2);
+  assert.match(prompt.messages[0].content,/Run the project tests/);
+  assert.match(prompt.systemPrompt,/plain git push/);
+});
+
+test('reviewer technical failures are not called denials, exhaust bounded retries and redact secrets', async () => {
+  const f = await fixture(); await f.command('auto run'); let attempts = 0;
+  f.ctx.modelRegistry.streamSimple = () => ({result:async()=>{
+    attempts++;return {stopReason:'error',errorMessage:'fetch failed Bearer supersecret sk-abcdefgh123456 api_key=hidden-secret',content:[],usage:{input:1,output:0}};
+  }});
+  const result=await f.call();assert.equal(attempts,3);assert.match(result.reason,/3 attempt\(s\)/);assert.match(result.reason,/unavailable|No security decision/i);
+  assert.doesNotMatch(result.reason,/supersecret|abcdefgh123456|hidden-secret/);
+
+  const nonTransient=await fixture();await nonTransient.command('auto run');let immediate=0;
+  nonTransient.ctx.modelRegistry.streamSimple=()=>({result:async()=>{immediate++;return{stopReason:'error',errorMessage:'invalid API key',content:[],usage:{input:1,output:0}};}});
+  const denied=await nonTransient.call();assert.equal(immediate,1);assert.match(denied.reason,/No security decision was made/);
+});
+
 test('the permission choice and lifetime choice are two ordinary native dialogs, both answerable by the generic proxy', async () => {
   const loaded = await loadExtensions(['extensions/permissions/index.ts'],process.cwd()); assert.deepEqual(loaded.errors,[]);
   const host = nativeUI(undefined,loaded);

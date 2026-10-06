@@ -21,6 +21,12 @@ test("routes mutations, unknown commands, and shell composition to review", () =
   }
 });
 
+test("routes ordinary pushes to review and labels force/delete pushes as high risk", () => {
+  assert.equal(analyzeBashCommand("git push origin main").reviewReason, "Git command is not in the safe read-only allowlist");
+  assert.equal(analyzeBashCommand("git push origin main --force-with-lease").reviewReason, "force, deletion, or mirror Git push");
+  assert.equal(analyzeBashCommand("git push origin main --delete").reviewReason, "force, deletion, or mirror Git push");
+});
+
 test("extracts file operands from allowlisted search commands for workspace checks", () => {
   assert.deepEqual(analyzeBashCommand("grep TODO src/main.ts").filePaths, ["src/main.ts"]);
   assert.deepEqual(analyzeBashCommand("grep -f /etc/patterns /tmp/data").filePaths, ["/etc/patterns", "/tmp/data"]);

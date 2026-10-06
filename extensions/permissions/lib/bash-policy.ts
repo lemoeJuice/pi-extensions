@@ -16,6 +16,7 @@ const HIGH_RISK_PATTERNS: Array<[RegExp, string]> = [
   [/\bfind\b[^\n]*\s-(?:delete|exec(?:dir)?|ok(?:dir)?|fprint|fprintf|fls)\b/i, "find command can modify files or execute commands"],
   [/\bgit\s+clean\b[^\n]*-[^\n]*[fd]/i, "deletion of untracked Git files"],
   [/\bgit\s+reset\s+--hard\b/i, "discarding Git changes"],
+  [/\bgit\b[^\n]*\bpush\b[^\n]*(?:--force(?:-with-lease)?\b|(?:^|\s)-f(?:\s|$)|--delete\b|--mirror\b)/i, "force, deletion, or mirror Git push"],
   [/\bgit\s+(?:diff|log|show)\b[^\n]*--(?:output|ext-diff|textconv)\b/i, "Git output file or external diff execution"],
   [/\b(?:curl|wget)\b[^\n]*\|\s*(?:ba)?sh\b/i, "downloaded code execution"],
 ];
