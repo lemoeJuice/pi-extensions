@@ -14,6 +14,7 @@ function mockPi(overrides={}){
   registerCommand(name,command){commands.set(name,command);},
   registerFlag(name,definition){flags.set(name,definition);},
   getFlag(name){return overrides[name]??flags.get(name)?.default;},
+  getAllTools(){return [{name:'read',parameters:{'x-pi-guardrails-contract':'pi-guardrails.read-intent.v1'}},...tools.values()];},
   on(name,handler){const handlers=events.get(name)||[];handlers.push(handler);events.set(name,handlers);},
   appendEntry(customType,data){appended.push({customType,data});},
  };
@@ -26,6 +27,8 @@ test('both context extensions register their public tools, commands, and lifecyc
  assert.ok(rolling.events.has('turn_end'));
  const design=mockPi();designIntent(design);
  assert.deepEqual([...design.tools.keys()],['design_intent_query','design_intent_get','design_intent_propose','design_intent_check']);
+ assert.equal(design.tools.get('design_intent_query').parameters['x-pi-guardrails-contract'],'design-intent.read-projection.v1');
+ assert.equal(design.tools.get('design_intent_get').parameters['x-pi-guardrails-contract'],'design-intent.read-projection.v1');
  assert.ok(design.commands.has('design-intent'));
  assert.ok(design.events.has('before_agent_start'));
 });

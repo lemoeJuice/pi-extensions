@@ -5,6 +5,7 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-tui": "*",
@@ -14,6 +15,6 @@
     "ws": "^8.18.0"
   },
   "pi": {
-    "extensions": ["./extensions/permissions/index.ts", "./extensions/edit/index.ts", "./extensions/daemon/index.ts", "./extensions/rolling-context/index.ts", "./extensions/design-intent/index.ts"]
+    "extensions": ["./extensions/edit/index.ts", "./extensions/permissions/index.ts", "./extensions/daemon/index.ts", "./extensions/design-intent/index.ts", "./extensions/rolling-context/index.ts"]
   }
 }

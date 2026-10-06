@@ -1,5 +1,6 @@
 import type { ExtensionAPI, SessionBoundaryDraft, SessionEntry, ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { checkOptionalToolContract, DESIGN_INTENT_READ_CONTRACT } from "../shared/contracts.ts";
 import { analyzeGroups, boundMemory, effectiveTarget, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, serializedStateBytes, MAX_STATE_BYTES, TELEMETRY_TYPE, contextComposition, ownedEdits, ownedCheckpoint, recallProjection, turnClock, type PlanMetrics, type RollingConfig } from "./lib.ts";
 
 const NoteParams=Type.Object({intent:Type.String({minLength:1}),kind:Type.Union([Type.Literal("plan"),Type.Literal("task-decision"),Type.Literal("focus"),Type.Literal("next-step")]),text:Type.String({minLength:1,maxLength:2000}),replaces:Type.Optional(Type.Array(Type.String(),{maxItems:8})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:12}))},{additionalProperties:false});
@@ -17,6 +18,8 @@ function parseConfig(pi:ExtensionAPI):RollingConfig {
 }
 
 export default function rollingContext(pi:ExtensionAPI) {
+  checkOptionalToolContract(pi,"rolling-context","design_intent_query",DESIGN_INTENT_READ_CONTRACT);
+  checkOptionalToolContract(pi,"rolling-context","design_intent_get",DESIGN_INTENT_READ_CONTRACT);
   pi.registerFlag("rolling-context-mode",{type:"string",default:"observe",description:"Rolling Context mode: observe, on, or off"});
   pi.registerFlag("rolling-context-target",{type:"string",default:"32768",description:"Target context token estimate"});
   pi.registerFlag("rolling-context-reserve",{type:"string",default:"16384",description:"Conservative output reserve in tokens"});
