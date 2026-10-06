@@ -163,11 +163,11 @@ test('manual Rolling Context checkpoint confirms through ordinary UI, including 
  compactOptions=undefined;await pi.commands.get('rolling-context').handler('checkpoint',{...ctx,hasUI:false});assert.equal(compactOptions,undefined);
 });
 
-test('Design Intent has one local accept/reject execution path; proxy replies only to its confirm',async()=>{
+test('Design Intent has one local commit path; proxy replies only to ordinary UI dialogs',async()=>{
  const cwd='/tmp/design-intent-web-approval-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
  const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;
  const branch=[];const sessionManager={getSessionId:()=> 'approval-session',getLeafId:()=>branch.at(-1)?.id??'root',getBranch:()=>branch};
- const proxy=proxyUI(request=>{assert.equal(request.method,'confirm');assert.match(request.message,/candidate=/);return{confirmed:true};});
+ const proxy=proxyUI(request=>{if(request.method==='select')return{value:'Later'};assert.equal(request.method,'confirm');assert.match(request.message,/candidate=/);return{confirmed:true};});
  const ctx={cwd,sessionManager,isProjectTrusted:()=>true,hasUI:true,waitForIdle:async()=>{},hasPendingMessages:()=>false,ui:proxy.ui};
  const result=await pi.tools.get('design_intent_propose').execute('propose-1',{intent:'Preserve the API',kind:'invariant',title:'Stable interface',statement:'Keep the public interface stable',rationale:'Existing clients depend on it.'},undefined,undefined,ctx);
  assert.equal(result.details.type,'design-intent.proposal.v1');assert.deepEqual(proxy.broker.snapshot().pending,[]);
@@ -189,7 +189,7 @@ test('the sole DI approval path rechecks trust and reports receipt failure as co
  const cwd='/tmp/design-intent-ui-boundary-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
  const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;let trusted=true;const branch=[];
  const ctx={cwd,isProjectTrusted:()=>trusted,sessionManager:{getSessionId:()=> 'boundary-session',getLeafId:()=>branch.at(-1)?.id??'root',getBranch:()=>branch},hasUI:true,waitForIdle:async()=>{},hasPendingMessages:()=>false};
- const propose=async id=>{const result=await pi.tools.get('design_intent_propose').execute(id,{intent:'Preserve behavior',kind:'requirement',title:id,statement:'Keep the API safe',rationale:'Compatibility matters'},undefined,undefined,ctx);branch.push({type:'message',id,message:{role:'toolResult',toolCallId:id,toolName:'design_intent_propose',details:result.details}});return result.details.proposalId;};
+ const propose=async id=>{const result=await pi.tools.get('design_intent_propose').execute(id,{intent:'Preserve behavior',kind:'requirement',title:id,statement:'Keep the API safe',rationale:'Compatibility matters'},undefined,undefined,{...ctx,hasUI:false});branch.push({type:'message',id,message:{role:'toolResult',toolCallId:id,toolName:'design_intent_propose',details:result.details}});return result.details.proposalId;};
  const first=await propose('untrusted');const revoked=proxyUI(()=>{trusted=false;return{confirmed:true};});
  await pi.commands.get('design-intent').handler(`accept ${first}`,{...ctx,ui:revoked.ui});
  assert.equal(JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8')).records.length,0);assert.match(revoked.notices.at(-1).message,/no longer trusted/);revoked.restore();

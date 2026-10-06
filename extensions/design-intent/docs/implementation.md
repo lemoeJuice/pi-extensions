@@ -4,12 +4,14 @@
 
 当前限制：项目根固定为受信任的 `ctx.cwd`，不扫描仓库父目录；文件检查只读取用户选定路径并返回 `unknown`，不会生成 Git diff 或自动判定 pass/violation；审批 UI 显示候选记录/关系的变更说明，非交互审批使用 `--design-intent-confirm PROPOSAL:ACTION:SOURCE_HASH:CANDIDATE_HASH` 精确绑定参数。Store 读取使用 no-follow fd 和 1 MiB bounded read；但 Node 的 path-based rename API 不提供 openat/renameat 目录句柄 CAS，父目录被恶意并发替换及非协作写入仍有窄竞态。目录 fsync、外部写入 CAS 和多进程崩溃恢复仍受普通文件系统约束。
 
+非交互候选 hash 包含 review 时间戳；跨独立调用保存/复用准确预览的时间戳尚待完善，不能承诺把上一次调用打印的 token 原样重用即可提交。本次验证无 UI propose 只保存候选、无确认默认不写文件，不声称完成 headless 正向审批的端到端验证。
+
 ## 1. MVP 的固定选择
 
 - 使用单一项目文件 `.pi/design-intent.json`；项目真相不写入 Rolling Context 的状态库。
 - accepted/rejected/superseded 记录、理由和关系在同一 JSON 中维护；proposed 只存在当前会话分支。
 - 普通 TypeScript 函数、TypeBox 校验、数组/Map 检索；不引入数据库、服务或通用决策框架。
-- 模型只能 query/get/propose/check；审批只能由用户命令显式完成。
+- 模型只能 query/get/propose/check；propose 有 UI 时即时询问 Accept/Reject/Later。批准必须来自用户 UI 的准确 diff 确认或显式命令，不能来自模型参数。
 - `task-decision` 不自动导入、批准或替代 intent。实际代码和测试只能作为检查证据。
 - 初始支持并测试 pi `1.0.0`。根 export 和真实结果类型为准，不调用宿主私有 API。
 
@@ -84,6 +86,8 @@ type LoadedStore =
 ```
 
 missing 用于首次建立提案，baseRevision=0、baseHash="missing"；磁盘后来出现任何文件就使该提案过期。读取失败、权限拒绝、损坏 JSON、重复 ID、悬空引用是 unavailable，不能初始化新空库覆盖它。
+
+加载、读取、生成候选、Later/关闭、无 UI propose 及即时 Reject 都不创建意图 JSON。第一次明确批准的提交在原子 rename 成功时发布文件，revision 为 1；带理由并确认的 reject 命令也可首次建库。批准后的提交尝试可能创建 `.pi/`、lock/temp；发布前失败不创建 JSON，但不保证删除已经创建的空目录。
 
 缓存按 canonicalStorePath + sourceHash 建立。每次 query/get/check/入口注入执行有界读取与 hash 检查，不只依赖 mtime/size；相同内容复用解析/索引。不使用 watcher 或后台轮询；缺失、拒绝和损坏不能沿用旧缓存冒充当前来源。
 
@@ -167,7 +171,7 @@ opaque cursor 编码查询参数 hash、canonical storePath、raw sourceHash、�
 
 ## 7. 提案持久化与分支恢复
 
-`design_intent_propose` 参数是 draft record（kind/title/statement/rationale/scope/关系/source），不含 status、review、正式 DI ID。创建提案时对当前 source revision 校验所有关系端点存在且 accepted；批准时锁内重新验证候选与冲突/依赖，再展示会受 supersede 影响而进入 needs-review 的既有记录。固定权限仅为“生成提案”。
+`design_intent_propose` 参数是 draft record（kind/title/statement/rationale/scope/关系/source），不含 status、review、正式 DI ID。创建提案时对当前 source revision 校验所有关系端点存在且 accepted；批准时锁内重新验证候选与冲突/依赖，再展示会受 supersede 影响而进入 needs-review 的既有记录。模型只能提出候选，不能通过参数批准；用户的即时 Accept 加准确 diff 确认可以触发同一安全提交路径。
 
 ```ts
 interface Proposal {
@@ -181,11 +185,11 @@ interface Proposal {
 }
 ```
 
-proposalId 由首次创建的 session ID 与 toolCallId 派生；fork/clone 复制已有提案时保持该 ID，不改来源身份。工具设 sequential，返回 content 提示“尚未批准”和 `details: Proposal`，不先写入权威文件。
+proposalId 由首次创建的 session ID 与 toolCallId 派生；fork/clone 复制已有提案时保持该 ID，不改来源身份。工具设 sequential；弹框前先 `appendEntry("design-intent.proposal.v1", proposal)`，因为正在执行的工具结果还不在 branch 中。返回 `details/structuredContent` 包含原提案及 `review.status/message`，明确 pending、committed、rejected_pending_reason、cancelled、failed 或 uncertain；可附回执及回执失败警告。review 元数据不改变原提案 hash 的正文。
 
-工具的声明与实际变更必须匹配：提案是会话状态写入，不是项目文件写入。返回前验证 kind 与关系，不从 context_note 偷取内容隐式建立提案；agent 若要长期化，必须显式调用 propose 并说明理由。
+工具的声明与实际变更必须匹配：保存候选是会话状态写入，只有随后明确的人类批准才可能写项目文件。返回前验证 kind 与关系，不从 context_note 偷取内容隐式建立提案；agent 若要长期化，必须显式调用 propose 并说明理由。
 
-重建从当前 `getBranch()` 的该工具结果及本插件命令 custom entry 扫描。nested propose 不产生直接结果 entry，不能指望父工具总会保留 details；MVP 为该工具设 `exposure:"model-only"`，避免通过 codemode 嵌套调用丢失提案持久化。query/get/check 保持可调用。
+重建从当前 `getBranch()` 的提案 custom entry 和该工具结果扫描，只接受规范正文 hash 匹配的提案。MVP 保留 `exposure:"model-only"`，不引入嵌套提案审批；query/get/check 保持可调用。持久性仍遵守宿主 session 策略，`--no-session` 不落盘。
 
 批准后写入 `sources` 的 proposal ref（含 proposalId/proposalHash），用于权威文件中幂等查找；另可 `pi.appendEntry("design-intent.review.v1", receipt)` 记录会话回执。回执失败或切换到旧分支，不能使已经写入项目文件的批准倒退。
 
@@ -203,7 +207,11 @@ proposalId 由首次创建的 session ID 与 toolCallId 派生；fork/clone 复�
 /design-intent reject <proposal-id> <reason>
 ```
 
-accept/reject 默认 `await ctx.waitForIdle()`，然后重新取项目/session/branch，不在旧 context 上继续操作。命令没有 executeTool，不能假装通过它调用另一工具。等待/确认后 session、项目或 proposal 改变就终止本次审批。
+accept/reject **命令**先 `await ctx.waitForIdle()`，然后重新取项目/session/branch。即时工具路径绝不 waitForIdle，避免等待自己而死锁。两者复用 `reviewProposal`，不调用命令 handler 或私有宿主 API；在确认前、文件队列中及原子发布前复核信任、取消、待处理消息、session/branch/proposal 身份，提交函数仍锁内核对 source/candidate hash 与路径。
+
+即时 `ctx.ui.select` 无默认超时：Accept 进入共享的准确 diff confirm；Later/关闭保留候选；无 UI 的 propose 只保存 pending，不能借确认 flag 自动提交。Reject 不进项目提交函数、不弹 input/editor，不立即建立无理由的 rejected 项目记录。它返回 `rejected_pending_reason` 和工具文本，请用户在下一条普通消息中解释理由；用户之后若选择长期记录，可用带理由的 reject 命令再确认。
+
+Reject 调用公开、非等待的 `ctx.abort()` 并返回 `terminate:true`；不能等待 abort 的 idle promise，否则工具会等待自身退出。仅 terminate 不够：宿主仅在整个工具批次的已完成结果都 terminate 时才按该标志停轮。abort 取消当前运行并跳过后续同批工具，工具结果仍正常完成并通过 message_end 保存；已执行的操作不回滚。provider 若收到已取消的 signal 应按宿主标准取消语义退出，不继续模型请求。测试使用真实 Agent 与 session 文件验证这一结果，而非只断言一个 mock 的 abort 次数。
 
 review 是纯预览：检查基线，按当前记录最大数字 ID + 1 分配候选 DI ID，构造下一个 revision，生成准确 JSON diff、影响列表和 candidateHash。真正分配以锁内同基线重建为准；基线相同必须得到相同候选。
 
@@ -299,7 +307,7 @@ no-violation-found 只允许在指定条目/范围和有证据的规则下输出
 | `session_start/session_tree` | 清会话缓存、恢复当前分支提案，按当前项目重新定位文件 |
 | `before_agent_start` | 有 grant 才重新读源并返回有限入口投影；只用 message 返回，不替换系统 prompt |
 | query/get/check | 每次核对 raw hash，变更时重算；失败不能用旧缓存充当当前真相 |
-| propose | 读取基础版本、返回会话提案 details；不写项目文件 |
+| propose | 读取基础版本、持久化分支候选并即时 select；明确 Accept 后准确 diff confirm，提交结果包含在工具输出；Reject 停止工作流 |
 | accept/reject command | 等 idle、准确确认、锁内提交；不启动主 agent 回复 |
 | `turn_end/agent_before_settle` | 不提交 context_edit/compaction，不改变 continue；可省略 handler |
 | `session_shutdown` | 取消本次未提交读取/检查，清缓存，幂等释放本实例资源 |
@@ -314,7 +322,7 @@ Git 分支与 pi `/tree` 不同：pi 树只决定提案/任务历史，当前意
 
 工具业务失败用 throw 或 `isError:true`，不要仅在普通文本里写“失败”。声明 outputSchema 时每个正常结果必须有 structuredContent；错误结果也使用明确诊断 envelope。model-facing 文本不泄露密钥、完整 session 或无关项目内容。
 
-UI 用标准 notify/confirm，不需要自定义 TUI。无 UI 的命令结果保存为本插件 custom entry 并供宿主事件/会话读取，不向 stdout 乱写 console.log 污染 JSON/RPC。若使用 `sendMessage` 显示回执，必须 `triggerTurn:false`，且不作为重新审批的权威依据。
+UI 用标准 select/confirm/notify，不需要自定义 TUI；daemon 只代理这些普通 UI，不理解 proposal/hash/否决理由。无 UI 的命令通过宿主 UI notify 展示结果，成功提交记录 custom receipt；即时工具通过 content/details 返回结果，不向 stdout 乱写 console.log 污染 JSON/RPC。若使用 `sendMessage` 显示回执，必须 `triggerTurn:false`，且不作为重新审批的权威依据。
 
 flags 初始只需 root、read-enable、入口注入开关和输出预算。原生 registerFlag 仅 string/boolean，数值自行严格解析；project 内任意 settings 字段不会自动传入扩展。默认不启用辅助模型，不自动导入设计文档、不自动推送长期化建议。
 

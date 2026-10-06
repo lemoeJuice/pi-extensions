@@ -20,7 +20,7 @@ Helper modules under each extension's `lib/` (or daemon runtime directory) are i
 
 `/rolling-context status` inspects task memory. Automatic rolling edits are opt-in with `--rolling-context-mode on`; observe mode is the default. The extension preserves source history and uses conservative tool-result capsules/checkpoints, with native compaction retained as fallback. See [`extensions/rolling-context/README.md`](extensions/rolling-context/README.md).
 
-Design Intent stores approved project requirements and decisions in `.pi/design-intent.json`. The fixed file is read by default in a trusted current workspace without prompting (`--design-intent-read false` disables reading); writes still require explicit `/design-intent accept|reject` approval. Proposal tools cannot approve or write project intent. See [`extensions/design-intent/README.md`](extensions/design-intent/README.md).
+Design Intent stores approved project requirements and decisions in `.pi/design-intent.json`. The fixed file is read by default in a trusted current workspace without prompting (`--design-intent-read false` disables reading). Proposals immediately ask **Accept / Reject / Later** when UI is available: Accept requires exact-diff confirmation before writing; Reject stops the agent workflow and asks for the reason in the next ordinary user message, without writing a reasonless rejection; Later keeps the proposal pending. The file is created only by an explicitly approved commit, not by loading, reading, or proposing. `/design-intent accept|reject` remains available for deferred review. See [`extensions/design-intent/README.md`](extensions/design-intent/README.md).
 
 ### Permissions
 

@@ -56,7 +56,7 @@ interface IntentStore {
 }
 ```
 
-`proposed` 不进入这个权威集合；提案存在当前 session 的工具结果 `details`，包括完整拟议内容、目标关系、理由、源文件路径、基础 revision 和内容哈希，按当前 branch 重建。用户批准或否决后才写入项目记录。
+`proposed` 不进入这个权威集合；提案先保存为当前 session 的 custom entry，再返回工具结果 `details`，包括完整拟议内容、目标关系、理由、源文件路径、基础 revision 和内容哈希，按当前 branch 重建。只有用户明确批准项目写入后才写入项目记录；即时 Reject 的“拒绝、待说明理由”只存在 session，不是假造理由的项目记录。
 
 批准后正文、理由和 scope 不原地改写；变更使用新的 ID 和显式 supersedes。旧记录保留正文与来源，状态更新为 superseded；存储 revision 单调增长。关系数组足以表达演化，无须构建新的框架。
 
@@ -67,7 +67,9 @@ interface IntentStore {
 1. 用户或 agent 发起提案，写明要求/决策、原因、范围、依赖及可能冲突。
 2. 插件做结构与关系检查，展示新增内容、影响记录以及项目文件差异。
 3. 用户明确批准或否决。默认只通过用户命令写入权威文件，模型工具没有 accept/supersede 权限。
-4. 批准后才成为 accepted；否决后保留 rejected 方案和理由。提案不因任务结束、测试成功或 checkpoint 自动批准。
+4. agent 调用 propose 后，有 UI 时立即用普通 `ctx.ui.select` 展示完整提案和 **Accept / Reject / Later**，无默认超时。Accept 展示准确候选 diff、源版本及 file/lock/temp 副作用，再用 confirm 明确批准写入，成功后才成为 accepted。Later 或关闭选择框保留候选；无 UI 只保存待审提案，不自动提交。
+5. **Reject 直接停止当前 agent 工作流**，跳过尚未执行的同批工具和后续自动续跑；不回滚已经执行的操作。工具输出请用户在下一条普通消息中说明拒绝理由，不弹 input/editor 收集理由，不自动推断理由，也不写无理由的 rejected 项目记录。提案与拒绝结果保留在 session；若希望长期记录否决及理由，用户再用 `/design-intent reject PROPOSAL reason` 明确确认项目写入。
+6. 提案不因任务结束、测试成功或 checkpoint 自动批准；用户下一条自然消息不自动成为写入授权。
 
 若内容由用户直接维护在受信任项目文件中，则沿用项目的人工 review/Git 流程。本插件不声称能阻止 bash/edit 绕过命令直接改文件，也不把 JSON 中的 review 字段当成防篡改证明。
 
@@ -149,7 +151,7 @@ truncated、未展开的 ID、待核验/冲突提示
 | --- | --- |
 | `design_intent_query` | 只读，按任务/路径/标签提供相关投影 |
 | `design_intent_get` | 只读，按 ID 提供完整意图、理由及演化 |
-| `design_intent_propose` | 保存当前分支的提案；不写项目权威记录 |
+| `design_intent_propose` | 保存当前分支提案并即时询问 Accept/Reject/Later；只有用户 Accept 且确认准确 diff 后才提交 |
 | `design_intent_check` | 用实际改动生成限定范围、带证据的报告 |
 | `/design-intent status` / `show <id>` | 文件、版本、有效意图、冲突和待复核依赖 |
 | `/design-intent review <proposal-id>` | 显示提案与将写入的差异 |
@@ -163,6 +165,12 @@ truncated、未展开的 ID、待核验/冲突提示
 原记录状态变更和新记录写入在同一个文件版本提交，不把 supersede 分散成几次写入。提交点前失败不增长 revision，不先发送成功事件；提交点后的响应/持久性失败需重新对账，不能声称已撤销，详见实现文档。确认是插件的设计审批流程，仍需遵守已有文件权限机制。
 
 有 UI 时，accept/reject 命令展示精确差异并要求确认；非交互环境默认不提交，必须由操作者提供明确的 proposal ID、预期源哈希及确认选项。模型调用工具不能借此获得批准权限。
+
+### 意图文件何时创建
+
+加载插件、读取/query/get、生成提案、Later、关闭提示、无 UI 提案及即时 Reject 均不创建 `.pi/design-intent.json`；missing 表示尚未建立项目权威库，不是读取失败。第一次明确批准且成功的提交才通过同目录临时文件和原子 rename 发布该 JSON，revision 从 1 开始。通常是即时 Accept 后的 diff 确认或 `/design-intent accept`；显式带理由并确认的 `/design-intent reject` 也可以首次创建只含 rejected 记录的库。
+
+审批提交过程中可能创建 `.pi/`、lock 和临时文件；发布前失败不会创建意图 JSON，但可能留下空目录，崩溃时还可能留下需人工核对的 lock/temp。不在 missing 时自动初始化空库，更不能把损坏或不可访问的库当成 missing 覆盖。
 
 ## 7. 项目分支、会话分支与恢复
 

@@ -170,7 +170,7 @@ export function makeProposal(sessionId:string,toolCallId:string,loaded:LoadResul
   const body={type:"design-intent.proposal.v1" as const,proposalId,storePath:loaded.storePath,baseRevision,baseHash,draft,sessionId,createdAt};return{...body,proposalHash:sha(JSON.stringify(body))};
 }
 export function rebuildProposals(branch:any[]):Map<string,Proposal>{
-  const out=new Map<string,Proposal>();for(const entry of branch){if(entry.type==="message"&&entry.message?.role==="toolResult"&&entry.message.toolName==="design_intent_propose"){const p=entry.message.details as Proposal;if(p?.type==="design-intent.proposal.v1"&&p.proposalHash===sha(JSON.stringify({type:p.type,proposalId:p.proposalId,storePath:p.storePath,baseRevision:p.baseRevision,baseHash:p.baseHash,draft:p.draft,sessionId:p.sessionId,createdAt:p.createdAt})))out.set(p.proposalId,p);}}
+  const out=new Map<string,Proposal>();for(const entry of branch){const p=(entry.type==="custom"&&entry.customType==="design-intent.proposal.v1"?entry.data:entry.type==="message"&&entry.message?.role==="toolResult"&&entry.message.toolName==="design_intent_propose"?entry.message.details:undefined) as Proposal|undefined;if(p?.type==="design-intent.proposal.v1"&&p.proposalHash===sha(JSON.stringify({type:p.type,proposalId:p.proposalId,storePath:p.storePath,baseRevision:p.baseRevision,baseHash:p.baseHash,draft:p.draft,sessionId:p.sessionId,createdAt:p.createdAt})))out.set(p.proposalId,p);}
   return out;
 }
 export interface Candidate {store:IntentStore;record:IntentRecord;candidateHash:string;sourceHash:string}
@@ -211,7 +211,7 @@ export function storeDiff(loaded:LoadResult,candidate:Candidate):string{
     ...newlyNeedsReview.map(record=>`! ${record.id}: needs review because dependency chain includes ${record.dependsOn.join(", ")||"an unaccepted dependency"}`),
     `candidate hash: ${candidate.candidateHash}`].join("\n");
 }
-export async function commitCandidate(project:ProjectIdentity,proposal:Proposal,action:"accept"|"reject",note:string,expectedCandidateHash:string,reviewedAt?:string):Promise<Candidate>{
+export async function commitCandidate(project:ProjectIdentity,proposal:Proposal,action:"accept"|"reject",note:string,expectedCandidateHash:string,reviewedAt?:string,beforeCommit?:()=>void):Promise<Candidate>{
   const root=await realpath(project.root);if(resolve(root,".pi")!==dirname(project.storePath))throw new Error("Unsafe intent store path");
   const dir=dirname(project.storePath);
   try{const existing=await lstat(dir);if(existing.isSymbolicLink()||!existing.isDirectory())throw new Error("UNSAFE_STORE_DIRECTORY: .pi must be an ordinary project-local directory");}
@@ -234,6 +234,7 @@ export async function commitCandidate(project:ProjectIdentity,proposal:Proposal,
     const rel=relative(latestProject.root,project.storePath);if(rel.startsWith(`..${sep}`)||rel==="..")throw new Error("Store path escaped project root");
     const payload=serializeStore(candidate.store);const file=await open(temp,"wx",0o600);try{await file.writeFile(payload,"utf8");await file.sync();}finally{await file.close();}
     const check=await loadStore(latestProject);if(check.hash!==proposal.baseHash)throw new Error("STALE_PROPOSAL: store changed during review");
+    beforeCommit?.();
     await rename(temp,project.storePath);
     try{const dirHandle=await open(dir,"r");try{await dirHandle.sync();}finally{await dirHandle.close();}}catch{}
     const verified=await loadStore(latestProject);if(verified.state!=="ready"||verified.hash!==sha(payload))throw new Error("COMMIT_UNCERTAIN: file was renamed but post-commit verification failed");
