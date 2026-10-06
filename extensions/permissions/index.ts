@@ -5,9 +5,9 @@ import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { isPathWithinWorkingDirectory, patchPaths } from "../edit/lib/codex-apply-patch.ts";
 import { analyzeBashCommand } from "./lib/bash-policy.ts";
+import { MODE_ENTRY, PermissionModes, sessionIdentity, type PermissionMode, type ModeScope } from "./lib/mode-state.ts";
 
 const REVIEW_TIMEOUT_MS = 15_000;
-type PermissionMode = "manual" | "auto";
 type ManualChoice = "Allow once" | "Switch to auto" | "Deny";
 let localPromptQueue: Promise<void> = Promise.resolve();
 
@@ -29,7 +29,43 @@ function requireIntent(value: unknown, toolName: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
-  let mode: PermissionMode = "manual";
+  const modes = new PermissionModes();
+  const describeMode = (ctx: any) => { const state = modes.get(ctx); return `Permission mode: ${state.mode} · ${state.scope === "run" ? "this TUI run only, current session" : state.scope === "session" ? "saved for this session" : "default"}`; };
+  const updateStatus = (ctx: any) => ctx.ui.setStatus?.("permissions", describeMode(ctx));
+  const setMode = (ctx: any, mode: PermissionMode, scope: ModeScope) => {
+    const identity = sessionIdentity(ctx);
+    if (scope === "session") {
+      if (!identity.sessionFile) throw new Error("Cannot persist permission mode in an ephemeral session (--no-session). Choose this TUI run only.");
+      // Do not enable auto if the session write fails.
+      try { pi.appendEntry(MODE_ENTRY, { schemaVersion: 1, sessionId: identity.sessionId, mode }); }
+      catch (error) {
+        modes.setRun(ctx, "manual");
+        // SessionManager may append in memory before its disk write throws.
+        // Best-effort compensation prevents later flushing a failed auto request.
+        try { pi.appendEntry(MODE_ENTRY, { schemaVersion: 1, sessionId: identity.sessionId, mode: "manual" }); } catch { /* run remains fail-closed */ }
+        updateStatus(ctx);
+        throw new Error(`Permission mode save failed; manual review is active for this run. Verify the session record before resuming: ${String(error)}`);
+      }
+      modes.clearRun(ctx);
+    } else modes.setRun(ctx, mode);
+    updateStatus(ctx);
+    ctx.ui.notify(describeMode(ctx), "info");
+  };
+  const askScope = async (ctx: any): Promise<ModeScope | undefined> => {
+    if (!ctx.hasUI) return undefined;
+    const choice = await queueLocalPrompt(() => ctx.ui.select(
+      "Keep automatic permission review for this session?\nAuto still requires the model to review each triggered operation; it is not unrestricted access.",
+      ["This TUI run only", "Persist for this session"], { signal: ctx.signal }));
+    return choice === "This TUI run only" ? "run" : choice === "Persist for this session" ? "session" : undefined;
+  };
+  const restoreStatus = (_event: any, ctx: any) => {
+    const state = modes.get(ctx);
+    if (state.diagnostic) ctx.ui.notify(state.diagnostic, "warning");
+    updateStatus(ctx);
+  };
+  pi.on("session_start", restoreStatus);
+  pi.on("session_tree", restoreStatus);
+  pi.on("session_shutdown", event => { if (event.reason === "quit") modes.clearAllRun(); });
   const bashCache = new Map<string, ReturnType<typeof createBashTool>>();
   const getBashTool = (cwd: string) => {
     let tool = bashCache.get(cwd);
@@ -118,18 +154,21 @@ export default function (pi: ExtensionAPI) {
   } as any);
 
   pi.registerCommand("permissions", {
-    description: "Show or change permission mode: /permissions manual|auto",
+    description: "Show or change this session's permission mode: /permissions manual|auto [run|session]",
     handler: async (args, ctx) => {
-      const requested = args.trim().toLowerCase();
+      const [requested, scopeArg, ...extra] = args.trim().toLowerCase().split(/\s+/);
       if (requested === "manual" || requested === "auto") {
-        mode = requested;
-        const result = `Permission mode: ${mode}`;
-        ctx.ui.notify(result, "info");
+        if (extra.length || scopeArg && scopeArg !== "run" && scopeArg !== "session") { ctx.ui.notify("Usage: /permissions manual|auto [run|session]", "warning"); return; }
+        const origin = sessionIdentity(ctx).key;
+        const scope = (scopeArg as ModeScope | undefined) ?? (requested === "auto" ? await askScope(ctx) : sessionIdentity(ctx).sessionFile ? "session" : "run");
+        if (!scope) { ctx.ui.notify("Permission mode unchanged. Choose run or session explicitly when no UI is available.", "warning"); return; }
+        if (ctx.signal?.aborted || sessionIdentity(ctx).key !== origin) { ctx.ui.notify("Permission mode unchanged: session changed or operation cancelled.", "warning"); return; }
+        try { setMode(ctx, requested, scope); } catch (error) { ctx.ui.notify(String(error), "error"); }
       } else if (requested) {
-        const result = "Usage: /permissions [manual|auto]";
+        const result = "Usage: /permissions [manual|auto [run|session]]";
         ctx.ui.notify(result, "warning");
       } else {
-        const result = `Permission mode: ${mode}`;
+        const result = describeMode(ctx);
         ctx.ui.notify(result, "info");
       }
     },
@@ -191,6 +230,8 @@ export default function (pi: ExtensionAPI) {
       : reason;
     const reviewPrompt = `Working directory: ${ctx.cwd}\nIntent: ${intent}\nOperation: ${event.toolName}\nReview trigger (not necessarily a risk finding): ${reviewReason}\nTargets: ${outside.join(", ") || targets.join(", ") || "(command review)"}\nActual operation: ${details}`;
 
+    const reviewSession = sessionIdentity(ctx).key;
+    let mode = modes.get(ctx).mode;
     if (mode === "manual") {
       const behavior = event.toolName === "bash"
         ? `Command: ${String(input.command ?? "").replace(/\s+/g, " ").slice(0, 240)}`
@@ -199,9 +240,12 @@ export default function (pi: ExtensionAPI) {
       if (choice === "Deny" || choice === undefined) {
         return { block: true, reason: choice === undefined ? "Permission review was not completed or no approval UI was available" : "Blocked by user" };
       }
+      if (ctx.signal?.aborted || sessionIdentity(ctx).key !== reviewSession) return { block: true, reason: "Permission review cancelled or session changed; operation not executed" };
       if (choice === "Switch to auto") {
-        mode = "auto";
-        ctx.ui.notify("Permission mode: auto; reviewing this operation", "info");
+        const scope = await askScope(ctx);
+        if (!scope || ctx.signal?.aborted || sessionIdentity(ctx).key !== reviewSession) return { block: true, reason: "Automatic mode selection cancelled or session changed; operation not executed" };
+        try { setMode(ctx, "auto", scope); mode = "auto"; }
+        catch (error) { return { block: true, reason: `Automatic mode was not enabled: ${String(error)}` }; }
       }
     }
 
@@ -242,6 +286,8 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    if (ctx.signal?.aborted || sessionIdentity(ctx).key !== reviewSession) return { block: true, reason: "Permission review cancelled or session changed; operation not executed" };
+    if (mode === "auto" && modes.get(ctx).mode !== "auto") return { block: true, reason: "Automatic permission mode was revoked during review; operation not executed" };
     if (outside.length && event.toolName === "edit") input.__allowOutsideWorkingDirectory = true;
     return undefined;
   });

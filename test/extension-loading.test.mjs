@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { loadExtensions } from '../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js';
+import { SessionManager } from '@earendil-works/pi-coding-agent';
 
 test('the package manifest loads all extensions through the real Pi loader', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
@@ -19,6 +20,7 @@ test('Pi-loaded permissions can invoke automatic review using the public pi-ai e
   let reviews = 0;
   const ctx = {
     cwd: process.cwd(),
+    sessionManager: SessionManager.inMemory(),
     model: { provider: 'test', id: 'reviewer' },
     signal: new AbortController().signal,
     ui: { notify() {} },
@@ -33,7 +35,7 @@ test('Pi-loaded permissions can invoke automatic review using the public pi-ai e
       },
     },
   };
-  await permissions.commands.get('permissions').handler('auto', ctx);
+  await permissions.commands.get('permissions').handler('auto run', ctx);
   const event = { toolName: 'bash', input: { command: 'npm test', intent: 'Run project tests' } };
   const handler = permissions.handlers.get('tool_call')[0];
   assert.equal(await handler(event, ctx), undefined);
@@ -47,7 +49,7 @@ test('Pi-loaded manual permissions without UI never wait for a daemon event subs
   assert.deepEqual(result.errors, []);
   const handler = result.extensions[0].handlers.get('tool_call')[0];
   const blocked = await handler({ toolName: 'read', input: { path: '/outside/workspace/file', intent: 'Inspect the exact external file' } }, {
-    cwd: process.cwd(), hasUI: false, ui: { select() { throw new Error('No UI must not prompt'); } },
+    cwd: process.cwd(), sessionManager: SessionManager.inMemory(), hasUI: false, ui: { select() { throw new Error('No UI must not prompt'); } },
   });
   assert.equal(blocked.block, true);
   assert.match(blocked.reason, /no approval UI was available/);
