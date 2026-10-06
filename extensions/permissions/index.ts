@@ -28,7 +28,7 @@ async function selectPermissionChoice(pi: ExtensionAPI, ctx: any, request: { too
   const localChoice = ctx.hasUI
     ? queueLocalPrompt(async () => {
         if (settled) return { source: "skipped" as const, choice: undefined };
-        const choice = await ctx.ui.select(`${request.intent}\nOperation: ${request.toolName}\n${request.behavior}\nReview reason: ${request.reason}`, ["Allow once", "Switch to auto", "Deny"], { signal: localController.signal, timeout: 120_000 });
+        const choice = await ctx.ui.select(`${request.intent}\nOperation: ${request.toolName}\n${request.behavior}\nReview reason: ${request.reason}`, ["Allow once", "Switch to auto", "Deny"], { signal: localController.signal });
         return { source: "local" as const, choice: choice as ManualChoice | undefined };
       })
     : undefined;
@@ -38,13 +38,12 @@ async function selectPermissionChoice(pi: ExtensionAPI, ctx: any, request: { too
     availabilitySettled = true;
     markAvailable(value);
   };
-  const availabilityTimeout = setTimeout(() => resolveAvailability(false), 700);
   const requestId = randomUUID();
   pi.events.emit("pi-remote:approval-request", {
     ...request,
     requestId,
-    onDelivered: () => { remoteDelivered = true; clearTimeout(availabilityTimeout); resolveAvailability(true); },
-    onUnavailable: () => { clearTimeout(availabilityTimeout); resolveAvailability(false); },
+    onDelivered: () => { remoteDelivered = true; resolveAvailability(true); },
+    onUnavailable: () => { resolveAvailability(false); },
     respond: (choice: ManualChoice) => choose(choice),
   });
   if (localChoice) {
@@ -61,21 +60,10 @@ async function selectPermissionChoice(pi: ExtensionAPI, ctx: any, request: { too
     settled = true;
     const choice = winner.choice;
     pi.events.emit("pi-remote:approval-cancel", { requestId, choice: choice || "Deny" });
-    if (remoteDelivered || await available) {
-      return Promise.race([
-        remoteChoice,
-        new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 120_000)),
-      ]);
-    }
+    if (remoteDelivered) return remoteChoice;
     return choice;
   }
-  if (await available) {
-    return Promise.race([
-      remoteChoice,
-      new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 120_000)),
-    ]);
-  }
-  return undefined;
+  return await available ? remoteChoice : undefined;
 }
 
 function requireIntent(value: unknown, toolName: string): string {
