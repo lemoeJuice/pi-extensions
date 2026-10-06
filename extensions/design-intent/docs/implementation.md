@@ -49,14 +49,14 @@ load/commit 是 I/O 边界；关系、查询和候选变更是纯函数。每次
 
 当前 `extensions/permissions/index.ts` 的工具 hooks 不会拦截生命周期/命令中的 `fs.readFile`、`rename` 或直接 subprocess。Design Intent 必须有自己的**限定文件访问检查**，不能仅声明工具 readOnlyHint 就视为授权。
 
-- 受信任、位于当前 workspace 内的固定意图库，可以按已启用的项目读取配置获得 read grant；grant 只覆盖该 JSON 文件，不覆盖 sources 指向的外部文档。
-- 无明确 grant 时，工具/用户命令可询问“读取这个准确路径”；没有 UI 默认不读。提供操作者专用 `--design-intent-read` 显式允许当前所选固定文件；它不是网络或全目录授权。
-- 自动 `before_agent_start` 注入只使用已经获得的 read grant，不在每个新请求里弹框。未授权返回清楚的 unavailable 提示，让用户主动配置。
-- outside-cwd 的 root 不靠 read flag 默默放行。MVP 要求操作者在项目根运行，或显式确认该准确文件的额外授权；不能借项目根发现暗读上级目录。
+- 受信任、位于当前 workspace 内的固定意图库默认允许读取；读取配置只覆盖该 JSON 文件，不覆盖 sources 指向的外部文档。
+- `--design-intent-read` 默认 true。读取不询问人工确认，无 UI 时也可以读取受信任项目的固定文件；显式 false 禁用读取并返回 unavailable，不回退到弹窗。这不是网络或全目录授权。
+- 自动 `before_agent_start` 注入仅在项目受信任且读取开启时进行，不弹框。未受信任或读取禁用时不注入；query/get/check 明确区分 unavailable 与 missing。
+- outside-cwd 的 root 不靠 read flag 默默放行。MVP 要求操作者在项目根运行，不提供上级目录读取确认旁路；不能借项目根发现暗读上级目录。
 - accept/reject 的确认包含目标文件、可能创建的 `.pi` 目录、临时文件和 lock 副作用。模型提案不是写授权；auto permission review 也不等同项目设计批准。
 - 检查实际代码/diff 在工具 context 中通过 `ctx.executeTool("read"/"bash", { intent, ... })` 执行，经过现有工具参数校验和权限流程。没有该工具或被拒绝则 unknown，不降级为私有 fs/exec 绕过。
 
-这里的 grant 是本插件内部的一份限定授权记录，不新建公共权限框架，也不改变 permissions 的模式。无法与现有授权约定兼容时禁用对应自动访问，而不是宣称已经统一授权。
+这里的读取策略仅限当前项目的固定意图库，不创建会话 grant，不改变 permissions 的模式，也不放宽项目写入审批。
 
 ## 4. 权威文件 schema 与读取
 

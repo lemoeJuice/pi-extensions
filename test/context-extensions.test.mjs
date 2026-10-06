@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { CombinedAutocompleteProvider } from '@earendil-works/pi-tui';
 import rollingContext from '../extensions/rolling-context/index.ts';
 import designIntent from '../extensions/design-intent/index.ts';
 import { UIBroker } from '../extensions/daemon/ui/broker.ts';
@@ -103,6 +104,7 @@ test('pin and unpin persist branch-local memory changes',async()=>{
  const manager=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);const pi=mockPi();rollingContext(pi);const notices=[];const ctx={sessionManager:manager,ui:{notify:text=>notices.push(text)}};
  await pi.commands.get('rolling-context').handler('pin note-1',ctx);await pi.commands.get('rolling-context').handler('unpin note-1',ctx);
  assert.equal(pi.appended.length,2);assert.equal(pi.appended[0].customType,'rolling-context.state.v1');assert.equal(pi.appended[0].data.snapshot.items.find(item=>item.id==='note-1').pinned,true);assert.equal(pi.appended[1].data.snapshot.items.find(item=>item.id==='note-1').pinned,false);assert.ok(notices.some(text=>/pinned note-1/.test(text)));
+ await pi.commands.get('rolling-context').handler('inspect',ctx);assert.match(notices.at(-1),/当前分支条目（ITEM_ID）/);assert.match(notices.at(-1),/note-1 · task-decision/);
 });
 
 test('design_intent_get returns the complete record and current source identity',async()=>{
@@ -124,15 +126,32 @@ function proxyUI(answer) {
  return{ui,broker,notices,restore};
 }
 
-test('Design Intent read grants use the same ordinary confirm when proxied',async()=>{
+test('Design Intent reads a trusted workspace by default without any local or remote prompt',async()=>{
  const cwd='/tmp/design-intent-remote-read-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
  const manager=SessionManager.inMemory(cwd,{id:'remote-read-session'},[]);const pi=mockPi();designIntent(pi);
- const proxy=proxyUI(request=>{assert.equal(request.method,'confirm');assert.match(request.message,/exact project intent file/);return{confirmed:true};});
+ const proxy=proxyUI(()=>{throw new Error('DI reading must not prompt');});
  const ctx={cwd,sessionManager:manager,isProjectTrusted:()=>true,hasUI:true,ui:proxy.ui};
  const result=await pi.tools.get('design_intent_query').execute('query-1',{},undefined,undefined,ctx);
  assert.equal(result.details.projection.availability,'ready');assert.deepEqual(proxy.broker.snapshot().pending,[]);proxy.restore();
- const headless=mockPi();designIntent(headless);const denied=await headless.tools.get('design_intent_query').execute('query-2',{},undefined,undefined,{...ctx,hasUI:false});
+ const headless=mockPi();designIntent(headless);const ready=await headless.tools.get('design_intent_query').execute('query-2',{},undefined,undefined,{...ctx,hasUI:false});
+ assert.equal(ready.details.projection.availability,'ready');
+ const disabled=mockPi({'design-intent-read':false});designIntent(disabled);const denied=await disabled.tools.get('design_intent_query').execute('query-3',{},undefined,undefined,ctx);
  assert.equal(denied.details.projection.availability,'unavailable');
+ const untrusted=await headless.tools.get('design_intent_query').execute('query-4',{},undefined,undefined,{...ctx,isProjectTrusted:()=>false});assert.equal(untrusted.details.projection.availability,'unavailable');
+ const injection=await headless.events.get('before_agent_start')[0]({prompt:'Inspect project requirements'},{...ctx,hasUI:false});assert.equal(injection.message.details.availability,'ready');
+ assert.equal(await disabled.events.get('before_agent_start')[0]({prompt:'Inspect'},ctx),undefined);
+});
+
+test('Rolling Context TUI argument completions and help explain every action and required item IDs',async()=>{
+ const pi=mockPi();rollingContext(pi);const command=pi.commands.get('rolling-context');
+ const all=command.getArgumentCompletions('');assert.deepEqual(all.map(item=>item.value),['status','inspect','on','observe','off','pin','unpin','checkpoint','help']);assert.ok(all.every(item=>item.description));
+ assert.match(command.getArgumentCompletions('pin ')[0].label,/ITEM_ID/);assert.equal(command.getArgumentCompletions('pin ')[0].value,'pin ');
+ assert.deepEqual(command.getArgumentCompletions('ob').map(item=>item.value),['observe']);assert.equal(command.getArgumentCompletions('unknown'),null);
+ const notices=[];const ctx={ui:{notify:message=>notices.push(message)}};await command.handler('help',ctx);assert.match(notices.at(-1),/unpin <ITEM_ID>/);assert.match(notices.at(-1),/覆盖和净节省/);
+ await command.handler('on extra',ctx);assert.match(notices.at(-1),/参数说明/);assert.equal(pi.appended.length,0);
+ const provider=new CombinedAutocompleteProvider([{name:'rolling-context',...command}],process.cwd());const line='/rolling-context ';
+ const suggestions=await provider.getSuggestions([line],0,line.length,{signal:new AbortController().signal});const pin=suggestions.items.find(item=>item.value==='pin');assert.match(pin.label,/ITEM_ID/);assert.match(pin.description,/inspect/);
+ const applied=provider.applyCompletion([line],0,line.length,pin,suggestions.prefix);assert.match(applied.lines[0],/^\/rolling-context pin\s*$/);assert.doesNotMatch(applied.lines[0],/ITEM_ID/);
 });
 
 test('manual Rolling Context checkpoint confirms through ordinary UI, including the proxy',async()=>{

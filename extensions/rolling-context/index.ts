@@ -6,6 +6,18 @@ import { analyzeGroups, boundMemory, effectiveTarget, estimateProjection, groups
 const NoteParams=Type.Object({intent:Type.String({minLength:1}),kind:Type.Union([Type.Literal("plan"),Type.Literal("task-decision"),Type.Literal("focus"),Type.Literal("next-step")]),text:Type.String({minLength:1,maxLength:2000}),replaces:Type.Optional(Type.Array(Type.String(),{maxItems:8})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:12}))},{additionalProperties:false});
 const RecallParams=Type.Object({intent:Type.String({minLength:1}),entryId:Type.Optional(Type.String()),itemId:Type.Optional(Type.String()),query:Type.Optional(Type.String({maxLength:300})),paths:Type.Optional(Type.Array(Type.String({minLength:1,maxLength:256}),{maxItems:12})),cursor:Type.Optional(Type.String({maxLength:2048})),limit:Type.Optional(Type.Number({minimum:1,maximum:8}))},{additionalProperties:false});
 const NoteDetails=Type.Object({type:Type.Literal("rolling-context.note.v1"),noteId:Type.String(),taskId:Type.String(),kind:Type.String(),text:Type.String(),replaces:Type.Array(Type.String()),paths:Type.Array(Type.String())});
+const CommandArguments=[
+  {value:"status",label:"status",description:"查看模式、预算与运行状态（默认）"},
+  {value:"inspect",label:"inspect",description:"查看连续性摘要和当前分支的条目 ID"},
+  {value:"on",label:"on",description:"启用后续自动上下文维护；不恢复已移出的内容"},
+  {value:"observe",label:"observe",description:"仅观察和估算，不应用上下文改写"},
+  {value:"off",label:"off",description:"停止后续 Rolling 改写；保留既有 edits/checkpoints"},
+  {value:"pin",label:"pin <ITEM_ID>",description:"固定当前分支条目；先用 inspect 查看 ITEM_ID"},
+  {value:"unpin",label:"unpin <ITEM_ID>",description:"解除条目固定；需要一个当前分支 ITEM_ID"},
+  {value:"checkpoint",label:"checkpoint",description:"等待 idle、人工确认并验证覆盖和净节省后请求 compact"},
+  {value:"help",label:"help",description:"显示全部参数与操作说明"},
+];
+const commandHelp=()=>["/rolling-context 参数说明",...CommandArguments.map(item=>`  ${item.label} — ${item.description}`),"on/off/observe 不回滚已有改写；pin/unpin 需要 inspect 中的准确 ITEM_ID。"].join("\n");
 
 function parseConfig(pi:ExtensionAPI):RollingConfig {
   const mode=String(pi.getFlag("rolling-context-mode")??"observe");
@@ -247,14 +259,21 @@ export default function rollingContext(pi:ExtensionAPI) {
   pi.on("session_compact",event=>{manualCheckpoint=undefined;lastStatus+=`; compacted reason=${event.reason}; fromExtension=${event.fromExtension}`;});
   pi.on("session_compact_failed",event=>{manualCheckpoint=undefined;lastStatus+=`; compact failed reason=${event.reason}; aborted=${event.aborted}; ${event.errorMessage??"no error detail"}`;});
 
-  pi.registerCommand("rolling-context",{description:"Inspect or control Rolling Context",handler:async(args,ctx)=>{
+  pi.registerCommand("rolling-context",{description:"Rolling Context: status | inspect | on | observe | off | pin/unpin ITEM_ID | checkpoint | help",getArgumentCompletions:prefix=>{
+    const trimmed=prefix.trimStart();
+    if(/^(pin|unpin)\s/.test(trimmed)){const item=CommandArguments.find(item=>item.value===trimmed.split(/\s+/)[0])!;return [{...item,value:prefix}];}
+    if(/\s/.test(trimmed))return null;
+    const matches=CommandArguments.filter(item=>item.value.startsWith(trimmed));return matches.length?matches:null;
+  },handler:async(args,ctx)=>{
     const [verb,...rest]=args.trim().split(/\s+/);const value=rest.join(" ");
+    if(verb==="help"){ctx.ui.notify(commandHelp(),"info");return;}
+    if(rest.length&&(verb!=="pin"&&verb!=="unpin"||rest.length!==1)){ctx.ui.notify(commandHelp(),"warning");return;}
     if(verb==="status"||!verb){const state=rebuildState(ctx);ctx.ui.notify(`${lastStatus}\nmode=${mode}; focus=${state.snapshot.focus.taskId||"none"}; next=${state.snapshot.focus.nextSteps.length}; intentRefs=${state.snapshot.intentRefs.length}`,"info");return;}
-    if(verb==="inspect"){const state=rebuildState(ctx);ctx.ui.notify(renderCheckpoint(state.snapshot),"info");return;}
+    if(verb==="inspect"){const state=rebuildState(ctx);const items=state.snapshot.items.map(item=>`- ${item.id} · ${item.kind} · ${item.status}${item.pinned?" · pinned":""}: ${item.text.slice(0,120)}`);ctx.ui.notify(`${renderCheckpoint(state.snapshot)}\n\n当前分支条目（ITEM_ID）：\n${items.join("\n")||"- 无"}`,"info");return;}
     if(["on","observe","pin","unpin","checkpoint"].includes(verb))validateContracts();
     if(verb==="observe"||verb==="on"||verb==="off"){mode=verb;pi.appendEntry("rolling-context.config.v1",{mode});ctx.ui.notify(`Rolling Context mode: ${mode}. Existing edits/checkpoints are unchanged.`,"info");return;}
     if(verb==="pin"||verb==="unpin"){
-      const id=rest[0];if(!id){ctx.ui.notify(`Usage: /rolling-context ${verb} ITEM_ID`,"warning");return;}
+      const id=rest[0];if(!id){ctx.ui.notify(`Usage: /rolling-context ${verb} ITEM_ID\n先用 /rolling-context inspect 查看条目 ID。`,"warning");return;}
       const state=rebuildState(ctx);const item=state.snapshot.items.find(candidate=>candidate.id===id);if(!item){ctx.ui.notify(`Unknown active-branch item ${id}`,"error");return;}
       item.pinned=verb==="pin";state.snapshot.revision++;
       const envelope={schemaVersion:1 as const,revision:state.snapshot.revision,planId:hash([ctx.sessionManager.getSessionId(),ctx.sessionManager.getLeafId(),id,verb,state.snapshot.revision]).slice(0,24),baseLeafId:ctx.sessionManager.getLeafId(),snapshot:state.snapshot,edits:state.envelope?.edits??[],checkpoint:state.envelope?.checkpoint};
@@ -274,6 +293,6 @@ export default function rollingContext(pi:ExtensionAPI) {
       ctx.compact({customInstructions:"Use exactly the Rolling Context state supplied by the extension as the continuity summary. Do not add or infer project Design Intent. Preserve user instructions, task-local execution decisions, evidence freshness and next steps.",onComplete:()=>{manualCheckpoint=undefined;ctx.ui.notify("Rolling Context checkpoint completed.","info");},onError:error=>{manualCheckpoint=undefined;ctx.ui.notify(`Checkpoint failed: ${error.message}`,"error");}});
       return;
     }
-    ctx.ui.notify("Usage: /rolling-context [status|inspect|checkpoint|on|off|observe]","warning");
+    ctx.ui.notify(commandHelp(),"warning");
   }});
 }

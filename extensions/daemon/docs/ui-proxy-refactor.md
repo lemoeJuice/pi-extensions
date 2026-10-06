@@ -177,7 +177,7 @@ Pi 仍活着，daemon 的内存缓存丢失不应影响等待状态。
 
 - **Permissions**：保留 intent、路径、自动 reviewer 和执行阶段复核，只删除远程
   availability/cancel/respond 分支；manual 只调用普通 `ctx.ui.select`。
-- **Design Intent 读取**：只调用本地 UI 授权方法，没有网页专用 grant 入口。
+- **Design Intent 读取**：按后续读取策略更新，受信任当前 workspace 的固定 JSON 默认直接读取；没有人工读取确认或网页专用 grant 入口。显式关闭读取、未受信任或越界时不可用。
 - **Design Intent accept/reject**：保留当前本地命令的候选 diff、确认、锁定提交和
   branch/source/hash 复核，删除 `remoteReviews/applyRemoteReview`。Reject 理由来自
   原命令参数，或由本地 `ctx.ui.input` 请求；网页只是代理同样的文本输入。
@@ -234,6 +234,11 @@ Pi 仍活着，daemon 的内存缓存丢失不应影响等待状态。
 8. `custom()` 和尚未桥接的核心 TUI 提示明确标记 local-only，不声称“所有界面已代理”。
 
 ## 9. 当前实施与验证边界
+
+后续读取策略更新：`design-intent-read` 默认 true，已删除读取确认及 session grant；
+读取只限受信任当前 workspace 的固定 JSON。本文重构前审查中的 read-grant 行为
+是历史背景，不是当前运行时入口。提案即时弹出人工审查符合核心显式批准原则，
+但现有 MVP 的 command-only 审批与 proposal-only 工具契约尚未调整，当前仍由命令审批。
 
 - 公共 host interceptor 仍不存在。本轮采用隔离的共享 `ctx.ui` compatibility
   decorator，运行时仅安装于 `tui && hasUI`；可用 `--remote-ui-proxy false` 禁用。

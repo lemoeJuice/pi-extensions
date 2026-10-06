@@ -17,15 +17,7 @@ async function projectFor(ctx:ExtensionContext, allowParent=false):Promise<Proje
   if(!allowParent && project.root!==await import("node:fs/promises").then(m=>m.realpath(ctx.cwd)))throw new Error("DESIGN_INTENT_ROOT: start Pi at the project root; access outside the current workspace is disabled");
   return project;
 }
-function readGranted(pi:ExtensionAPI):boolean{return pi.getFlag("design-intent-read")===true;}
-async function authorizeRead(ctx:ExtensionContext,project:ProjectIdentity,pi:ExtensionAPI,approvedSession?:string):Promise<boolean>{
-  if(!ctx.isProjectTrusted())return false;
-  if(readGranted(pi)||approvedSession===ctx.sessionManager.getSessionId())return true;
-  if(!ctx.hasUI)return false;
-  const sessionId=ctx.sessionManager.getSessionId();
-  const allowed=await ctx.ui.confirm("Read project Design Intent",`Allow reading this exact project intent file for the current session?\n${project.storePath}`,{signal:ctx.signal});
-  return allowed&&ctx.isProjectTrusted()&&ctx.sessionManager.getSessionId()===sessionId;
-}
+function readEnabled(pi:ExtensionAPI):boolean{return pi.getFlag("design-intent-read")!==false;}
 function projectionText(p:IntentProjection):string{
   if(p.availability!=="ready")return `[Design Intent ${p.availability}] ${p.diagnostics.map(d=>d.message).join("; ")}`;
   const items=p.items.map(i=>`- [${i.id}] ${i.kind}${i.needsReview?" (needs review)":""}${i.mustExpand?" (must expand)":""}: ${i.statement}${i.rationale?`\n  理由：${i.rationale}`:""}`).join("\n");
@@ -35,16 +27,14 @@ function toolResult(p:IntentProjection){return{content:[{type:"text" as const,te
 function diffProposal(p:Proposal,candidate:ReturnType<typeof buildCandidate>,loaded:LoadResult):string{return `${storeDiff(loaded,candidate)}\n\nproposal=${p.proposalId}\nbase=${p.baseHash}\ncandidate=${candidate.candidateHash}`;}
 
 export default function designIntent(pi:ExtensionAPI){
-  pi.registerFlag("design-intent-read",{type:"boolean",default:false,description:"Allow Design Intent to read .pi/design-intent.json inside the current project workspace"});
-  pi.registerFlag("design-intent-inject",{type:"boolean",default:true,description:"Inject a limited project Design Intent projection at task start (requires read grant)"});
+  pi.registerFlag("design-intent-read",{type:"boolean",default:true,description:"Read the fixed .pi/design-intent.json in a trusted current workspace without prompting; false disables reading"});
+  pi.registerFlag("design-intent-inject",{type:"boolean",default:true,description:"Inject a limited project Design Intent projection at task start when trusted workspace reading is enabled"});
   pi.registerFlag("design-intent-budget",{type:"string",default:"1000",description:"Maximum characters in task-start Design Intent projection"});
   pi.registerFlag("design-intent-confirm",{type:"string",default:"",description:"Explicit non-interactive approval token: PROPOSAL:accept|reject:SOURCE_HASH:CANDIDATE_HASH"});
   let cached:{path:string;hash:string;loaded:LoadResult}|undefined;
-  let readApprovedSession:string|undefined;
-  const load=async(ctx:ExtensionContext,approved=false):Promise<{project:ProjectIdentity;loaded:LoadResult;authorized:boolean}>=>{
-    const project=await projectFor(ctx);const authorized=ctx.isProjectTrusted()&&(approved||await authorizeRead(ctx,project,pi,readApprovedSession));
-    if(!authorized)return{project,loaded:{state:"unavailable",code:"READ_NOT_AUTHORIZED",message:"Project intent file read is not authorized; enable --design-intent-read or explicitly allow it in the prompt.",storePath:project.storePath},authorized:false};
-    if(!readGranted(pi))readApprovedSession=ctx.sessionManager.getSessionId();
+  const load=async(ctx:ExtensionContext):Promise<{project:ProjectIdentity;loaded:LoadResult;authorized:boolean}>=>{
+    const project=await projectFor(ctx);const authorized=ctx.isProjectTrusted()&&readEnabled(pi);
+    if(!authorized)return{project,loaded:{state:"unavailable",code:"READ_NOT_AUTHORIZED",message:"Project intent reading is disabled or the project is not trusted.",storePath:project.storePath},authorized:false};
     const loaded=await loadStore(project);if(loaded.state==="ready"&&cached?.path===loaded.storePath&&cached.hash===loaded.hash)return{project,loaded:cached.loaded,authorized:true};
     if(loaded.state==="ready")cached={path:loaded.storePath,hash:loaded.hash,loaded};else cached=undefined;
     return{project,loaded,authorized:true};
@@ -77,19 +67,19 @@ export default function designIntent(pi:ExtensionAPI){
         for(const item of applicable)results.push({intentId:item.id,status:"unknown",reason:read.isError?"File read was denied or failed; no conformance claim can be made.":truncated?"File evidence is truncated; no conformance claim can be made.":`File evidence was read (${content.length} characters), but this natural-language intent has no deterministic checker; manual review is required.`,path:normalized,...(!read.isError?{evidenceHash:sha(content)}:{}),truncated});
       }catch(error){for(const item of applicable)results.push({intentId:item.id,status:"unknown",reason:`File read was unavailable: ${error instanceof Error?error.message:String(error)}`,path:normalized});}
     }
-    const refreshed=await load(ctx,authorized);
+    const refreshed=await load(ctx);
     const stale=loaded.state!==refreshed.loaded.state||loaded.state==="ready"&&(refreshed.loaded.state!=="ready"||loaded.hash!==refreshed.loaded.hash);
     if(stale)for(const result of results){result.status="unknown";result.reason="Intent source changed during evidence collection; discard this report and retry.";}
     const report={type:"design-intent.check.v1",storePath:loaded.storePath,storeRevision:loaded.state==="ready"?loaded.store.revision:undefined,sourceHash:loaded.state==="ready"?loaded.hash:undefined,paths:paths as string[],stale,complete:!stale&&authorized&&loaded.state==="ready"&&results.length>0&&results.every(result=>typeof result.evidenceHash==="string"&&!result.truncated),results};
     return{content:[{type:"text",text:JSON.stringify(report,null,2)}],details:report};
   }});
 
-  pi.on("session_start",()=>{cached=undefined;readApprovedSession=undefined;});pi.on("session_tree",()=>{cached=undefined;});
+  pi.on("session_start",()=>{cached=undefined;});pi.on("session_tree",()=>{cached=undefined;});
   pi.on("before_agent_start",async(event,ctx)=>{
     if(pi.getFlag("design-intent-inject")===false)return;
     const project=await projectFor(ctx).catch(()=>undefined);if(!project)return;
-    if(!ctx.isProjectTrusted()||(!readGranted(pi)&&readApprovedSession!==ctx.sessionManager.getSessionId()))return;
-    const {loaded}=await load(ctx,readGranted(pi));const budgetRaw=Number(pi.getFlag("design-intent-budget")??1000);const maxChars=Number.isSafeInteger(budgetRaw)&&budgetRaw>=100&&budgetRaw<=10000?budgetRaw:1000;
+    if(!ctx.isProjectTrusted()||!readEnabled(pi))return;
+    const {loaded}=await load(ctx);const budgetRaw=Number(pi.getFlag("design-intent-budget")??1000);const maxChars=Number.isSafeInteger(budgetRaw)&&budgetRaw>=100&&budgetRaw<=10000?budgetRaw:1000;
     const projection=queryStore(loaded,{text:event.prompt,maxChars});
     let content=projectionText(projection);if(content.length>maxChars)content=`${content.slice(0,maxChars-100)}\n[Projection truncated; query by path/ID before design-sensitive edits.]`;
     return{message:{customType:"design-intent.projection.v1",content,display:false,details:projection}};

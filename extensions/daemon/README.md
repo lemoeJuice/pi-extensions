@@ -79,7 +79,8 @@ succeeded. Results come from the original tool/message/notification flow.
 Design Intent proposals no longer open a web-only review workflow. Send the usual
 `/design-intent review|accept|reject` command from either interface; accept/reject
 uses the same local confirmation, and Reject's reason stays a command argument.
-Read grants and Rolling Context checkpoint confirmations use ordinary UI too.
+Design Intent reads the trusted workspace's fixed store without prompting; Rolling
+Context checkpoint confirmations use ordinary UI.
 Authorization, branch/hash checks and project writes remain in the plugins.
 
 ### Compatibility and limits

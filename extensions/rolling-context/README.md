@@ -14,6 +14,12 @@ Design Intent 可选契约在 `session_start`（runtime 就绪后）校验，不
 
 可用工具：`context_note`、`context_recall`。可用命令：`/rolling-context status|inspect|on|off|observe|pin|unpin|checkpoint`。MVP 不启用小模型提取；面对未覆盖上下文、图片、未知扩展消息或不安全 checkpoint 时保守回退。功能边界详见 [`docs/implementation.md`](docs/implementation.md)。
 
+在 TUI 输入 `/rolling-context ` 可看到子命令补全与说明；`/rolling-context help` 显示完整帮助。
+`status` 查看状态（无参数时默认执行）；`inspect` 查看连续性摘要及条目 ID；
+`on` 启用后续自动维护，`observe` 仅观察，`off` 停止后续 Rolling 改写（都不回滚已有 edits/checkpoints）；
+`pin ITEM_ID` / `unpin ITEM_ID` 固定或解除固定当前分支条目，ID 从 `inspect` 获取；
+`checkpoint` 等待 idle 并人工确认，随后验证覆盖和净节省再请求 compact。
+
 `/rolling-context checkpoint` 的人工确认可在 Pi 本地界面或 Remote session 网页完成；网页不在目标 session 时请求会保持排队，进入对应页面后重放。该确认没有等待超时，Pi 会在收到批准后复核 session branch 与待处理消息，再启动 compact。
 
 默认 hot→warm 批次至少间隔 4 个完整 turn，累计节省 2048 估算 tokens；checkpoint 与普通 warm 最短驻留为 16 turn。可用 `--rolling-context-warm-interval`、`--rolling-context-batch-saving`、`--rolling-context-checkpoint-interval` 调整。先 preview after-warm 再判断 checkpoint；高缓存命中时普通收益门槛翻倍。已有 capsule 不重复摘要。
