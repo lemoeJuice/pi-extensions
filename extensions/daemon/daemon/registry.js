@@ -29,7 +29,6 @@ class Registry {
     const s = this.sessions.get(sessionId); if (!s) return;
     for (const [requestId, approval] of s.approvals) {
       if (approval.instanceId !== instanceId) continue;
-      clearTimeout(approval.timer);
       s.approvals.delete(requestId);
       this.broadcastApprovalResolved(sessionId, requestId);
     }
@@ -120,16 +119,19 @@ class Registry {
     const instance = s?.instances.get(instanceId);
     if (!s || !instance || !request?.requestId) return false;
     if (s.approvals.has(request.requestId)) return false;
-    const kind = request.kind === 'design-intent' ? 'design-intent' : 'permission';
+    const kinds = ['permission', 'design-intent', 'design-intent-read', 'rolling-context-checkpoint'];
+    const kind = kinds.includes(request.kind) ? request.kind : 'permission';
     if (kind === 'design-intent' && (typeof request.proposalId !== 'string' || typeof request.proposalHash !== 'string' || typeof request.sourceHash !== 'string')) return false;
+    if (kind === 'design-intent-read' && (typeof request.storePath !== 'string' || typeof request.purpose !== 'string')) return false;
+    if (kind === 'rolling-context-checkpoint' && typeof request.summary !== 'string') return false;
     const payload = kind === 'design-intent'
       ? { type: 'approval_request', kind, sessionId, requestId: request.requestId, proposalId: request.proposalId, proposalHash: request.proposalHash, storePath: request.storePath, baseRevision: request.baseRevision, sourceHash: request.sourceHash, candidateHash: request.candidateHash, statement: request.statement, rationale: request.rationale, effects: request.effects, acceptDiff: request.acceptDiff, acceptUnavailable: request.acceptUnavailable, timestamp: Date.now() }
+      : kind === 'design-intent-read'
+        ? { type: 'approval_request', kind, sessionId, requestId: request.requestId, storePath: request.storePath, purpose: request.purpose, reason: request.reason, timestamp: Date.now() }
+        : kind === 'rolling-context-checkpoint'
+          ? { type: 'approval_request', kind, sessionId, requestId: request.requestId, summary: request.summary, stateBytes: request.stateBytes, timestamp: Date.now() }
       : { type: 'approval_request', kind, sessionId, requestId: request.requestId, toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior, timestamp: Date.now() };
-    const timer = setTimeout(() => {
-      if (kind === 'design-intent') this.expireApproval(sessionId, instanceId, request.requestId);
-      else this.respondApproval(sessionId, request.requestId, 'Deny');
-    }, 120000);
-    s.approvals.set(request.requestId, { instanceId, timer, payload });
+    s.approvals.set(request.requestId, { instanceId, payload });
     for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(JSON.stringify(payload));
     return true;
   }
@@ -138,12 +140,14 @@ class Registry {
     const approval = s?.approvals.get(requestId);
     const instance = approval && s.instances.get(approval.instanceId);
     if (!s || !approval || !instance || instance.ws.readyState !== 1) return { error: 'Approval request is no longer active' };
-    const choices = approval.payload.kind === 'design-intent' ? ['Accept', 'Reject'] : ['Allow once', 'Switch to auto', 'Deny'];
+    const choices = approval.payload.kind === 'design-intent' ? ['Accept', 'Reject']
+      : approval.payload.kind === 'design-intent-read' ? ['Allow once', 'Deny']
+        : approval.payload.kind === 'rolling-context-checkpoint' ? ['Create checkpoint', 'Cancel']
+          : ['Allow once', 'Switch to auto', 'Deny'];
     if (!choices.includes(choice)) return { error: 'Invalid approval choice' };
     if (approval.payload.kind === 'design-intent' && choice === 'Reject' && (typeof reason !== 'string' || !reason.trim() || reason.length > 4000)) return { error: 'A rejection reason of at most 4000 characters is required' };
     try { instance.ws.send(JSON.stringify({ type: 'approval_choice', requestId, choice, ...(reason ? { reason } : {}) })); }
     catch (error) { return { error: String(error) }; }
-    clearTimeout(approval.timer);
     s.approvals.delete(requestId);
     this.broadcastApprovalResolved(sessionId, requestId, { choice });
     return {};
@@ -151,17 +155,8 @@ class Registry {
   dismissApproval(sessionId, instanceId, requestId) {
     const s = this.sessions.get(sessionId), approval = s?.approvals.get(requestId);
     if (!s || !approval || approval.instanceId !== instanceId) return false;
-    clearTimeout(approval.timer); s.approvals.delete(requestId);
+    s.approvals.delete(requestId);
     this.broadcastApprovalResolved(sessionId, requestId, { dismissed: true });
-    return true;
-  }
-  expireApproval(sessionId, instanceId, requestId) {
-    const s = this.sessions.get(sessionId), approval = s?.approvals.get(requestId);
-    if (!s || !approval || approval.instanceId !== instanceId) return false;
-    const instance = s.instances.get(instanceId);
-    clearTimeout(approval.timer); s.approvals.delete(requestId);
-    if (instance?.ws.readyState === 1) instance.ws.send(JSON.stringify({ type: 'approval_expired', requestId }));
-    this.broadcastApprovalResolved(sessionId, requestId, { expired: true });
     return true;
   }
   broadcastApprovalResolved(sessionId, requestId, result = {}) {

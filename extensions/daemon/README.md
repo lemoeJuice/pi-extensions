@@ -61,14 +61,18 @@ Send button for Stop while Pi is generating. Type `/` to filter available
 commands; selecting one opens a dialog to edit its arguments and apply it.
 Manual permission reviews are presented simultaneously in Pi's local UI and the
 connected session page; the first response wins and dismisses the other prompt.
-Approval requests remain queued in daemon memory for up to two minutes when the
+Approval requests remain queued in daemon memory without an expiry when the
 target session page is not open; opening that session page replays the pending
-prompt. Design Intent proposals also open a distinct browser review dialog with
+prompt. They are removed only after a decision, explicit dismissal, or the
+originating Pi instance disconnects; a daemon restart also clears this in-memory
+queue. Design Intent proposals also open a distinct browser review dialog with
 the source version, acceptance candidate diff, and explicit accept/reject
 actions. The browser sends its decision back to the originating Pi extension;
 only Pi revalidates the active proposal and writes the project store. Rejecting
-requires a reason and does not apply proposed relationships. The session page
-retries a missing session while Pi reconnects to the daemon.
+requires a reason and does not apply proposed relationships. The same approval
+surface handles exact-file Design Intent read grants and Rolling Context manual
+checkpoint confirmation. None of these human decisions expire while pending.
+The session page retries a missing session while Pi reconnects to the daemon.
 Provider and tool errors are shown in the conversation. The footer shows the
 active fast-mode status when the installed fast-mode extension exposes its
 statusline segment. Commands are dispatched back through Pi's

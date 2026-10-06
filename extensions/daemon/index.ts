@@ -99,7 +99,7 @@ export default function (pi: ExtensionAPI) {
   let streamCounter = 0;
   let currentStreamId: string | undefined;
   const pendingRemoteMessages: Array<{ requestId: string; text: string }> = [];
-  const pendingApprovals = new Map<string, { request: any; delivered: boolean; cancelChoice?: string; generation: number; kind: "permission" | "design-intent" }>();
+  const pendingApprovals = new Map<string, { request: any; delivered: boolean; cancelChoice?: string; generation: number; kind: "permission" | "design-intent" | "design-intent-read" | "rolling-context-checkpoint" }>();
   const pendingCommandResults = new Map<string, Array<(result: string) => void>>();
 
   pi.events.on('pi-remote:command-result', (result: any) => {
@@ -126,7 +126,7 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  function sendApprovalRequest(request: any, kind: "permission" | "design-intent", publicFields: Record<string, unknown>) {
+  function sendApprovalRequest(request: any, kind: "permission" | "design-intent" | "design-intent-read" | "rolling-context-checkpoint", publicFields: Record<string, unknown>) {
     if (socket?.readyState !== WebSocket.OPEN || typeof request?.requestId !== 'string') { request?.onUnavailable?.(); return; }
     pendingApprovals.set(request.requestId, { request, delivered: false, generation: connectionGeneration, kind });
     try {
@@ -148,9 +148,19 @@ export default function (pi: ExtensionAPI) {
     acceptDiff: request.acceptDiff, acceptUnavailable: request.acceptUnavailable,
   }));
 
+  pi.events.on('pi-remote:design-intent-read-approval-request', (request: any) => sendApprovalRequest(request, 'design-intent-read', {
+    storePath: request.storePath, purpose: request.purpose, reason: request.reason,
+  }));
+
+  pi.events.on('pi-remote:rolling-context-checkpoint-approval-request', (request: any) => sendApprovalRequest(request, 'rolling-context-checkpoint', {
+    summary: request.summary, stateBytes: request.stateBytes,
+  }));
+
   pi.events.on('pi-remote:approval-dismiss', (request: any) => {
-    if (typeof request?.requestId !== 'string' || socket?.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ type: 'approval_dismiss', requestId: request.requestId }));
+    if (typeof request?.requestId !== 'string') return;
+    const pending = pendingApprovals.get(request.requestId);
+    if (pending) { pendingApprovals.delete(request.requestId); pending.request.onUnavailable?.(); }
+    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'approval_dismiss', requestId: request.requestId }));
   });
 
   pi.events.on('pi-remote:approval-cancel', (response: any) => {
@@ -208,17 +218,14 @@ export default function (pi: ExtensionAPI) {
               const pending = pendingApprovals.get(msg.requestId);
               if (!pending) return;
               pendingApprovals.delete(msg.requestId);
-              if (pending.kind === 'design-intent') {
+              if (pending.kind !== 'permission') {
                 Promise.resolve(pending.request.respond?.(msg.choice, msg.reason)).then(outcome => {
-                  const value = outcome && typeof outcome === 'object' ? outcome : { ok: true, message: 'Design Intent decision processed' };
+                  const value = outcome && typeof outcome === 'object' ? outcome : { ok: true, message: 'Approval completed' };
                   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'approval_outcome', requestId: msg.requestId, outcome: value }));
                 }).catch(error => {
                   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'approval_outcome', requestId: msg.requestId, outcome: { ok: false, message: error instanceof Error ? error.message : String(error) } }));
                 });
               } else pending.request.respond?.(msg.choice);
-            } else if (msg.type === 'approval_expired') {
-              const pending = pendingApprovals.get(msg.requestId);
-              if (pending) { pendingApprovals.delete(msg.requestId); pending.request.onUnavailable?.(); }
             } else if (msg.type === 'approval_cancel_error') {
               const pending = pendingApprovals.get(msg.requestId);
               if (!pending) return;

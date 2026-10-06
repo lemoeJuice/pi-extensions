@@ -19,12 +19,36 @@ async function projectFor(ctx:ExtensionContext, allowParent=false):Promise<Proje
   return project;
 }
 function readGranted(pi:ExtensionAPI):boolean{return pi.getFlag("design-intent-read")===true;}
+let localReadPromptQueue:Promise<void>=Promise.resolve();
+function queueReadPrompt<T>(prompt:()=>Promise<T>):Promise<T>{const current=localReadPromptQueue.then(prompt,prompt);localReadPromptQueue=current.then(()=>undefined,()=>undefined);return current;}
 async function authorizeRead(ctx:ExtensionContext,project:ProjectIdentity,pi:ExtensionAPI,approvedSession?:string):Promise<boolean>{
   if(!ctx.isProjectTrusted())return false;
   if(readGranted(pi))return true;
   if(approvedSession===ctx.sessionManager.getSessionId())return true;
-  if(!ctx.hasUI)return false;
-  return ctx.ui.confirm("Read project Design Intent",`Allow this extension to read the project intent file for this session?\n${project.storePath}`);
+  let markAvailable!:(available:boolean)=>void,choose!:(choice:"Allow once"|"Deny")=>void,resolveRemote!:(result:{source:"remote";choice:"Allow once"|"Deny"}|{source:"unavailable"})=>void;
+  let availabilitySettled=false;
+  const available=new Promise<boolean>(resolve=>{markAvailable=resolve;});
+  const remoteChoice=new Promise<"Allow once"|"Deny">(resolve=>{choose=resolve;});
+  const remoteResult=new Promise<{source:"remote";choice:"Allow once"|"Deny"}|{source:"unavailable"}>(resolve=>{resolveRemote=resolve;});
+  const requestId=randomUUID();
+  const localController=new AbortController();
+  const localChoice=ctx.hasUI?queueReadPrompt(async()=>({source:"local" as const,choice:await ctx.ui.select(`Read project Design Intent\nFile: ${project.storePath}\nThis grant is limited to this project file for the current session.`,["Allow once","Deny"],{signal:localController.signal}) as "Allow once"|"Deny"|undefined})):undefined;
+  const resolveAvailability=(value:boolean)=>{if(availabilitySettled)return;availabilitySettled=true;markAvailable(value);};
+  pi.events.emit("pi-remote:design-intent-read-approval-request",{
+    requestId,storePath:project.storePath,purpose:"Read the project Design Intent file for this session",reason:"This grants read access to this exact file only; it does not approve project changes.",
+    onDelivered:()=>resolveAvailability(true),
+    onUnavailable:()=>{resolveAvailability(false);resolveRemote({source:"unavailable"});},
+    respond:(choice:"Allow once"|"Deny")=>{choose(choice);resolveRemote({source:"remote",choice});return{ok:choice==="Allow once",message:choice==="Allow once"?"Design Intent read access allowed for this session":"Design Intent read access denied"};},
+  });
+  if(localChoice){
+    const winner=await Promise.race([localChoice,remoteResult]);
+    if(winner.source==="remote"){localController.abort();return winner.choice==="Allow once";}
+    if(winner.source==="unavailable"){const local=await localChoice;return local.choice==="Allow once";}
+    pi.events.emit("pi-remote:approval-dismiss",{requestId});
+    return winner.choice==="Allow once";
+  }
+  if(!await available)return false;
+  return await remoteChoice==="Allow once";
 }
 function projectionText(p:IntentProjection):string{
   if(p.availability!=="ready")return `[Design Intent ${p.availability}] ${p.diagnostics.map(d=>d.message).join("; ")}`;

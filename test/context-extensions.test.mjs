@@ -110,6 +110,22 @@ test('design_intent_get returns the complete record and current source identity'
  assert.equal(record.scope.paths[0],'src/api.ts');assert.deepEqual(record.sources,[{kind:'user',ref:'request-1'}]);assert.equal(record.review.note,'Explicitly approved');assert.equal(record.createdInRevision,2);assert.equal(result.details.projection.sourceHash.length,64);
 });
 
+test('Design Intent read authorization can be granted through the remote approval event without local UI',async()=>{
+ const cwd='/tmp/design-intent-remote-read-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
+ const manager=SessionManager.inMemory(cwd,{id:'remote-read-session'},[]);const pi=mockPi();designIntent(pi);const ctx={cwd,sessionManager:manager,isProjectTrusted:()=>true,hasUI:false};
+ pi.on('pi-remote:design-intent-read-approval-request',request=>{assert.equal(request.storePath,`${cwd}/.pi/design-intent.json`);request.onDelivered();request.respond('Allow once');});
+ const result=await pi.tools.get('design_intent_query').execute('query-1',{},undefined,undefined,ctx);
+ assert.equal(result.details.projection.availability,'ready');
+});
+
+test('manual Rolling Context checkpoint can be approved remotely without timeout or local UI',async()=>{
+ const cwd='/tmp/rolling-context-remote-checkpoint-test';const header={type:'session',version:3,id:'remote-checkpoint-session',timestamp:new Date().toISOString(),cwd};const manager=SessionManager.inMemory(cwd,{id:header.id},[]);const pi=mockPi();rollingContext(pi);let compactOptions;const notices=[];
+ const ctx={cwd,sessionManager:manager,hasUI:false,waitForIdle:async()=>{},hasPendingMessages:()=>false,ui:{notify:text=>notices.push(text)},compact:options=>{compactOptions=options;}};
+ pi.on('pi-remote:rolling-context-checkpoint-approval-request',request=>{assert.match(request.summary,/当前任务/);request.onDelivered();request.respond('Create checkpoint');});
+ await pi.commands.get('rolling-context').handler('checkpoint',ctx);
+ assert.ok(compactOptions);assert.match(compactOptions.customInstructions,/Do not add or infer project Design Intent/);
+});
+
 test('remote Design Intent approval commits only the current branch proposal matching its preview hash',async()=>{
  const cwd='/tmp/design-intent-web-approval-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
  const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;let approval;pi.events.set('pi-remote:design-intent-approval-request',[request=>{approval=request;}]);

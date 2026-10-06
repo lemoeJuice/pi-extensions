@@ -94,4 +94,21 @@ test('approval is queued off-page, replayed on the session page, and routed to P
   assert.equal((await sessionFrames.next(frame => frame.type === 'approval_resolved')).choice, 'Accept');
   pi.send(JSON.stringify({ type: 'approval_outcome', requestId: 'review-1', outcome: { ok: true, message: 'Accepted DI-0003' } }));
   assert.deepEqual((await sessionFrames.next(frame => frame.type === 'approval_resolved' && frame.outcome)).outcome, { ok: true, message: 'Accepted DI-0003' });
+
+  for (const request of [
+    { kind: 'design-intent-read', requestId: 'read-1', storePath: '/tmp/project/.pi/design-intent.json', purpose: 'Read project intent', reason: 'Exact-file session grant' },
+    { kind: 'rolling-context-checkpoint', requestId: 'checkpoint-1', summary: 'Validated task state', stateBytes: 128 },
+  ]) {
+    pi.send(JSON.stringify({ type: 'approval_request', ...request }));
+    assert.equal((await piFrames.next(frame => frame.type === 'approval_delivery' && frame.requestId === request.requestId)).delivered, true);
+    const prompt = await sessionFrames.next(frame => frame.type === 'approval_request' && frame.requestId === request.requestId);
+    assert.equal(prompt.kind, request.kind);
+    const choice = request.kind === 'design-intent-read' ? 'Allow once' : 'Create checkpoint';
+    const result = await fetch(`http://127.0.0.1:${port}/api/sessions/session-1/approvals`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requestId: request.requestId, choice }),
+    });
+    assert.equal(result.status, 202);
+    assert.deepEqual(await piFrames.next(frame => frame.type === 'approval_choice' && frame.requestId === request.requestId), { type: 'approval_choice', requestId: request.requestId, choice });
+  }
 });

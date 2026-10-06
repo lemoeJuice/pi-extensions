@@ -76,7 +76,7 @@ const server = http.createServer((req, res) => {
     let body = ''; req.on('data', chunk => { body += chunk; if (body.length > 16 * 1024) req.destroy(); });
     req.on('end', () => {
       let value; try { value = JSON.parse(body); } catch { return json(400, { error: 'Invalid JSON' }); }
-      if (typeof value.requestId !== 'string' || !['Allow once', 'Switch to auto', 'Deny', 'Accept', 'Reject'].includes(value.choice) || (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length > 4000))) return json(400, { error: 'Invalid approval response' });
+      if (typeof value.requestId !== 'string' || !['Allow once', 'Switch to auto', 'Deny', 'Accept', 'Reject', 'Create checkpoint', 'Cancel'].includes(value.choice) || (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length > 4000))) return json(400, { error: 'Invalid approval response' });
       const result = registry.respondApproval(decodeURIComponent(approval[1]), value.requestId, value.choice, value.reason);
       return result.error ? json(409, result) : json(202, { ok: true });
     }); return;
@@ -128,7 +128,6 @@ wss.on('connection', (ws, req) => {
       }
       else if (msg.type === 'approval_dismiss' && typeof msg.requestId === 'string') registry.dismissApproval(registered.sessionId, registered.instanceId, msg.requestId);
       else if (msg.type === 'approval_outcome' && typeof msg.requestId === 'string' && msg.outcome && typeof msg.outcome === 'object') registry.broadcastApprovalOutcome(registered.sessionId, msg.requestId, msg.outcome);
-      else if (msg.type === 'approval_expired' && typeof msg.requestId === 'string') registry.expireApproval(registered.sessionId, registered.instanceId, msg.requestId);
       else if (msg.type === 'event' && Number.isSafeInteger(msg.seq)) registry.event(registered.sessionId, registered.instanceId, { seq: msg.seq, timestamp: Number(msg.timestamp) || Date.now(), type: msg.event?.type || 'event', event: msg.event });
       else if (msg.type === 'status' && ['idle','running','waiting','error'].includes(msg.status)) { const s=registry.sessions.get(registered.sessionId); const i=s?.instances.get(registered.instanceId); if(i)i.status=msg.status; registry.broadcastList(); }
     });
