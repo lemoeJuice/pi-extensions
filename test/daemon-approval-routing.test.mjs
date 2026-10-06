@@ -29,17 +29,17 @@ function frames(socket) {
   };
 }
 
-test('session approval UI scripts parse and render proposal fields as text', async () => {
+test('generic UI scripts parse and contain no plugin approval branches', async () => {
   const html = await readFile('extensions/daemon/web/index.html', 'utf8');
   const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]);
   assert.equal(scripts.length, 2);
   for (const source of scripts) new Script(source);
-  assert.match(html, /Design Intent approval/);
-  assert.match(html, /textContent=design\?\(approval\.statement/);
-  assert.match(html, /approval-reject-reason/);
+  assert.match(html, /request.method==='select'/);
+  assert.match(html, /textContent=request.title/);
+  assert.doesNotMatch(html, /design-intent|rolling-context-checkpoint|approval_request|proposalId/);
 });
 
-test('approval is queued off-page, replayed on the session page, and routed to Pi', async t => {
+test('generic UI is queued off-page, replayed on session entry and resynchronized after reconnect', async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'pi-approval-routing-'));
   const listener = net.createServer();
   listener.listen(0, '127.0.0.1');
@@ -72,43 +72,52 @@ test('approval is queued off-page, replayed on the session page, and routed to P
 
   const pi = new WebSocket(`ws://127.0.0.1:${port}/internal`); sockets.push(pi);
   const piFrames = frames(pi); await once(pi, 'open');
-  pi.send(JSON.stringify({ type: 'register', instance: { instanceId: 'pi-1', sessionId: 'session-1', pid: 123, cwd: '/tmp/project' } }));
+  pi.send(JSON.stringify({ type: 'register', instance: { instanceId: 'pi-1', sessionId: 'session-1', pid: 123, cwd: '/tmp/project', uiVersion: 1 } }));
   await piFrames.next(frame => frame.type === 'registered');
-  pi.send(JSON.stringify({ type: 'approval_request', kind: 'design-intent', requestId: 'review-1', proposalId: 'DIP-123', proposalHash: 'proposal-hash', storePath: '/tmp/project/.pi/design-intent.json', baseRevision: 2, sourceHash: 'source-hash', candidateHash: 'candidate-hash', statement: 'Keep the API stable', rationale: 'Existing users depend on it', acceptDiff: '+ DI-0003' }));
-  assert.equal((await piFrames.next(frame => frame.type === 'approval_delivery')).delivered, true);
+  const request = { id: 'prompt-1', method: 'confirm', title: 'An arbitrary extension asks', message: 'Full local prompt content' };
+  const snapshot = { type: 'ui_snapshot', version: 1, uiEpoch: 'ui-epoch', revision: 1, pending: [request], status: {} };
+  pi.send(JSON.stringify(snapshot));
 
   const session = new WebSocket(`ws://127.0.0.1:${port}/ws/sessions/session-1`); sockets.push(session);
   const sessionFrames = frames(session); await once(session, 'open');
   await sessionFrames.next(frame => frame.type === 'session_available');
-  const queued = await sessionFrames.next(frame => frame.type === 'approval_request');
-  assert.equal(queued.requestId, 'review-1');
-  assert.equal(queued.kind, 'design-intent');
-  assert.equal(queued.candidateHash, 'candidate-hash');
-
-  const response = await fetch(`http://127.0.0.1:${port}/api/sessions/session-1/approvals`, {
+  const queued = await sessionFrames.next(frame => frame.type === 'ui_snapshot');
+  assert.deepEqual(queued.pending, [request]);
+  assert.equal(queued.uiEpoch, 'ui-epoch');
+  const response = await fetch(`http://127.0.0.1:${port}/api/sessions/session-1/ui/responses`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ requestId: 'review-1', choice: 'Accept' }),
+    body: JSON.stringify({ version: 1, uiEpoch: 'ui-epoch', response: { id: 'prompt-1', confirmed: true } }),
   });
   assert.equal(response.status, 202);
-  assert.deepEqual(await piFrames.next(frame => frame.type === 'approval_choice'), { type: 'approval_choice', requestId: 'review-1', choice: 'Accept' });
-  assert.equal((await sessionFrames.next(frame => frame.type === 'approval_resolved')).choice, 'Accept');
-  pi.send(JSON.stringify({ type: 'approval_outcome', requestId: 'review-1', outcome: { ok: true, message: 'Accepted DI-0003' } }));
-  assert.deepEqual((await sessionFrames.next(frame => frame.type === 'approval_resolved' && frame.outcome)).outcome, { ok: true, message: 'Accepted DI-0003' });
+  assert.deepEqual(await piFrames.next(frame => frame.type === 'ui_response'), { type: 'ui_response', version: 1, uiEpoch: 'ui-epoch', response: { id: 'prompt-1', confirmed: true } });
+  pi.send(JSON.stringify({ type: 'ui_response_ack', version: 1, uiEpoch: 'ui-epoch', id: 'prompt-1', accepted: true }));
+  assert.equal((await sessionFrames.next(frame => frame.type === 'ui_response_ack')).accepted, true);
+  pi.send(JSON.stringify({ ...snapshot, revision: 2, pending: [] }));
+  assert.deepEqual((await sessionFrames.next(frame => frame.type === 'ui_snapshot' && frame.revision === 2)).pending, []);
 
-  for (const request of [
-    { kind: 'design-intent-read', requestId: 'read-1', storePath: '/tmp/project/.pi/design-intent.json', purpose: 'Read project intent', reason: 'Exact-file session grant' },
-    { kind: 'rolling-context-checkpoint', requestId: 'checkpoint-1', summary: 'Validated task state', stateBytes: 128 },
-  ]) {
-    pi.send(JSON.stringify({ type: 'approval_request', ...request }));
-    assert.equal((await piFrames.next(frame => frame.type === 'approval_delivery' && frame.requestId === request.requestId)).delivered, true);
-    const prompt = await sessionFrames.next(frame => frame.type === 'approval_request' && frame.requestId === request.requestId);
-    assert.equal(prompt.kind, request.kind);
-    const choice = request.kind === 'design-intent-read' ? 'Allow once' : 'Create checkpoint';
-    const result = await fetch(`http://127.0.0.1:${port}/api/sessions/session-1/approvals`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ requestId: request.requestId, choice }),
+  const pending = { id: 'pending-long', method: 'select', title: 'Waiting locally', options: ['Option'] };
+  pi.send(JSON.stringify({ ...snapshot, revision: 3, pending: [pending] }));
+  await sessionFrames.next(frame => frame.type === 'ui_snapshot' && frame.revision === 3);
+  const closed = once(pi, 'close'); pi.close(); await closed;
+  await sessionFrames.next(frame => frame.type === 'ui_unavailable');
+  // Pi's live broker retains the same request; a fresh daemon registration receives its snapshot.
+  const reconnected = new WebSocket(`ws://127.0.0.1:${port}/internal`); sockets.push(reconnected);
+  const reconnectFrames = frames(reconnected); await once(reconnected, 'open');
+  reconnected.send(JSON.stringify({ type: 'register', instance: { instanceId: 'pi-1', sessionId: 'session-1', pid: 123, cwd: '/tmp/project', uiVersion: 1 } }));
+  await reconnectFrames.next(frame => frame.type === 'registered');
+  reconnected.send(JSON.stringify({ ...snapshot, revision: 3, pending: [pending] }));
+  assert.deepEqual((await sessionFrames.next(frame => frame.type === 'ui_snapshot' && frame.revision === 3)).pending, [pending]);
+  const stale = await fetch(`http://127.0.0.1:${port}/api/sessions/session-1/ui/responses`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version: 1, uiEpoch: 'old-epoch', response: { id: pending.id, value: 'Option' } }),
+  });
+  assert.equal(stale.status, 409);
+  for (const envelope of [null, [], { version: 2, uiEpoch: 'ui-epoch', response: { id: pending.id, value: 'Option' } }]) {
+    const invalid = await fetch(`http://127.0.0.1:${port}/api/sessions/session-1/ui/responses`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(envelope),
     });
-    assert.equal(result.status, 202);
-    assert.deepEqual(await piFrames.next(frame => frame.type === 'approval_choice' && frame.requestId === request.requestId), { type: 'approval_choice', requestId: request.requestId, choice });
+    assert.equal(invalid.status, 400);
   }
+  reconnected.send('null');
+  assert.equal((await reconnectFrames.next(frame => frame.type === 'error')).error, 'Expected an object frame');
 });

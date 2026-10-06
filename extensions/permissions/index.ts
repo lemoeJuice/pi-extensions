@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { retryAssistantCall } from "@earendil-works/pi-ai";
 import { createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { isPathWithinWorkingDirectory, patchPaths } from "../edit/lib/codex-apply-patch.ts";
@@ -18,53 +17,9 @@ function queueLocalPrompt<T>(prompt: () => Promise<T>): Promise<T> {
   return current;
 }
 
-async function selectPermissionChoice(pi: ExtensionAPI, ctx: any, request: { toolName: string; intent: string; reason: string; behavior: string }): Promise<ManualChoice | undefined> {
-  let markAvailable!: (available: boolean) => void;
-  let choose!: (choice: ManualChoice) => void;
-  let availabilitySettled = false;
-  const available = new Promise<boolean>(resolve => { markAvailable = resolve; });
-  const remoteChoice = new Promise<ManualChoice>(resolve => { choose = resolve; });
-  const localController = new AbortController();
-  let settled = false;
-  const localChoice = ctx.hasUI
-    ? queueLocalPrompt(async () => {
-        if (settled) return { source: "skipped" as const, choice: undefined };
-        const choice = await ctx.ui.select(`${request.intent}\nOperation: ${request.toolName}\n${request.behavior}\nReview reason: ${request.reason}`, ["Allow once", "Switch to auto", "Deny"], { signal: localController.signal });
-        return { source: "local" as const, choice: choice as ManualChoice | undefined };
-      })
-    : undefined;
-  let remoteDelivered = false;
-  const resolveAvailability = (value: boolean) => {
-    if (availabilitySettled) return;
-    availabilitySettled = true;
-    markAvailable(value);
-  };
-  const requestId = randomUUID();
-  pi.events.emit("pi-remote:approval-request", {
-    ...request,
-    requestId,
-    onDelivered: () => { remoteDelivered = true; resolveAvailability(true); },
-    onUnavailable: () => { resolveAvailability(false); },
-    respond: (choice: ManualChoice) => choose(choice),
-  });
-  if (localChoice) {
-    const winner = await Promise.race([
-      localChoice,
-      remoteChoice.then(choice => ({ source: "remote" as const, choice })),
-    ]);
-    if (winner.source === "remote") {
-      settled = true;
-      localController.abort();
-      return winner.choice;
-    }
-    if (winner.source === "skipped") return undefined;
-    settled = true;
-    const choice = winner.choice;
-    pi.events.emit("pi-remote:approval-cancel", { requestId, choice: choice || "Deny" });
-    if (remoteDelivered) return remoteChoice;
-    return choice;
-  }
-  return await available ? remoteChoice : undefined;
+async function selectPermissionChoice(ctx: any, request: { toolName: string; intent: string; reason: string; behavior: string }): Promise<ManualChoice | undefined> {
+  if (!ctx.hasUI) return undefined;
+  return queueLocalPrompt(() => ctx.ui.select(`${request.intent}\nOperation: ${request.toolName}\n${request.behavior}\nReview reason: ${request.reason}`, ["Allow once", "Switch to auto", "Deny"], { signal: ctx.signal }));
 }
 
 function requireIntent(value: unknown, toolName: string): string {
@@ -170,15 +125,12 @@ export default function (pi: ExtensionAPI) {
         mode = requested;
         const result = `Permission mode: ${mode}`;
         ctx.ui.notify(result, "info");
-        pi.events.emit("pi-remote:command-result", { name: "permissions", result });
       } else if (requested) {
         const result = "Usage: /permissions [manual|auto]";
         ctx.ui.notify(result, "warning");
-        pi.events.emit("pi-remote:command-result", { name: "permissions", result });
       } else {
         const result = `Permission mode: ${mode}`;
         ctx.ui.notify(result, "info");
-        pi.events.emit("pi-remote:command-result", { name: "permissions", result });
       }
     },
   });
@@ -243,7 +195,7 @@ export default function (pi: ExtensionAPI) {
       const behavior = event.toolName === "bash"
         ? `Command: ${String(input.command ?? "").replace(/\s+/g, " ").slice(0, 240)}`
         : `Target: ${outside.join(", ") || targets.join(", ") || "(not applicable)"}`;
-      const choice = await selectPermissionChoice(pi, ctx, { toolName: event.toolName, intent, behavior, reason });
+      const choice = await selectPermissionChoice(ctx, { toolName: event.toolName, intent, behavior, reason });
       if (choice === "Deny" || choice === undefined) {
         return { block: true, reason: choice === undefined ? "Permission review was not completed or no approval UI was available" : "Blocked by user" };
       }

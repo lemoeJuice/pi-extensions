@@ -11,6 +11,9 @@ daemon listens on this machine's current Tailscale IPv4 address
 (`100.64.209.124:4317` in this setup) by default. Open
 <http://100.64.209.124:4317> from a device on the same tailnet to view sessions.
 
+After upgrading from the plugin-specific approval protocol, reload/restart Pi's
+extensions and refresh the browser page. There is no legacy `/approvals` fallback.
+
 Override the endpoint with `PI_REMOTE_HOST` and `PI_REMOTE_PORT`. Access is
 governed by your Tailscale ACLs. Do not bind to `0.0.0.0` unless you
 intentionally accept the additional security implications. Alternatively, bind
@@ -47,7 +50,7 @@ Pi itself owns the JSONL session files, which the daemon only reads.
 - `POST /api/sessions/:sessionId/messages` with `{ "text": "..." }`
 - `POST /api/sessions/:sessionId/abort` to stop the current Pi generation
 - `POST /api/sessions/:sessionId/commands` with `{ "name": "...", "args": "..." }`
-- `POST /api/sessions/:sessionId/approvals` with `{ "requestId": "...", "choice": "...", "reason": "..."? }`
+- `POST /api/sessions/:sessionId/ui/responses` with `{ "version": 1, "uiEpoch": "...", "response": { "id": "...", "value": "..." } }` (or `confirmed: boolean` / `cancelled: true`)
 - `WS /internal` for Pi extension clients
 - `WS /ws/sessions/:sessionId` for session event streams
 
@@ -59,23 +62,49 @@ The session page renders streamed thinking in a collapsed section, pages
 read-only history from the registered session's active branch, and swaps the
 Send button for Stop while Pi is generating. Type `/` to filter available
 commands; selecting one opens a dialog to edit its arguments and apply it.
-Manual permission reviews are presented simultaneously in Pi's local UI and the
-connected session page; the first response wins and dismisses the other prompt.
-Approval requests remain queued in daemon memory without an expiry when the
-target session page is not open; opening that session page replays the pending
-prompt. They are removed only after a decision, explicit dismissal, or the
-originating Pi instance disconnects; a daemon restart also clears this in-memory
-queue. Design Intent proposals also open a distinct browser review dialog with
-the source version, acceptance candidate diff, and explicit accept/reject
-actions. The browser sends its decision back to the originating Pi extension;
-only Pi revalidates the active proposal and writes the project store. Rejecting
-requires a reason and does not apply proposed relationships. The same approval
-surface handles exact-file Design Intent read grants and Rolling Context manual
-checkpoint confirmation. None of these human decisions expire while pending.
+Supported extension `ctx.ui.select/confirm/input` calls are displayed both in the
+original local TUI and on the session page. Options and full prompt text come from
+that same UI call; the daemon has no plugin-specific approval logic. The first valid
+response wins once. A remote answer aborts and waits for native dialog cleanup
+before the original caller continues. Local answers never wait for a network reply.
+
+The Pi-process broker owns pending prompts; the daemon stores display copies only.
+Opening a session page replays its current snapshot. Browser disconnects, daemon
+restarts and network failures do not settle local prompts; Pi re-advertises the same
+epoch/request IDs on reconnect. There is no default decision timeout. Explicit
+caller-provided timeouts retain the native UI behavior. HTTP 202 means queued;
+`ui_response_ack` means Pi accepted the UI response, not that business execution
+succeeded. Results come from the original tool/message/notification flow.
+
+Design Intent proposals no longer open a web-only review workflow. Send the usual
+`/design-intent review|accept|reject` command from either interface; accept/reject
+uses the same local confirmation, and Reject's reason stays a command argument.
+Read grants and Rolling Context checkpoint confirmations use ordinary UI too.
+Authorization, branch/hash checks and project writes remain in the plugins.
+
+### Compatibility and limits
+
+Pi does not currently expose a public global UI interceptor for its running TUI.
+This implementation isolates a compatibility decorator over the mutable shared
+UI context, tested against Pi **0.99.1** using its real extension runner and native
+selector/input components. Load daemon before UI-producing extensions (the package
+manifest does this). Disable with `--remote-ui-proxy false` if another UI decorator
+conflicts. Installation failures restore the original methods and report a warning.
+RPC/headless contexts are not decorated, and a daemon connection does not create UI.
+
+`custom()` and `editor()` stay local-only and are marked as such on the session page.
+The installed native editor has no safe cancellation handle, so offering a remote
+answer would leave an orphaned local component. These calls retain local behavior,
+including nested UI calls; core dialogs that bypass `ctx.ui` are not intercepted.
+Full interactive CLI reload/session-switch and real-browser smoke testing remain
+separate delivery checks; this is not a claim of universal TUI mirroring.
+
+Generic `notify/setStatus` calls are mirrored. Notifications are transient, not a
+durable business result log. The proxy does not infer plugin status or command
+completion from text. Fast-mode metadata is unknown without a public host source.
+
 The session page retries a missing session while Pi reconnects to the daemon.
-Provider and tool errors are shown in the conversation. The footer shows the
-active fast-mode status when the installed fast-mode extension exposes its
-statusline segment. Commands are dispatched back through Pi's
+Provider and tool errors are shown in the conversation. Commands are dispatched back through Pi's
 extension/prompt command expansion rather than executed by the daemon.
 
 ### Rolling Context Graph View

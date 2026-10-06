@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { WebSocketServer, WebSocket } = require('ws');
 const { Registry } = require('./registry');
+const { UI_VERSION } = require('./ui-protocol');
 const { findSessionFile, readHistory, readTelemetry } = require('./history');
 const { getDaemonVersion } = require('./version');
 const host = process.env.PI_REMOTE_HOST || '100.64.209.124';
@@ -71,14 +72,14 @@ const server = http.createServer((req, res) => {
         .then(result => json(result.error ? 409 : 202, result.error ? result : { ok: true, result: result.result || 'Command accepted by Pi' }));
     }); return;
   }
-  const approval = url.pathname.match(/^\/api\/sessions\/([^/]+)\/approvals$/);
-  if (req.method === 'POST' && approval) {
-    let body = ''; req.on('data', chunk => { body += chunk; if (body.length > 16 * 1024) req.destroy(); });
+  const uiResponse = url.pathname.match(/^\/api\/sessions\/([^/]+)\/ui\/responses$/);
+  if (req.method === 'POST' && uiResponse) {
+    let body = ''; req.on('data', chunk => { body += chunk; if (body.length > 256 * 1024) req.destroy(); });
     req.on('end', () => {
       let value; try { value = JSON.parse(body); } catch { return json(400, { error: 'Invalid JSON' }); }
-      if (typeof value.requestId !== 'string' || !['Allow once', 'Switch to auto', 'Deny', 'Accept', 'Reject', 'Create checkpoint', 'Cancel'].includes(value.choice) || (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length > 4000))) return json(400, { error: 'Invalid approval response' });
-      const result = registry.respondApproval(decodeURIComponent(approval[1]), value.requestId, value.choice, value.reason);
-      return result.error ? json(409, result) : json(202, { ok: true });
+      if (!value || typeof value !== 'object' || Array.isArray(value) || value.version !== UI_VERSION || typeof value.uiEpoch !== 'string' || !value.response || typeof value.response !== 'object') return json(400, { error: 'Invalid UI response envelope' });
+      const result = registry.respondUI(decodeURIComponent(uiResponse[1]), value.uiEpoch, value.response);
+      return result.error ? json(409, result) : json(202, { queued: true });
     }); return;
   }
   if (req.method === 'GET' && /^\/s\/[^/]+\/context$/.test(url.pathname)) {
@@ -103,11 +104,13 @@ wss.on('connection', (ws, req) => {
   if (pathname === '/internal') {
     let registered;
     ws.on('message', raw => {
+      if (registered && registry.sessions.get(registered.sessionId)?.instances.get(registered.instanceId)?.ws !== ws) return ws.close(1008, 'Stale instance connection');
       let msg; try { msg = JSON.parse(raw.toString()); } catch { ws.send(JSON.stringify({ type: 'error', error: 'Malformed JSON' })); return; }
+      if (!msg || typeof msg !== 'object' || Array.isArray(msg)) { ws.send(JSON.stringify({ type: 'error', error: 'Expected an object frame' })); return; }
       if (!registered) {
         if (msg.type !== 'register' || !validInstance(msg.instance)) { ws.send(JSON.stringify({ type: 'error', error: 'register must be the first message' })); return ws.close(1008); }
         registered = msg.instance; const result = registry.register(ws, registered);
-        ws.send(JSON.stringify({ type: 'registered', instanceId: registered.instanceId, writable: result.writable, conflict: result.conflict }));
+        ws.send(JSON.stringify({ type: 'registered', instanceId: registered.instanceId, writable: result.writable, conflict: result.conflict, uiVersion: UI_VERSION }));
       } else if (msg.type === 'heartbeat') ws.send(JSON.stringify({ type: 'heartbeat_ack', timestamp: Date.now() }));
       else if (msg.type === 'commands' && typeof msg.requestId === 'string') {
         const commands = Array.isArray(msg.commands) ? msg.commands.filter(c => c && typeof c.name === 'string').map(({ name, description, source, requiresArgs }) => ({ name, description, source, requiresArgs: requiresArgs === true })) : [];
@@ -118,20 +121,15 @@ wss.on('connection', (ws, req) => {
         registry.broadcastList();
       }
       else if ((msg.type === 'request_ack' || msg.type === 'request_error') && typeof msg.requestId === 'string') registry.resolveRequest(msg.requestId, msg.type === 'request_error' ? { error: msg.error || 'Pi rejected the command' } : { ok: true, result: msg.result });
-      else if (msg.type === 'approval_request' && typeof msg.requestId === 'string') {
-        const delivered = registry.approvalRequest(registered.sessionId, registered.instanceId, msg);
-        ws.send(JSON.stringify({ type: 'approval_delivery', requestId: msg.requestId, delivered }));
+      else if (msg.type === 'ui_snapshot') {
+        if (!registry.uiSnapshot(registered.sessionId, registered.instanceId, msg)) ws.send(JSON.stringify({ type: 'ui_error', error: 'Invalid or stale UI snapshot' }));
       }
-      else if (msg.type === 'approval_cancel' && typeof msg.requestId === 'string' && ['Allow once', 'Switch to auto', 'Deny'].includes(msg.choice)) {
-        const result = registry.respondApproval(registered.sessionId, msg.requestId, msg.choice);
-        if (result.error) ws.send(JSON.stringify({ type: 'approval_cancel_error', requestId: msg.requestId, error: result.error }));
-      }
-      else if (msg.type === 'approval_dismiss' && typeof msg.requestId === 'string') registry.dismissApproval(registered.sessionId, registered.instanceId, msg.requestId);
-      else if (msg.type === 'approval_outcome' && typeof msg.requestId === 'string' && msg.outcome && typeof msg.outcome === 'object') registry.broadcastApprovalOutcome(registered.sessionId, msg.requestId, msg.outcome);
+      else if (msg.type === 'ui_response_ack') registry.uiResponseAck(registered.sessionId, registered.instanceId, msg);
+      else if (msg.type === 'ui_notification') registry.uiNotification(registered.sessionId, registered.instanceId, msg);
       else if (msg.type === 'event' && Number.isSafeInteger(msg.seq)) registry.event(registered.sessionId, registered.instanceId, { seq: msg.seq, timestamp: Number(msg.timestamp) || Date.now(), type: msg.event?.type || 'event', event: msg.event });
       else if (msg.type === 'status' && ['idle','running','waiting','error'].includes(msg.status)) { const s=registry.sessions.get(registered.sessionId); const i=s?.instances.get(registered.instanceId); if(i)i.status=msg.status; registry.broadcastList(); }
     });
-    ws.on('close', () => { if (registered) registry.unregister(registered.sessionId, registered.instanceId); });
+    ws.on('close', () => { if (registered) registry.unregister(registered.sessionId, registered.instanceId, ws); });
     return;
   }
   if (pathname === '/ws/sessions') {

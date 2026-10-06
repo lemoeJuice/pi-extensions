@@ -41,3 +41,14 @@ test('Pi-loaded permissions can invoke automatic review using the public pi-ai e
   assert.equal((await handler(event, ctx)).block, true);
   assert.equal(reviews, 2);
 });
+
+test('Pi-loaded manual permissions without UI never wait for a daemon event subscriber', { timeout: 1000 }, async () => {
+  const result = await loadExtensions(['extensions/permissions/index.ts'], process.cwd());
+  assert.deepEqual(result.errors, []);
+  const handler = result.extensions[0].handlers.get('tool_call')[0];
+  const blocked = await handler({ toolName: 'read', input: { path: '/outside/workspace/file', intent: 'Inspect the exact external file' } }, {
+    cwd: process.cwd(), hasUI: false, ui: { select() { throw new Error('No UI must not prompt'); } },
+  });
+  assert.equal(blocked.block, true);
+  assert.match(blocked.reason, /no approval UI was available/);
+});

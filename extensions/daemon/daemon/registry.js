@@ -1,18 +1,24 @@
 'use strict';
+const { UI_VERSION, validSnapshot, validResponse } = require('./ui-protocol');
 
 class Registry {
   constructor() { this.sessions = new Map(); this.clients = new Set(); this.pendingRequests = new Map(); }
   register(ws, instance) {
     let session = this.sessions.get(instance.sessionId);
     if (!session) {
-      session = { sessionId: instance.sessionId, cwd: instance.cwd, model: instance.model, title: instance.title, metadata: instance.metadata, instances: new Map(), approvals: new Map(), events: [], lastActivityAt: Date.now() };
+      session = { sessionId: instance.sessionId, cwd: instance.cwd, model: instance.model, title: instance.title, metadata: instance.metadata, instances: new Map(), uiSnapshots: new Map(), events: [], lastActivityAt: Date.now() };
       this.sessions.set(instance.sessionId, session);
     }
     session.sessionFile = instance.sessionFile || session.sessionFile;
     session.leafId = instance.leafId || session.leafId;
     instance.connectedAt = Date.now();
     instance.status = 'idle';
-    const conflict = session.instances.size > 0;
+    const previous = session.instances.get(instance.instanceId);
+    if (previous && previous.ws !== ws) {
+      session.uiSnapshots.delete(instance.instanceId);
+      previous.ws.close?.(1008, 'Instance connection replaced');
+    }
+    const conflict = [...session.instances.keys()].some(id => id !== instance.instanceId);
     instance.writable = !conflict;
     session.instances.set(instance.instanceId, { ws, ...instance });
     session.cwd = instance.cwd || session.cwd;
@@ -25,13 +31,11 @@ class Registry {
     for (const client of this.clients) if (client.sessionId === instance.sessionId && client.ws.readyState === 1) client.ws.send(available);
     return { writable: instance.writable, conflict };
   }
-  unregister(sessionId, instanceId) {
+  unregister(sessionId, instanceId, ws) {
     const s = this.sessions.get(sessionId); if (!s) return;
-    for (const [requestId, approval] of s.approvals) {
-      if (approval.instanceId !== instanceId) continue;
-      s.approvals.delete(requestId);
-      this.broadcastApprovalResolved(sessionId, requestId);
-    }
+    if (ws && s.instances.get(instanceId)?.ws !== ws) return;
+    s.uiSnapshots.delete(instanceId);
+    this.broadcastUI(sessionId, { type: 'ui_unavailable', instanceId });
     s.instances.delete(instanceId);
     if (s.instances.size === 0) {
       this.sessions.delete(sessionId);
@@ -48,8 +52,8 @@ class Registry {
     const session = this.sessions.get(sessionId);
     if (session) {
       if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'session_available', sessionId }));
-      for (const approval of session.approvals.values()) {
-        if (ws.readyState === 1) ws.send(JSON.stringify(approval.payload));
+      for (const [instanceId, snapshot] of session.uiSnapshots) {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ ...snapshot, sessionId, instanceId }));
       }
     }
     return client;
@@ -114,58 +118,42 @@ class Registry {
       catch (error) { clearTimeout(timer); this.pendingRequests.delete(message.requestId); resolve({ error: String(error) }); }
     });
   }
-  approvalRequest(sessionId, instanceId, request) {
-    const s = this.sessions.get(sessionId);
-    const instance = s?.instances.get(instanceId);
-    if (!s || !instance || !request?.requestId) return false;
-    if (s.approvals.has(request.requestId)) return false;
-    const kinds = ['permission', 'design-intent', 'design-intent-read', 'rolling-context-checkpoint'];
-    const kind = kinds.includes(request.kind) ? request.kind : 'permission';
-    if (kind === 'design-intent' && (typeof request.proposalId !== 'string' || typeof request.proposalHash !== 'string' || typeof request.sourceHash !== 'string')) return false;
-    if (kind === 'design-intent-read' && (typeof request.storePath !== 'string' || typeof request.purpose !== 'string')) return false;
-    if (kind === 'rolling-context-checkpoint' && typeof request.summary !== 'string') return false;
-    const payload = kind === 'design-intent'
-      ? { type: 'approval_request', kind, sessionId, requestId: request.requestId, proposalId: request.proposalId, proposalHash: request.proposalHash, storePath: request.storePath, baseRevision: request.baseRevision, sourceHash: request.sourceHash, candidateHash: request.candidateHash, statement: request.statement, rationale: request.rationale, effects: request.effects, acceptDiff: request.acceptDiff, acceptUnavailable: request.acceptUnavailable, timestamp: Date.now() }
-      : kind === 'design-intent-read'
-        ? { type: 'approval_request', kind, sessionId, requestId: request.requestId, storePath: request.storePath, purpose: request.purpose, reason: request.reason, timestamp: Date.now() }
-        : kind === 'rolling-context-checkpoint'
-          ? { type: 'approval_request', kind, sessionId, requestId: request.requestId, summary: request.summary, stateBytes: request.stateBytes, timestamp: Date.now() }
-      : { type: 'approval_request', kind, sessionId, requestId: request.requestId, toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior, timestamp: Date.now() };
-    s.approvals.set(request.requestId, { instanceId, payload });
-    for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(JSON.stringify(payload));
+  uiSnapshot(sessionId, instanceId, snapshot) {
+    const s = this.sessions.get(sessionId), instance = s?.instances.get(instanceId);
+    if (!instance || instance.uiVersion !== UI_VERSION || !validSnapshot(snapshot)) return false;
+    const previous = s.uiSnapshots.get(instanceId);
+    if (previous?.uiEpoch === snapshot.uiEpoch && previous.revision >= snapshot.revision) return false;
+    const stored = { type: 'ui_snapshot', version: UI_VERSION, uiEpoch: snapshot.uiEpoch,
+      revision: snapshot.revision, pending: snapshot.pending, status: snapshot.status };
+    s.uiSnapshots.set(instanceId, stored);
+    this.broadcastUI(sessionId, { ...stored, instanceId });
     return true;
   }
-  respondApproval(sessionId, requestId, choice, reason) {
+  respondUI(sessionId, uiEpoch, response) {
     const s = this.sessions.get(sessionId);
-    const approval = s?.approvals.get(requestId);
-    const instance = approval && s.instances.get(approval.instanceId);
-    if (!s || !approval || !instance || instance.ws.readyState !== 1) return { error: 'Approval request is no longer active' };
-    const choices = approval.payload.kind === 'design-intent' ? ['Accept', 'Reject']
-      : approval.payload.kind === 'design-intent-read' ? ['Allow once', 'Deny']
-        : approval.payload.kind === 'rolling-context-checkpoint' ? ['Create checkpoint', 'Cancel']
-          : ['Allow once', 'Switch to auto', 'Deny'];
-    if (!choices.includes(choice)) return { error: 'Invalid approval choice' };
-    if (approval.payload.kind === 'design-intent' && choice === 'Reject' && (typeof reason !== 'string' || !reason.trim() || reason.length > 4000)) return { error: 'A rejection reason of at most 4000 characters is required' };
-    try { instance.ws.send(JSON.stringify({ type: 'approval_choice', requestId, choice, ...(reason ? { reason } : {}) })); }
+    const instance = s && [...s.instances.values()].find(i => i.writable && i.ws.readyState === 1);
+    const snapshot = instance && s.uiSnapshots.get(instance.instanceId);
+    const request = snapshot?.pending.find(item => item.id === response?.id);
+    if (!request || snapshot.uiEpoch !== uiEpoch) return { error: 'UI request is stale, unavailable, or not writable' };
+    if (!validResponse(request, response)) return { error: 'Invalid UI response' };
+    try { instance.ws.send(JSON.stringify({ type: 'ui_response', version: UI_VERSION, uiEpoch, response })); }
     catch (error) { return { error: String(error) }; }
-    s.approvals.delete(requestId);
-    this.broadcastApprovalResolved(sessionId, requestId, { choice });
+    // Only the Pi broker closes the actual prompt. Sending is not completion.
     return {};
   }
-  dismissApproval(sessionId, instanceId, requestId) {
-    const s = this.sessions.get(sessionId), approval = s?.approvals.get(requestId);
-    if (!s || !approval || approval.instanceId !== instanceId) return false;
-    s.approvals.delete(requestId);
-    this.broadcastApprovalResolved(sessionId, requestId, { dismissed: true });
-    return true;
+  uiResponseAck(sessionId, instanceId, frame) {
+    const snapshot = this.sessions.get(sessionId)?.uiSnapshots.get(instanceId);
+    if (frame.version !== UI_VERSION || !snapshot || snapshot.uiEpoch !== frame.uiEpoch || typeof frame.id !== 'string' || typeof frame.accepted !== 'boolean') return;
+    this.broadcastUI(sessionId, { type: 'ui_response_ack', instanceId, uiEpoch: frame.uiEpoch, id: frame.id, accepted: frame.accepted });
   }
-  broadcastApprovalResolved(sessionId, requestId, result = {}) {
-    const frame = JSON.stringify({ type: 'approval_resolved', sessionId, requestId, ...result });
-    for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(frame);
+  uiNotification(sessionId, instanceId, frame) {
+    const instance = this.sessions.get(sessionId)?.instances.get(instanceId);
+    if (!instance || instance.uiVersion !== UI_VERSION || frame.version !== UI_VERSION || this.sessions.get(sessionId)?.uiSnapshots.get(instanceId)?.uiEpoch !== frame.uiEpoch || typeof frame.message !== 'string' || frame.message.length > 65536 || !['info', 'warning', 'error'].includes(frame.notifyType)) return;
+    this.broadcastUI(sessionId, { type: 'ui_notification', instanceId, message: frame.message, notifyType: frame.notifyType });
   }
-  broadcastApprovalOutcome(sessionId, requestId, outcome) {
-    const frame = JSON.stringify({ type: 'approval_resolved', sessionId, requestId, outcome });
-    for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(frame);
+  broadcastUI(sessionId, frame) {
+    const encoded = JSON.stringify({ ...frame, sessionId });
+    for (const client of this.clients) if (client.sessionId === sessionId && client.ws.readyState === 1) client.ws.send(encoded);
   }
   resolveRequest(requestId, result) {
     const pending = this.pendingRequests.get(requestId); if (!pending) return;

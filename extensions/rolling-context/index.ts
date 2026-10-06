@@ -1,5 +1,4 @@
 import type { ExtensionAPI, SessionBoundaryDraft, SessionEntry, ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { checkOptionalToolContract, DESIGN_INTENT_READ_CONTRACT } from "../shared/contracts.ts";
 import { analyzeGroups, boundMemory, effectiveTarget, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, serializedStateBytes, MAX_STATE_BYTES, TELEMETRY_TYPE, contextComposition, ownedEdits, ownedCheckpoint, recallProjection, turnClock, type PlanMetrics, type RollingConfig } from "./lib.ts";
@@ -7,34 +6,6 @@ import { analyzeGroups, boundMemory, effectiveTarget, estimateProjection, groups
 const NoteParams=Type.Object({intent:Type.String({minLength:1}),kind:Type.Union([Type.Literal("plan"),Type.Literal("task-decision"),Type.Literal("focus"),Type.Literal("next-step")]),text:Type.String({minLength:1,maxLength:2000}),replaces:Type.Optional(Type.Array(Type.String(),{maxItems:8})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:12}))},{additionalProperties:false});
 const RecallParams=Type.Object({intent:Type.String({minLength:1}),entryId:Type.Optional(Type.String()),itemId:Type.Optional(Type.String()),query:Type.Optional(Type.String({maxLength:300})),paths:Type.Optional(Type.Array(Type.String({minLength:1,maxLength:256}),{maxItems:12})),cursor:Type.Optional(Type.String({maxLength:2048})),limit:Type.Optional(Type.Number({minimum:1,maximum:8}))},{additionalProperties:false});
 const NoteDetails=Type.Object({type:Type.Literal("rolling-context.note.v1"),noteId:Type.String(),taskId:Type.String(),kind:Type.String(),text:Type.String(),replaces:Type.Array(Type.String()),paths:Type.Array(Type.String())});
-
-let checkpointPromptQueue:Promise<void>=Promise.resolve();
-function queueCheckpointPrompt<T>(prompt:()=>Promise<T>):Promise<T>{const current=checkpointPromptQueue.then(prompt,prompt);checkpointPromptQueue=current.then(()=>undefined,()=>undefined);return current;}
-async function requestCheckpointApproval(pi:ExtensionAPI,ctx:any,summary:string,stateBytes:number):Promise<boolean>{
-  let markAvailable!:(available:boolean)=>void,choose!:(choice:"Create checkpoint"|"Cancel")=>void,resolveRemote!:(result:{source:"remote";choice:"Create checkpoint"|"Cancel"}|{source:"unavailable"})=>void;
-  let availabilitySettled=false;
-  const available=new Promise<boolean>(resolve=>{markAvailable=resolve;});
-  const remoteChoice=new Promise<"Create checkpoint"|"Cancel">(resolve=>{choose=resolve;});
-  const remoteResult=new Promise<{source:"remote";choice:"Create checkpoint"|"Cancel"}|{source:"unavailable"}>(resolve=>{resolveRemote=resolve;});
-  const requestId=randomUUID(),controller=new AbortController();
-  const localChoice=ctx.hasUI?queueCheckpointPrompt(async()=>({source:"local" as const,choice:await ctx.ui.select(`Create a Rolling Context checkpoint?\n\n${summary.slice(0,3000)}`,["Create checkpoint","Cancel"],{signal:controller.signal}) as "Create checkpoint"|"Cancel"|undefined})):undefined;
-  const resolveAvailability=(value:boolean)=>{if(availabilitySettled)return;availabilitySettled=true;markAvailable(value);};
-  pi.events.emit("pi-remote:rolling-context-checkpoint-approval-request",{
-    requestId,summary:summary.slice(0,3000),stateBytes,
-    onDelivered:()=>resolveAvailability(true),
-    onUnavailable:()=>{resolveAvailability(false);resolveRemote({source:"unavailable"});},
-    respond:(choice:"Create checkpoint"|"Cancel")=>{choose(choice);resolveRemote({source:"remote",choice});return{ok:choice==="Create checkpoint",message:choice==="Create checkpoint"?"Rolling Context checkpoint approved":"Rolling Context checkpoint cancelled"};},
-  });
-  if(localChoice){
-    const winner=await Promise.race([localChoice,remoteResult]);
-    if(winner.source==="remote"){controller.abort();return winner.choice==="Create checkpoint";}
-    if(winner.source==="unavailable"){const local=await localChoice;return local.choice==="Create checkpoint";}
-    pi.events.emit("pi-remote:approval-dismiss",{requestId});
-    return winner.choice==="Create checkpoint";
-  }
-  if(!await available)return false;
-  return await remoteChoice==="Create checkpoint";
-}
 
 function parseConfig(pi:ExtensionAPI):RollingConfig {
   const mode=String(pi.getFlag("rolling-context-mode")??"observe");
@@ -294,7 +265,8 @@ export default function rollingContext(pi:ExtensionAPI) {
       await ctx.waitForIdle();
       if(ctx.hasPendingMessages()){ctx.ui.notify("Checkpoint skipped: pending messages exist.","warning");return;}
       const sessionId=ctx.sessionManager.getSessionId();const leafId=ctx.sessionManager.getLeafId();const state=rebuildState(ctx);const summary=renderCheckpoint(state.snapshot);
-      const ok=await requestCheckpointApproval(pi,ctx,summary,serializedStateBytes(state.envelope??state.snapshot));
+      if(!ctx.hasUI){ctx.ui.notify("Manual checkpoint requires a UI.","error");return;}
+      const ok=await ctx.ui.confirm("Rolling Context checkpoint",`Create a checkpoint from current validated task state?\n\n${summary.slice(0,3000)}`);
       if(!ok)return;
       validateContracts();
       if(ctx.sessionManager.getSessionId()!==sessionId||ctx.sessionManager.getLeafId()!==leafId||ctx.hasPendingMessages()){ctx.ui.notify("Checkpoint skipped: session branch changed or new messages arrived while approval was pending.","warning");return;}

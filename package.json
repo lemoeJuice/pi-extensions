@@ -15,6 +15,6 @@
     "ws": "^8.18.0"
   },
   "pi": {
-    "extensions": ["./extensions/edit/index.ts", "./extensions/permissions/index.ts", "./extensions/daemon/index.ts", "./extensions/design-intent/index.ts", "./extensions/rolling-context/index.ts"]
+    "extensions": ["./extensions/daemon/index.ts", "./extensions/edit/index.ts", "./extensions/permissions/index.ts", "./extensions/design-intent/index.ts", "./extensions/rolling-context/index.ts"]
   }
 }

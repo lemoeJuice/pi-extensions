@@ -4,6 +4,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import rollingContext from '../extensions/rolling-context/index.ts';
 import designIntent from '../extensions/design-intent/index.ts';
+import { UIBroker } from '../extensions/daemon/ui/broker.ts';
+import { installUIProxy } from '../extensions/daemon/ui/adapter.ts';
 import { emptyStore, serializeStore, sha } from '../extensions/design-intent/lib.ts';
 import { rebuild, hash } from '../extensions/rolling-context/lib.ts';
 
@@ -110,36 +112,71 @@ test('design_intent_get returns the complete record and current source identity'
  assert.equal(record.scope.paths[0],'src/api.ts');assert.deepEqual(record.sources,[{kind:'user',ref:'request-1'}]);assert.equal(record.review.note,'Explicitly approved');assert.equal(record.createdInRevision,2);assert.equal(result.details.projection.sourceHash.length,64);
 });
 
-test('Design Intent read authorization can be granted through the remote approval event without local UI',async()=>{
+function proxyUI(answer) {
+ const notices=[];
+ const wait=fallback=>(_title,_other,opts)=>new Promise(resolve=>{
+  if(opts?.signal?.aborted)return resolve(fallback);
+  opts?.signal?.addEventListener('abort',()=>resolve(fallback),{once:true});
+ });
+ const ui={select:wait(undefined),confirm:wait(false),input:wait(undefined),editor:async()=>undefined,custom:async()=>undefined,notify:(message,type)=>notices.push({message,type}),setStatus:()=>{}};
+ const broker=new UIBroker(frame=>{const request=frame.pending?.[0];if(request)queueMicrotask(()=>broker.respond(frame.uiEpoch,{id:request.id,...answer(request)}));});
+ const restore=installUIProxy(ui,broker);
+ return{ui,broker,notices,restore};
+}
+
+test('Design Intent read grants use the same ordinary confirm when proxied',async()=>{
  const cwd='/tmp/design-intent-remote-read-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
- const manager=SessionManager.inMemory(cwd,{id:'remote-read-session'},[]);const pi=mockPi();designIntent(pi);const ctx={cwd,sessionManager:manager,isProjectTrusted:()=>true,hasUI:false};
- pi.on('pi-remote:design-intent-read-approval-request',request=>{assert.equal(request.storePath,`${cwd}/.pi/design-intent.json`);request.onDelivered();request.respond('Allow once');});
+ const manager=SessionManager.inMemory(cwd,{id:'remote-read-session'},[]);const pi=mockPi();designIntent(pi);
+ const proxy=proxyUI(request=>{assert.equal(request.method,'confirm');assert.match(request.message,/exact project intent file/);return{confirmed:true};});
+ const ctx={cwd,sessionManager:manager,isProjectTrusted:()=>true,hasUI:true,ui:proxy.ui};
  const result=await pi.tools.get('design_intent_query').execute('query-1',{},undefined,undefined,ctx);
- assert.equal(result.details.projection.availability,'ready');
+ assert.equal(result.details.projection.availability,'ready');assert.deepEqual(proxy.broker.snapshot().pending,[]);proxy.restore();
+ const headless=mockPi();designIntent(headless);const denied=await headless.tools.get('design_intent_query').execute('query-2',{},undefined,undefined,{...ctx,hasUI:false});
+ assert.equal(denied.details.projection.availability,'unavailable');
 });
 
-test('manual Rolling Context checkpoint can be approved remotely without timeout or local UI',async()=>{
- const cwd='/tmp/rolling-context-remote-checkpoint-test';const header={type:'session',version:3,id:'remote-checkpoint-session',timestamp:new Date().toISOString(),cwd};const manager=SessionManager.inMemory(cwd,{id:header.id},[]);const pi=mockPi();rollingContext(pi);let compactOptions;const notices=[];
- const ctx={cwd,sessionManager:manager,hasUI:false,waitForIdle:async()=>{},hasPendingMessages:()=>false,ui:{notify:text=>notices.push(text)},compact:options=>{compactOptions=options;}};
- pi.on('pi-remote:rolling-context-checkpoint-approval-request',request=>{assert.match(request.summary,/当前任务/);request.onDelivered();request.respond('Create checkpoint');});
+test('manual Rolling Context checkpoint confirms through ordinary UI, including the proxy',async()=>{
+ const cwd='/tmp/rolling-context-remote-checkpoint-test';const header={type:'session',version:3,id:'remote-checkpoint-session',timestamp:new Date().toISOString(),cwd};const manager=SessionManager.inMemory(cwd,{id:header.id},[]);const pi=mockPi();rollingContext(pi);let compactOptions;
+ const proxy=proxyUI(request=>{assert.equal(request.method,'confirm');assert.match(request.message,/当前任务/);return{confirmed:true};});
+ const ctx={cwd,sessionManager:manager,hasUI:true,waitForIdle:async()=>{},hasPendingMessages:()=>false,ui:proxy.ui,compact:options=>{compactOptions=options;}};
  await pi.commands.get('rolling-context').handler('checkpoint',ctx);
- assert.ok(compactOptions);assert.match(compactOptions.customInstructions,/Do not add or infer project Design Intent/);
+ assert.ok(compactOptions);assert.match(compactOptions.customInstructions,/Do not add or infer project Design Intent/);proxy.restore();
+ compactOptions=undefined;await pi.commands.get('rolling-context').handler('checkpoint',{...ctx,hasUI:false});assert.equal(compactOptions,undefined);
 });
 
-test('remote Design Intent approval commits only the current branch proposal matching its preview hash',async()=>{
+test('Design Intent has one local accept/reject execution path; proxy replies only to its confirm',async()=>{
  const cwd='/tmp/design-intent-web-approval-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
- const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;let approval;pi.events.set('pi-remote:design-intent-approval-request',[request=>{approval=request;}]);
- const branch=[];const sessionManager={getSessionId:()=> 'remote-approval-session',getLeafId:()=>branch.at(-1)?.id??'root',getBranch:()=>branch};const notices=[];
- const ctx={cwd,sessionManager,isProjectTrusted:()=>true,hasUI:false,waitForIdle:async()=>{},hasPendingMessages:()=>false,ui:{notify:(message,type)=>notices.push({message,type})}};
- const result=await pi.tools.get('design_intent_propose').execute('propose-remote-1',{intent:'Preserve the API',kind:'invariant',title:'Stable interface',statement:'Keep the public interface stable',rationale:'Existing clients depend on it.'},undefined,undefined,ctx);
- assert.equal(result.details.type,'design-intent.proposal.v1');assert.equal(approval.proposalId,result.details.proposalId);assert.match(approval.acceptDiff,/candidate hash/);assert.equal(typeof approval.candidateHash,'string');
- branch.push({type:'message',id:'proposal-result',message:{role:'toolResult',toolCallId:'propose-remote-1',toolName:'design_intent_propose',details:result.details}});
- const outcome=await approval.respond('Accept');assert.equal(outcome.ok,true);assert.match(outcome.message,/accept committed/i);
- const committed=JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8'));assert.equal(committed.records.length,1);assert.equal(committed.records[0].status,'accepted');assert.equal(committed.records[0].review.note,'Approved by user through Pi Remote');assert.equal(pi.appended.at(-1).customType,'design-intent.review.v1');assert.ok(notices.some(item=>/committed/.test(item.message)));
- const rejected=await pi.tools.get('design_intent_propose').execute('propose-remote-2',{intent:'Consider replacing the interface',kind:'alternative',title:'Replacement interface',statement:'Replace the public interface',rationale:'A proposed alternative.',supersedes:['DI-0001']},undefined,undefined,ctx);
- const rejection=approval;assert.equal(rejection.proposalId,rejected.details.proposalId);branch.push({type:'message',id:'proposal-result-2',message:{role:'toolResult',toolCallId:'propose-remote-2',toolName:'design_intent_propose',details:rejected.details}});
- const rejectedOutcome=await rejection.respond('Reject','This would break existing clients.');assert.equal(rejectedOutcome.ok,true);
- const afterReject=JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8'));assert.equal(afterReject.records[0].status,'accepted');assert.equal(afterReject.records[1].status,'rejected');assert.deepEqual(afterReject.records[1].supersedes,[]);assert.match(afterReject.records[1].review.note,/This would break existing clients/);
+ const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;
+ const branch=[];const sessionManager={getSessionId:()=> 'approval-session',getLeafId:()=>branch.at(-1)?.id??'root',getBranch:()=>branch};
+ const proxy=proxyUI(request=>{assert.equal(request.method,'confirm');assert.match(request.message,/candidate=/);return{confirmed:true};});
+ const ctx={cwd,sessionManager,isProjectTrusted:()=>true,hasUI:true,waitForIdle:async()=>{},hasPendingMessages:()=>false,ui:proxy.ui};
+ const result=await pi.tools.get('design_intent_propose').execute('propose-1',{intent:'Preserve the API',kind:'invariant',title:'Stable interface',statement:'Keep the public interface stable',rationale:'Existing clients depend on it.'},undefined,undefined,ctx);
+ assert.equal(result.details.type,'design-intent.proposal.v1');assert.deepEqual(proxy.broker.snapshot().pending,[]);
+ branch.push({type:'message',id:'proposal-result',message:{role:'toolResult',toolCallId:'propose-1',toolName:'design_intent_propose',details:result.details}});
+ await pi.commands.get('design-intent').handler(`accept ${result.details.proposalId}`,ctx);
+ const committed=JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8'));assert.equal(committed.records[0].status,'accepted');assert.equal(committed.records[0].review.note,'Approved by user through /design-intent accept');assert.equal(pi.appended.at(-1).customType,'design-intent.review.v1');
+ const rejected=await pi.tools.get('design_intent_propose').execute('propose-2',{intent:'Consider replacing the interface',kind:'alternative',title:'Replacement interface',statement:'Replace the public interface',rationale:'A proposed alternative.',supersedes:['DI-0001']},undefined,undefined,ctx);
+ branch.push({type:'message',id:'proposal-result-2',message:{role:'toolResult',toolCallId:'propose-2',toolName:'design_intent_propose',details:rejected.details}});
+ await pi.commands.get('design-intent').handler(`reject ${rejected.details.proposalId} This would break clients.`,ctx);
+ const afterReject=JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8'));assert.equal(afterReject.records[0].status,'accepted');assert.equal(afterReject.records[1].status,'rejected');assert.deepEqual(afterReject.records[1].supersedes,[]);
+ const stale=await pi.tools.get('design_intent_propose').execute('propose-3',{intent:'Consider another rule',kind:'requirement',title:'New rule',statement:'Do something',rationale:'A candidate'},undefined,undefined,ctx);
+ branch.push({type:'message',id:'proposal-result-3',message:{role:'toolResult',toolCallId:'propose-3',toolName:'design_intent_propose',details:stale.details}});
+ proxy.restore();const changed=proxyUI(()=>{branch.push({type:'custom',id:'branch-changed'});return{confirmed:true};});
+ await pi.commands.get('design-intent').handler(`accept ${stale.details.proposalId}`,{...ctx,ui:changed.ui});
+ assert.equal((JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8'))).records.length,2);assert.match(changed.notices.at(-1).message,/branch changed/);changed.restore();
+});
+
+test('the sole DI approval path rechecks trust and reports receipt failure as committed',async()=>{
+ const cwd='/tmp/design-intent-ui-boundary-test';await mkdir(`${cwd}/.pi`,{recursive:true});await writeFile(`${cwd}/.pi/design-intent.json`,serializeStore(emptyStore()));
+ const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;let trusted=true;const branch=[];
+ const ctx={cwd,isProjectTrusted:()=>trusted,sessionManager:{getSessionId:()=> 'boundary-session',getLeafId:()=>branch.at(-1)?.id??'root',getBranch:()=>branch},hasUI:true,waitForIdle:async()=>{},hasPendingMessages:()=>false};
+ const propose=async id=>{const result=await pi.tools.get('design_intent_propose').execute(id,{intent:'Preserve behavior',kind:'requirement',title:id,statement:'Keep the API safe',rationale:'Compatibility matters'},undefined,undefined,ctx);branch.push({type:'message',id,message:{role:'toolResult',toolCallId:id,toolName:'design_intent_propose',details:result.details}});return result.details.proposalId;};
+ const first=await propose('untrusted');const revoked=proxyUI(()=>{trusted=false;return{confirmed:true};});
+ await pi.commands.get('design-intent').handler(`accept ${first}`,{...ctx,ui:revoked.ui});
+ assert.equal(JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8')).records.length,0);assert.match(revoked.notices.at(-1).message,/no longer trusted/);revoked.restore();
+ trusted=true;const second=await propose('receipt-failure');const approved=proxyUI(()=>({confirmed:true}));pi.appendEntry=()=>{throw new Error('disk full');};
+ await pi.commands.get('design-intent').handler(`accept ${second}`,{...ctx,ui:approved.ui});
+ assert.equal(JSON.parse(await readFile(`${cwd}/.pi/design-intent.json`,'utf8')).records.length,1);assert.equal(approved.notices.at(-1).type,'warning');assert.match(approved.notices.at(-1).message,/Project file was committed/);approved.restore();
 });
 
 test('design_intent_check bounds paths and reports denied, truncated, and stale evidence as unknown',async()=>{

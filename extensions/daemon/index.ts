@@ -5,6 +5,9 @@ import { readdirSync, readFileSync, readlinkSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import WebSocket from 'ws';
 import { getDaemonVersion } from './daemon/version.js';
+import { UIBroker } from './ui/broker.ts';
+import { installUIProxy } from './ui/adapter.ts';
+import { UI_VERSION } from './daemon/ui-protocol.js';
 
 const daemonPath = resolve(__dirname, 'daemon/main.js');
 const daemonVersion = getDaemonVersion();
@@ -71,20 +74,24 @@ async function stopStaleDaemon() {
   throw new Error(`Outdated Pi Remote daemon process ${pid} did not stop`);
 }
 
-async function ensureDaemon() {
+async function ensureDaemon(isCurrent: () => boolean) {
   const current = await daemonHealth();
+  if (!isCurrent()) return;
   if (current?.daemonVersion === daemonVersion) return;
   if (current?.ok) await stopStaleDaemon();
+  if (!isCurrent()) return;
   const child = spawn(process.execPath, [daemonPath], { detached: true, stdio: 'ignore', env: process.env });
   child.unref();
   for (let n = 0; n < 30; n++) {
     await sleep(250);
+    if (!isCurrent()) return;
     if ((await daemonHealth())?.daemonVersion === daemonVersion) return;
   }
   throw new Error('Pi Remote daemon did not become available');
 }
 
 export default function (pi: ExtensionAPI) {
+  pi.registerFlag('remote-ui-proxy', { type: 'boolean', default: true, description: 'Mirror supported local TUI dialogs to the remote session page (compatibility adapter)' });
   let socket: WebSocket | undefined;
   let stopped = false;
   let connectionGeneration = 0;
@@ -99,80 +106,23 @@ export default function (pi: ExtensionAPI) {
   let streamCounter = 0;
   let currentStreamId: string | undefined;
   const pendingRemoteMessages: Array<{ requestId: string; text: string }> = [];
-  const pendingApprovals = new Map<string, { request: any; delivered: boolean; cancelChoice?: string; generation: number; kind: "permission" | "design-intent" | "design-intent-read" | "rolling-context-checkpoint" }>();
-  const pendingCommandResults = new Map<string, Array<(result: string) => void>>();
+  let broker: UIBroker | undefined;
+  let restoreUI: (() => void) | undefined;
+  let registeredSocket: WebSocket | undefined;
 
-  pi.events.on('pi-remote:command-result', (result: any) => {
-    if (typeof result?.name !== 'string' || typeof result?.result !== 'string') return;
-    const waiters = pendingCommandResults.get(result.name);
-    const resolve = waiters?.shift();
-    if (resolve) resolve(result.result);
-    if (waiters && !waiters.length) pendingCommandResults.delete(result.name);
-  });
-
-  function waitForCommandResult(name: string, timeoutMs = 1500): Promise<string | undefined> {
-    return new Promise(resolve => {
-      const waiters = pendingCommandResults.get(name) || [];
-      const done = (result?: string) => {
-        clearTimeout(timer);
-        const index = waiters.indexOf(done as (result: string) => void);
-        if (index >= 0) waiters.splice(index, 1);
-        if (!waiters.length) pendingCommandResults.delete(name);
-        resolve(result);
-      };
-      const timer = setTimeout(() => done(), timeoutMs);
-      waiters.push(done as (result: string) => void);
-      pendingCommandResults.set(name, waiters);
-    });
+  function sendUI(frame: any) {
+    if (socket !== registeredSocket || socket?.readyState !== WebSocket.OPEN) return;
+    try { socket.send(JSON.stringify(frame)); } catch { /* keep the local prompt alive */ }
   }
 
-  function sendApprovalRequest(request: any, kind: "permission" | "design-intent" | "design-intent-read" | "rolling-context-checkpoint", publicFields: Record<string, unknown>) {
-    if (socket?.readyState !== WebSocket.OPEN || typeof request?.requestId !== 'string') { request?.onUnavailable?.(); return; }
-    pendingApprovals.set(request.requestId, { request, delivered: false, generation: connectionGeneration, kind });
-    try {
-      socket.send(JSON.stringify({ type: 'approval_request', requestId: request.requestId, kind, ...publicFields }));
-    } catch {
-      pendingApprovals.delete(request.requestId);
-      request.onUnavailable?.();
-    }
+  async function releaseUI() {
+    const closed = broker?.dispose(); restoreUI?.(); broker = undefined; restoreUI = undefined;
+    await closed;
   }
-
-  pi.events.on('pi-remote:approval-request', (request: any) => sendApprovalRequest(request, 'permission', {
-    toolName: request.toolName, intent: request.intent, reason: request.reason, behavior: request.behavior,
-  }));
-
-  pi.events.on('pi-remote:design-intent-approval-request', (request: any) => sendApprovalRequest(request, 'design-intent', {
-    proposalId: request.proposalId, proposalHash: request.proposalHash, storePath: request.storePath,
-    baseRevision: request.baseRevision, sourceHash: request.sourceHash, candidateHash: request.candidateHash,
-    statement: request.statement, rationale: request.rationale, effects: request.effects,
-    acceptDiff: request.acceptDiff, acceptUnavailable: request.acceptUnavailable,
-  }));
-
-  pi.events.on('pi-remote:design-intent-read-approval-request', (request: any) => sendApprovalRequest(request, 'design-intent-read', {
-    storePath: request.storePath, purpose: request.purpose, reason: request.reason,
-  }));
-
-  pi.events.on('pi-remote:rolling-context-checkpoint-approval-request', (request: any) => sendApprovalRequest(request, 'rolling-context-checkpoint', {
-    summary: request.summary, stateBytes: request.stateBytes,
-  }));
-
-  pi.events.on('pi-remote:approval-dismiss', (request: any) => {
-    if (typeof request?.requestId !== 'string') return;
-    const pending = pendingApprovals.get(request.requestId);
-    if (pending) { pendingApprovals.delete(request.requestId); pending.request.onUnavailable?.(); }
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'approval_dismiss', requestId: request.requestId }));
-  });
-
-  pi.events.on('pi-remote:approval-cancel', (response: any) => {
-    const pending = pendingApprovals.get(response?.requestId);
-    if (!pending || !['Allow once', 'Switch to auto', 'Deny'].includes(response?.choice)) return;
-    pending.cancelChoice = response.choice;
-    if (pending.delivered && socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: 'approval_cancel', requestId: response.requestId, choice: response.choice }));
-    }
-  });
 
   pi.on('session_start', async (_event, ctx) => {
+    await releaseUI();
+    registeredSocket = undefined;
     const generation = ++connectionGeneration;
     try { socket?.close(); } catch { /* ignore stale connection close */ }
     socket = undefined;
@@ -185,52 +135,38 @@ export default function (pi: ExtensionAPI) {
     instanceId = `${process.pid}-${randomUUID().slice(0, 8)}`;
     const activeModel = ctx.model;
     model = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
+    if (ctx.mode === 'tui' && ctx.hasUI && pi.getFlag('remote-ui-proxy') !== false) {
+      const next = new UIBroker(sendUI);
+      try { restoreUI = installUIProxy(ctx.ui, next); broker = next; }
+      catch (error) { next.dispose(); ctx.ui.notify(`Remote UI proxy unavailable; local UI unchanged: ${String(error)}`, 'warning'); }
+    }
     void connect(ctx, generation);
   });
 
   async function connect(ctx: any, generation: number) {
     while (!stopped && generation === connectionGeneration) {
       try {
-        await ensureDaemon();
+        await ensureDaemon(() => !stopped && generation === connectionGeneration);
         if (stopped || generation !== connectionGeneration) break;
         await new Promise<void>((resolve, reject) => {
           const ws = new WebSocket(wsUrl); socket = ws;
           let registered = false;
           ws.on('open', () => {
             if (generation !== connectionGeneration) { ws.close(); return; }
-            ws.send(JSON.stringify({ type: 'register', instance: { instanceId, sessionId, pid: process.pid, cwd, model, title: undefined, startedAt: Date.now(), sessionFile, leafId: ctx.sessionManager.getLeafId(), metadata: collectMetadata(ctx), commands: [...remoteCommands, ...pi.getCommands().map(({ name, description, source }) => ({ name, description, source }))] } }));
+            ws.send(JSON.stringify({ type: 'register', instance: { instanceId, sessionId, pid: process.pid, cwd, model, title: undefined, startedAt: Date.now(), sessionFile, leafId: ctx.sessionManager.getLeafId(), metadata: collectMetadata(ctx), uiVersion: UI_VERSION, commands: [...remoteCommands, ...pi.getCommands().map(({ name, description, source }) => ({ name, description, source }))] } }));
           });
           ws.on('message', async data => {
             if (generation !== connectionGeneration) return;
             let msg: any; try { msg = JSON.parse(data.toString()); } catch { return; }
+            if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
             if (msg.type === 'registered') {
               registered = true; retry = 1000;
+              if (msg.uiVersion === UI_VERSION) { registeredSocket = ws; if (broker) sendUI(broker.snapshot()); }
+              else if (broker) ctx.ui.notify('Remote UI proxy unavailable: incompatible UI protocol; local dialogs are unchanged.', 'warning');
               heartbeat = setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'heartbeat', timestamp: Date.now() })); }, 10000);
-            } else if (msg.type === 'approval_delivery') {
-              const pending = pendingApprovals.get(msg.requestId);
-              if (!pending) return;
-              if (msg.delivered) {
-                pending.delivered = true; pending.request.onDelivered?.();
-                if (pending.cancelChoice) ws.send(JSON.stringify({ type: 'approval_cancel', requestId: msg.requestId, choice: pending.cancelChoice }));
-              }
-              else { pendingApprovals.delete(msg.requestId); pending.request.onUnavailable?.(); }
-            } else if (msg.type === 'approval_choice') {
-              const pending = pendingApprovals.get(msg.requestId);
-              if (!pending) return;
-              pendingApprovals.delete(msg.requestId);
-              if (pending.kind !== 'permission') {
-                Promise.resolve(pending.request.respond?.(msg.choice, msg.reason)).then(outcome => {
-                  const value = outcome && typeof outcome === 'object' ? outcome : { ok: true, message: 'Approval completed' };
-                  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'approval_outcome', requestId: msg.requestId, outcome: value }));
-                }).catch(error => {
-                  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'approval_outcome', requestId: msg.requestId, outcome: { ok: false, message: error instanceof Error ? error.message : String(error) } }));
-                });
-              } else pending.request.respond?.(msg.choice);
-            } else if (msg.type === 'approval_cancel_error') {
-              const pending = pendingApprovals.get(msg.requestId);
-              if (!pending) return;
-              pendingApprovals.delete(msg.requestId);
-              pending.request.respond?.(pending.cancelChoice || 'Deny');
+            } else if (msg.type === 'ui_response') {
+              const accepted = msg.version === UI_VERSION && ws === registeredSocket && broker?.respond(msg.uiEpoch, msg.response) === true;
+              ws.send(JSON.stringify({ type: 'ui_response_ack', version: UI_VERSION, uiEpoch: msg.uiEpoch, id: msg.response?.id, accepted }));
             } else if (msg.type === 'get_commands') {
               const commands = [...remoteCommands, ...pi.getCommands().map(({ name, description, source }) => ({ name, description, source }))];
               ws.send(JSON.stringify({ type: 'commands', requestId: msg.requestId, commands }));
@@ -264,17 +200,10 @@ export default function (pi: ExtensionAPI) {
               const available = pi.getCommands().some(command => command.name === msg.name);
               if (!available) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Command is not available in this Pi session' })); return; }
               try {
-                const commandResult = msg.name === 'permissions' ? waitForCommandResult(msg.name) : undefined;
+                // A dispatch acknowledgement is not command completion. Any subsequent
+                // dialog/notification is mirrored from the same local UI, without plugin hooks.
                 await pi.sendUserMessage(`/${msg.name}${args ? ` ${args}` : ''}`, { deliverAs: 'steer', expandPromptTemplates: true });
-                if (msg.name === 'fast') {
-                  await sleep(100);
-                  sendMetadata(ctx);
-                  const fastMode = fastModeState();
-                  ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: fastMode === undefined ? 'Fast mode status is unavailable for this session' : `Fast mode is ${fastMode ? 'on' : 'off'}` }));
-                } else {
-                  const result = commandResult ? await commandResult : undefined;
-                  ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: result || `Dispatched /${msg.name} to Pi; this command did not return text` }));
-                }
+                ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: `Dispatched /${msg.name} to Pi` }));
               }
               catch (error) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: String(error) })); }
             }
@@ -283,12 +212,7 @@ export default function (pi: ExtensionAPI) {
           ws.on('close', () => {
             if (socket === ws) socket = undefined;
             if (generation === connectionGeneration) { if (heartbeat) clearInterval(heartbeat); heartbeat = undefined; }
-            for (const [requestId, pending] of pendingApprovals) {
-              if (pending.generation !== generation) continue;
-              pendingApprovals.delete(requestId);
-              if (pending.delivered && pending.kind === 'permission') pending.request.respond?.('Deny');
-              else pending.request.onUnavailable?.();
-            }
+            if (registeredSocket === ws) registeredSocket = undefined;
             if (registered) reject(new Error('daemon disconnected')); else reject(new Error('connection closed'));
           });
         });
@@ -299,12 +223,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   function sendStatus(status: string) { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'status', status })); }
-  function fastModeState(): boolean | undefined {
-    if (!pi.getCommands().some(command => command.name === 'fast')) return undefined;
-    const segments = (globalThis as any)[Symbol.for('@pi-plugins/statusline-registry')];
-    if (!(segments instanceof Map)) return undefined;
-    return segments.get('fast-mode')?.text === '[fast mode]';
-  }
   function collectMetadata(ctx: any) {
     const totals = { input: 0, cacheRead: 0, output: 0 };
     for (const entry of ctx.sessionManager.getBranch()) {
@@ -315,7 +233,7 @@ export default function (pi: ExtensionAPI) {
       totals.output += Number(usage.output) || 0;
     }
     const activeModel = ctx.model;
-    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), fastMode: fastModeState(), contextUsage: ctx.getContextUsage(), totals };
+    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), fastMode: undefined, contextUsage: ctx.getContextUsage(), totals };
   }
   function sendMetadata(ctx: any) {
     if (socket?.readyState === WebSocket.OPEN) sendEvent({ type: 'metadata', metadata: collectMetadata(ctx) });
@@ -367,13 +285,19 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on('thinking_level_select', (_event, ctx) => sendMetadata(ctx));
   pi.on('model_select', (_event, ctx) => sendMetadata(ctx));
-  pi.on('input', (event, ctx) => {
-    if (/^\/fast(?:\s|$)/i.test(event.text.trim())) setTimeout(() => sendMetadata(ctx), 100);
-  });
   pi.on('tool_execution_start', event => sendEvent({ type: 'tool_execution_start', ...event }));
   pi.on('tool_execution_update', event => sendEvent({ type: 'tool_execution_update', ...event }));
   pi.on('tool_execution_end', event => sendEvent({ type: 'tool_execution_end', ...event }));
+  pi.on('session_tree', async (_event, ctx) => {
+    await releaseUI();
+    if (ctx.mode === 'tui' && ctx.hasUI && pi.getFlag('remote-ui-proxy') !== false) {
+      const next = new UIBroker(sendUI);
+      try { restoreUI = installUIProxy(ctx.ui, next); broker = next; sendUI(next.snapshot()); }
+      catch { next.dispose(); ctx.ui.notify('Remote UI proxy unavailable after tree navigation; local UI unchanged.', 'warning'); }
+    }
+  });
   pi.on('session_shutdown', async () => {
+    await releaseUI(); registeredSocket = undefined;
     stopped = true; connectionGeneration++; if (heartbeat) clearInterval(heartbeat); heartbeat = undefined;
     try { socket?.close(); } catch { /* ignored */ }
     socket = undefined;
