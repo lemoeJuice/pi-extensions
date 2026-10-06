@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { retryAssistantCall } from "@earendil-works/pi-ai";
 import { createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
