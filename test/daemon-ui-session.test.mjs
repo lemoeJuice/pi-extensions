@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import net from 'node:net';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
@@ -26,6 +26,13 @@ function inbox(socket) {
     });
   };
 }
+
+test('session composer places mirrored extension status above input and aligns it right', async () => {
+  const html=await readFile('extensions/daemon/web/index.html','utf8');
+  assert.match(html,/<form class="composer"[^>]*><div id="ui-status"[^>]*><\/div><div class="composer-inner">/);
+  assert.match(html,/#ui-status\{[^}]*text-align:right/);
+  assert.match(html,/status\.hidden=statusItems\.length===0/);
+});
 
 async function stop(child) {
   if (child.exitCode !== null) return;
@@ -69,6 +76,7 @@ test('real daemon extension decorates shared native UI and replays the same pend
   const sid = host.ctx.sessionManager.getSessionId();
   await host.runner.emit({ type: 'session_start', reason: 'new' });
   assert.deepEqual(errors, []);
+  host.ctx.ui.setStatus('permissions','Permission mode: manual · default');
   // No plugin/approval event: an arbitrary caller uses the original local UI API.
   const confirmed = host.ctx.ui.confirm('Third-party confirmation', 'This is the full local message');
   const browser = new WebSocket(`ws://127.0.0.1:${port}/ws/sessions/${sid}`); sockets.push(browser);
@@ -77,6 +85,7 @@ test('real daemon extension decorates shared native UI and replays the same pend
     throw new Error(`${error.message}: ${JSON.stringify(host.mode.statuses)}; ${JSON.stringify(errors)}`);
   });
   assert.equal(snapshot.pending[0].message, 'This is the full local message');
+  assert.equal(snapshot.status.permissions,'Permission mode: manual · default');
   assert.ok(host.mode.extensionSelector);
   const response = await fetch(`http://127.0.0.1:${port}/api/sessions/${sid}/ui/responses`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
