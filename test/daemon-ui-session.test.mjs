@@ -41,6 +41,10 @@ async function stop(child) {
 
 test('real daemon extension decorates shared native UI and replays the same pending prompt after daemon restart', async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'pi-ui-proxy-session-'));
+  const statuslineKey = Symbol.for('@pi-plugins/statusline-registry');
+  const originalStatuslineRegistry = globalThis[statuslineKey];
+  const statuslineRegistry = new Map([['fast-mode', { text: '[fast mode]', align: 'right' }]]);
+  globalThis[statuslineKey] = statuslineRegistry;
   const listener = net.createServer(); listener.listen(0, '127.0.0.1'); await once(listener, 'listening');
   const port = listener.address().port; await new Promise(resolve => listener.close(resolve));
   const children = [], sockets = [];
@@ -53,6 +57,7 @@ test('real daemon extension decorates shared native UI and replays the same pend
     for (const child of children) await stop(child);
     if (oldEnv.host === undefined) delete process.env.PI_REMOTE_HOST; else process.env.PI_REMOTE_HOST = oldEnv.host;
     if (oldEnv.port === undefined) delete process.env.PI_REMOTE_PORT; else process.env.PI_REMOTE_PORT = oldEnv.port;
+    if (originalStatuslineRegistry === undefined) delete globalThis[statuslineKey]; else globalThis[statuslineKey] = originalStatuslineRegistry;
     await rm(root, { recursive: true, force: true });
   });
   async function startDaemon() {
@@ -87,6 +92,16 @@ test('real daemon extension decorates shared native UI and replays the same pend
   assert.equal(snapshot.pending[0].message, 'This is the full local message');
   assert.equal(snapshot.status.permissions,'Permission mode: manual · default');
   assert.ok(host.mode.extensionSelector);
+  const sessionState = await (await fetch(`http://127.0.0.1:${port}/api/sessions/${sid}`)).json();
+  assert.equal(sessionState.metadata.fastMode, true);
+  statuslineRegistry.delete('fast-mode');
+  host.ctx.ui.notify('Fast status changed', 'info');
+  const inactiveMetadata = await next(frame => frame.type === 'event' && frame.event?.type === 'metadata' && frame.event.metadata?.fastMode === undefined);
+  assert.equal(inactiveMetadata.event.metadata.fastMode, undefined);
+  statuslineRegistry.set('fast-mode', { text: '[fast mode]', align: 'right' });
+  host.ctx.ui.notify('Fast status changed', 'info');
+  const activeMetadata = await next(frame => frame.type === 'event' && frame.event?.type === 'metadata' && frame.event.metadata?.fastMode === true);
+  assert.equal(activeMetadata.event.metadata.fastMode, true);
   const response = await fetch(`http://127.0.0.1:${port}/api/sessions/${sid}/ui/responses`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ version: 1, uiEpoch: snapshot.uiEpoch, response: { id: snapshot.pending[0].id, confirmed: true } }),

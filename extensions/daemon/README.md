@@ -102,8 +102,9 @@ separate delivery checks; this is not a claim of universal TUI mirroring.
 
 Generic `notify/setStatus` calls are mirrored. Notifications are transient, not a
 durable business result log. The proxy does not infer plugin status or command
-completion from text. Generic status values appear right-aligned above the session
-composer input. Fast-mode metadata is unknown without a public host source.
+completion from notification text. Generic status values appear right-aligned above the session
+composer input. Fast mode is shown only when the neutral shared statusline registry exposes its
+visible `[fast mode]` segment; a missing segment remains unknown rather than being reported as off.
 
 The session page retries a missing session while Pi reconnects to the daemon.
 Provider and tool errors are shown in the conversation. Commands are dispatched back through Pi's

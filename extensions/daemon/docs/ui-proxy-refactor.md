@@ -44,7 +44,7 @@ Permissions / Design Intent / Rolling Context / 任意扩展
 | `extensions/permissions/index.ts` | 本地选择与远程回调竞争；本地响应可能等 daemon 回送；已送达请求断线时 daemon 调用 `respond('Deny')` | 远程故障影响本地决定；移除插件侧远程竞争，只等待原 `ctx.ui.select` |
 | `extensions/design-intent/index.ts` | propose 自动创建网页专用审查，独立 `applyRemoteReview`；本地 accept/reject 使用另一条 confirm 流程 | 网页与 TUI 不是同一交互，业务执行路径重复；删除网页专用执行入口，代理本地命令的确认流程 |
 | `extensions/design-intent/index.ts`、`extensions/rolling-context/index.ts` | 读取授权/checkpoint 各复制一套可用性 Promise、prompt queue、远程响应及取消 | 不应该由插件维护 transport 可用性；恢复普通 `ctx.ui` 调用 |
-| `extensions/daemon/index.ts` | `permissions` 命令专属结果 FIFO；读取 fast-mode 全局 statusline Map | 插件知识越过 UI 边界；命令通知走通用 notify/status；无宿主公共数据时保留 unknown |
+| `extensions/daemon/index.ts` | `permissions` 命令专属结果 FIFO；读取 Fast 私有启用状态 Map | 插件知识越过 UI 边界；命令通知走通用 notify/status；普通状态从中立可观察投影读取 |
 | daemon 注册与断线 | 断线清除审批副本；重连没有重新同步仍存在的本地弹窗 | 副本被误当作请求本体；应从 Pi UI broker 重新获取 pending snapshot |
 
 已有可保留部分：session/instance registry、网络连接、事件流、只读历史、消息输入、
@@ -218,7 +218,8 @@ Pi 仍活着，daemon 的内存缓存丢失不应影响等待状态。
 
 ### Phase 4 — 删除其余业务探测并做整体 smoke（P1/P2）
 
-删除 permissions 结果 FIFO、fast 全局 Map 探测（无法从公共 UI 得到时显示 unknown）。
+删除 permissions 结果 FIFO 和 Fast 私有状态探测。Fast mode 只通过中立共享 statusline registry
+中当前可见的 `[fast mode]` segment 观察；segment 缺失时保持 unknown，不推断为 off。
 测试真实 Pi：页面在首页/其他 session 时产生提示，晚进入、刷新、daemon 重启、
 离线本地回答、并发本地/网页回答、session/tree/reload、Pi 退出及多实例冲突。
 

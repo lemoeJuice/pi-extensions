@@ -4,7 +4,7 @@ import { UIBroker } from './broker.ts';
 /** Isolated compatibility decorator for Pi's mutable shared TUI context.
  * Not a public host interceptor. RPC/headless contexts are deliberately untouched.
  */
-export function installUIProxy(ui: ExtensionUIContext, broker: UIBroker): () => void {
+export function installUIProxy(ui: ExtensionUIContext, broker: UIBroker, afterNotify?: () => void): () => void {
   const originals = new Map<string, { descriptor: PropertyDescriptor; replacement: Function }>();
   const target = ui as any;
   const wrap = (key: string, factory: (original: Function) => Function) => {
@@ -32,7 +32,11 @@ export function installUIProxy(ui: ExtensionUIContext, broker: UIBroker): () => 
     // Native editor has no AbortSignal/dismiss handle; remote completion is unsafe.
     wrap('editor', original => (title: string, prefill: string) => broker.localOnly('editor', title, () => original(title, prefill)));
     wrap('custom', original => (...args: any[]) => broker.localOnly('custom', 'Custom terminal UI — complete locally', () => original(...args)));
-    wrap('notify', original => (message: string, type?: string) => { original(message, type); broker.notify(message, type); });
+    wrap('notify', original => (message: string, type?: string) => {
+      original(message, type);
+      broker.notify(message, type);
+      try { afterNotify?.(); } catch { /* status inspection must not affect the local notification */ }
+    });
     wrap('setStatus', original => (key: string, text?: string) => { original(key, text); broker.setStatus(key, text); });
   } catch (error) { restore(); throw error; }
   return restore;

@@ -22,6 +22,18 @@ const remoteCommands = [
   { name: 'model', description: 'Switch model using provider/model-id', source: 'remote', requiresArgs: true },
   { name: 'name', description: 'Set the session display name', source: 'remote', requiresArgs: true },
 ];
+const STATUSLINE_REGISTRY = Symbol.for('@pi-plugins/statusline-registry');
+const FAST_MODE_SEGMENT_TEXT = '[fast mode]';
+
+/** Observe the same shared statusline projection rendered by Pi; absence is unknown, not off. */
+function inspectFastModeSegment(): true | undefined {
+  const segments = (globalThis as any)[STATUSLINE_REGISTRY];
+  if (!(segments instanceof Map)) return undefined;
+  for (const segment of segments.values()) {
+    if (typeof segment?.text === 'string' && segment.text.trim().toLowerCase() === FAST_MODE_SEGMENT_TEXT) return true;
+  }
+  return undefined;
+}
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -137,7 +149,7 @@ export default function (pi: ExtensionAPI) {
     model = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
     if (ctx.mode === 'tui' && ctx.hasUI && pi.getFlag('remote-ui-proxy') !== false) {
       const next = new UIBroker(sendUI);
-      try { restoreUI = installUIProxy(ctx.ui, next); broker = next; }
+      try { restoreUI = installUIProxy(ctx.ui, next, () => sendMetadata(ctx)); broker = next; }
       catch (error) { next.dispose(); ctx.ui.notify(`Remote UI proxy unavailable; local UI unchanged: ${String(error)}`, 'warning'); }
     }
     void connect(ctx, generation);
@@ -233,7 +245,7 @@ export default function (pi: ExtensionAPI) {
       totals.output += Number(usage.output) || 0;
     }
     const activeModel = ctx.model;
-    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), fastMode: undefined, contextUsage: ctx.getContextUsage(), totals };
+    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), fastMode: inspectFastModeSegment(), contextUsage: ctx.getContextUsage(), totals };
   }
   function sendMetadata(ctx: any) {
     if (socket?.readyState === WebSocket.OPEN) sendEvent({ type: 'metadata', metadata: collectMetadata(ctx) });
@@ -242,7 +254,7 @@ export default function (pi: ExtensionAPI) {
     if (socket?.readyState !== WebSocket.OPEN) return;
     try { socket.send(JSON.stringify({ type: 'event', seq: ++seq, timestamp: Date.now(), event })); } catch { /* event serialization must not affect Pi */ }
   }
-  pi.on('agent_start', () => { sendStatus('running'); sendEvent({ type: 'agent_start' }); });
+  pi.on('agent_start', (_event, ctx) => { sendStatus('running'); sendEvent({ type: 'agent_start' }); sendMetadata(ctx); });
   pi.on('agent_end', (_event, ctx) => { sendStatus('waiting'); sendEvent({ type: 'agent_end', entryId: ctx.sessionManager.getLeafId() }); sendMetadata(ctx); });
   pi.on('message_update', event => {
     const update = event.assistantMessageEvent;
@@ -284,7 +296,8 @@ export default function (pi: ExtensionAPI) {
     if (message.role === 'assistant') currentStreamId = undefined;
   });
   pi.on('thinking_level_select', (_event, ctx) => sendMetadata(ctx));
-  pi.on('model_select', (_event, ctx) => sendMetadata(ctx));
+  // Run after all model_select observers have refreshed their inspectable status projections.
+  pi.on('model_select', (_event, ctx) => { setTimeout(() => sendMetadata(ctx), 0); });
   pi.on('tool_execution_start', event => sendEvent({ type: 'tool_execution_start', ...event }));
   pi.on('tool_execution_update', event => sendEvent({ type: 'tool_execution_update', ...event }));
   pi.on('tool_execution_end', event => sendEvent({ type: 'tool_execution_end', ...event }));
@@ -292,7 +305,7 @@ export default function (pi: ExtensionAPI) {
     await releaseUI();
     if (ctx.mode === 'tui' && ctx.hasUI && pi.getFlag('remote-ui-proxy') !== false) {
       const next = new UIBroker(sendUI);
-      try { restoreUI = installUIProxy(ctx.ui, next); broker = next; sendUI(next.snapshot()); }
+      try { restoreUI = installUIProxy(ctx.ui, next, () => sendMetadata(ctx)); broker = next; sendUI(next.snapshot()); }
       catch { next.dispose(); ctx.ui.notify('Remote UI proxy unavailable after tree navigation; local UI unchanged.', 'warning'); }
     }
   });
