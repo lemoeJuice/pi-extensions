@@ -1,6 +1,5 @@
 import type { ExtensionAPI, SessionBoundaryDraft, SessionEntry, ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { checkOptionalToolContract, DESIGN_INTENT_READ_CONTRACT } from "../shared/contracts.ts";
 import { analyzeGroups, boundMemory, effectiveTarget, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, serializedStateBytes, MAX_STATE_BYTES, TELEMETRY_TYPE, contextComposition, ownedEdits, ownedCheckpoint, recallProjection, turnClock, type PlanMetrics, type RollingConfig } from "./lib.ts";
 
 const NoteParams=Type.Object({intent:Type.String({minLength:1}),kind:Type.Union([Type.Literal("plan"),Type.Literal("task-decision"),Type.Literal("focus"),Type.Literal("next-step")]),text:Type.String({minLength:1,maxLength:2000}),replaces:Type.Optional(Type.Array(Type.String(),{maxItems:8})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:12}))},{additionalProperties:false});
@@ -30,14 +29,6 @@ function parseConfig(pi:ExtensionAPI):RollingConfig {
 }
 
 export default function rollingContext(pi:ExtensionAPI) {
-  // getAllTools is a runtime action, unavailable while extension factories load.
-  // Recheck at mutation boundaries too: Pi reports session_start errors but continues.
-  const validateContracts=()=>{
-    try{
-      checkOptionalToolContract(pi,"rolling-context","design_intent_query",DESIGN_INTENT_READ_CONTRACT);
-      checkOptionalToolContract(pi,"rolling-context","design_intent_get",DESIGN_INTENT_READ_CONTRACT);
-    }catch(error){lastStatus=`Rolling Context disabled: ${error instanceof Error?error.message:String(error)}`;throw error;}
-  };
   pi.registerFlag("rolling-context-mode",{type:"string",default:"observe",description:"Rolling Context mode: observe, on, or off"});
   pi.registerFlag("rolling-context-target",{type:"string",default:"32768",description:"Target context token estimate"});
   pi.registerFlag("rolling-context-reserve",{type:"string",default:"16384",description:"Conservative output reserve in tokens"});
@@ -160,10 +151,9 @@ export default function rollingContext(pi:ExtensionAPI) {
     return true;
   };
   const restoreMode=(ctx:any)=>{mode=config.mode;const entry=[...ctx.sessionManager.getBranch()].reverse().find((e:SessionEntry)=>e.type==="custom"&&e.customType==="rolling-context.config.v1");const saved=(entry as any)?.data?.mode;if(saved==="on"||saved==="off"||saved==="observe")mode=saved;};
-  pi.on("session_start",(_event,ctx)=>{validateContracts();restoreMode(ctx);const state=rebuildState(ctx);lastStatus=`mode=${mode}; items=${state.snapshot.items.length}; diagnostics=${state.diagnostics.length}`;});
+  pi.on("session_start",(_event,ctx)=>{restoreMode(ctx);const state=rebuildState(ctx);lastStatus=`mode=${mode}; items=${state.snapshot.items.length}; diagnostics=${state.diagnostics.length}`;});
   pi.on("session_tree",(_event,ctx)=>{restoreMode(ctx);const state=rebuildState(ctx);lastStatus=`mode=${mode}; branch=${ctx.sessionManager.getLeafId()??"empty"}; items=${state.snapshot.items.length}`;});
   pi.on("turn_end",async(event,ctx)=>{
-    validateContracts();
     const state=rebuildState(ctx);
     const projection=event.context.contextEntries;
     const tokens=estimateProjection(projection);
@@ -218,7 +208,6 @@ export default function rollingContext(pi:ExtensionAPI) {
   });
   pi.on("session_before_compact",async(event,ctx)=>{
     const explicit=!!manualCheckpoint;
-    try{validateContracts();}catch(error){lastStatus=`Rolling Context disabled: ${error instanceof Error?error.message:String(error)}`;ctx.ui.notify(lastStatus,"error");if(explicit){manualCheckpoint=undefined;return {cancel:true};}return;}
     if(explicit&&(event.reason!=="manual"||ctx.sessionManager.getSessionId()!==manualCheckpoint!.sessionId||ctx.sessionManager.getLeafId()!==manualCheckpoint!.leafId)){
       ctx.ui.notify("Rolling checkpoint cancelled because the session branch changed before compaction.","warning");return {cancel:true};
     }
@@ -270,7 +259,6 @@ export default function rollingContext(pi:ExtensionAPI) {
     if(rest.length&&(verb!=="pin"&&verb!=="unpin"||rest.length!==1)){ctx.ui.notify(commandHelp(),"warning");return;}
     if(verb==="status"||!verb){const state=rebuildState(ctx);ctx.ui.notify(`${lastStatus}\nmode=${mode}; focus=${state.snapshot.focus.taskId||"none"}; next=${state.snapshot.focus.nextSteps.length}; intentRefs=${state.snapshot.intentRefs.length}`,"info");return;}
     if(verb==="inspect"){const state=rebuildState(ctx);const items=state.snapshot.items.map(item=>`- ${item.id} · ${item.kind} · ${item.status}${item.pinned?" · pinned":""}: ${item.text.slice(0,120)}`);ctx.ui.notify(`${renderCheckpoint(state.snapshot)}\n\n当前分支条目（ITEM_ID）：\n${items.join("\n")||"- 无"}`,"info");return;}
-    if(["on","observe","pin","unpin","checkpoint"].includes(verb))validateContracts();
     if(verb==="observe"||verb==="on"||verb==="off"){mode=verb;pi.appendEntry("rolling-context.config.v1",{mode});ctx.ui.notify(`Rolling Context mode: ${mode}. Existing edits/checkpoints are unchanged.`,"info");return;}
     if(verb==="pin"||verb==="unpin"){
       const id=rest[0];if(!id){ctx.ui.notify(`Usage: /rolling-context ${verb} ITEM_ID\n先用 /rolling-context inspect 查看条目 ID。`,"warning");return;}
@@ -287,7 +275,6 @@ export default function rollingContext(pi:ExtensionAPI) {
       if(!ctx.hasUI){ctx.ui.notify("Manual checkpoint requires a UI.","error");return;}
       const ok=await ctx.ui.confirm("Rolling Context checkpoint",`Create a checkpoint from current validated task state?\n\n${summary.slice(0,3000)}`);
       if(!ok)return;
-      validateContracts();
       if(ctx.sessionManager.getSessionId()!==sessionId||ctx.sessionManager.getLeafId()!==leafId||ctx.hasPendingMessages()){ctx.ui.notify("Checkpoint skipped: session branch changed or new messages arrived while approval was pending.","warning");return;}
       manualCheckpoint={sessionId,leafId};
       ctx.compact({customInstructions:"Use exactly the Rolling Context state supplied by the extension as the continuity summary. Do not add or infer project Design Intent. Preserve user instructions, task-local execution decisions, evidence freshness and next steps.",onComplete:()=>{manualCheckpoint=undefined;ctx.ui.notify("Rolling Context checkpoint completed.","info");},onError:error=>{manualCheckpoint=undefined;ctx.ui.notify(`Checkpoint failed: ${error.message}`,"error");}});

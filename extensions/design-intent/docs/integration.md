@@ -11,7 +11,7 @@ Design Intent 检查是否违背已批准意图
 ```
 
 - **单一来源**：Design Intent 的项目文件维护长期真相；Rolling Context 只缓存相关 ID、版本和短投影，不复制演化关系或批准状态库。
-- **低耦合**：使用 `design_intent_query/get/check` 的普通工具结果及标记过的入口投影；不共享内部模块、数据库或依赖事件总线。查询/展开由 agent 调用，Rolling Context 不直接执行另一插件的内部逻辑。
+- **低耦合**：Rolling Context 只检查 session history 中 `design-intent.projection.v1` 的 payload 和必要来源字段，不校验生产工具的 contract marker，也不依赖 Design Intent 私有模块。查询/展开由 agent 调用；projection 可来自兼容工具结果或入口投影。
 - **检查点**：分开显示「相关 Design Intent」和「当前任务执行决策」。源版本不明/已变时重新 query；刷新未完成则旧投影标为历史/待核验，不称为当前真相。
 - **禁止自动晋升**：`context_note`、task-decision、代码修改和测试结果都不能覆盖/supersede intent；变更必须另提案并由用户批准。
 - **检查结果只是证据**：违背意图时修复实现或请求修改 intent；报告不更新设计，也不把“未发现违背”当完整证明。

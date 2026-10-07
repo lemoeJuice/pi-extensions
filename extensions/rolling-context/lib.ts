@@ -242,10 +242,19 @@ function capsuleSafe(group:Group):boolean {
     return false;
   });
 }
+function isReadyIntentProjection(value:unknown):value is {type:"design-intent.projection.v1";availability:"ready";storePath:string;sourceHash:string;storeRevision:number;items:Array<{id:string;statement?:string}>} {
+  if(!value||typeof value!=="object")return false;
+  const projection=value as any;
+  return projection.type==="design-intent.projection.v1"&&projection.availability==="ready"&&
+    typeof projection.storePath==="string"&&projection.storePath.length>0&&
+    typeof projection.sourceHash==="string"&&projection.sourceHash.length>0&&
+    Number.isSafeInteger(projection.storeRevision)&&projection.storeRevision>=0&&Array.isArray(projection.items)&&
+    projection.items.every((item:any)=>!!item&&typeof item.id==="string"&&!!item.id.trim()&&(item.statement===undefined||typeof item.statement==="string"));
+}
 function checkpointSafe(group:Group):boolean {
   return capsuleSafe(group)||group.complete&&group.consumed&&group.results.every(r=>!r.message.isError&&(
     r.message.toolName==="context_note"&&(r.message.details as any)?.type===NOTE_TYPE||
-    ["design_intent_query","design_intent_get"].includes(r.message.toolName)&&(r.message.details as any)?.projection?.availability==="ready"));
+    isReadyIntentProjection((r.message.details as any)?.projection)));
 }
 export function analyzeGroups(entries:ProjectedSessionEntry[],snapshot:MemorySnapshot):Array<{assistantId:string;resultIds:string[];reasons:string[]}>{
   const all=groups(entries),recent=new Set(all.filter(group=>group.complete).slice(-3).map(group=>group.assistantId));
@@ -314,12 +323,12 @@ export function planTurn(args:{entries:ProjectedSessionEntry[];branch:SessionEnt
     for(const message of projected.messages){
       const projection=foreignTargets.has(projected.sourceEntry.id)?undefined:message.role==="custom"&&message.customType==="design-intent.projection.v1"
         ? message.details as any
-        : message.role==="toolResult"&&["design_intent_query","design_intent_get"].includes(message.toolName)
+        : message.role==="toolResult"
           ? (message.details as any)?.projection
           : undefined;
-      if(projection?.type!=="design-intent.projection.v1"||projection.availability!=="ready"||typeof projection.storePath!=="string"||typeof projection.sourceHash!=="string"||!Number.isSafeInteger(projection.storeRevision))continue;
-      for(const item of Array.isArray(projection.items)?projection.items:[]){
-        if(typeof item?.id!=="string")continue;
+      if(!isReadyIntentProjection(projection))continue;
+      for(const item of projection.items){
+        if(!item||typeof item.id!=="string"||!item.id.trim())continue;
         const ref:IntentReference={storePath:projection.storePath,storeRevision:projection.storeRevision,sourceHash:projection.sourceHash,id:item.id,projection:typeof item.statement==="string"?item.statement.slice(0,600):undefined};
         const oldIndex=snapshot.intentRefs.findIndex(old=>old.id===ref.id&&old.storePath===ref.storePath);
         if(oldIndex<0)snapshot.intentRefs.push(ref);else snapshot.intentRefs[oldIndex]=ref;

@@ -2,8 +2,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { applyCodexPatch, parseCodexPatch } from "./lib/codex-apply-patch.ts";
-import { EDIT_PATCH_CONTRACT, markContract } from "../shared/contracts.ts";
+import { applyCodexPatch } from "./lib/codex-apply-patch.ts";
+import { parseCodexPatch } from "../shared/patch/codex.ts";
+import { consumeOutsideWorkingDirectoryGrant } from "../shared/mutation-authorization.ts";
 
 const EDIT_GUIDELINES = [
   "The edit tool requires exactly the intent and patch fields. patch must use Codex apply_patch syntax from *** Begin Patch through *** End Patch.",
@@ -107,20 +108,25 @@ function resultDiff(stats: ReturnType<typeof changeStats>[]): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  // This edit implementation supports file creation, so it owns the native write loadout decision.
+  pi.on("before_agent_start", () => {
+    pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "write"));
+  });
+
   pi.registerTool({
     name: "edit",
     label: "edit",
     description: "Use intent and patch only. patch must be a complete Codex apply_patch document (*** Begin Patch … *** End Patch); native edit's path/edits/oldText/newText arguments are not supported. Supports Add, Delete, Update, @@ context, End of File, and Move to.",
     promptSnippet: "Call edit with {intent, patch}; patch is Codex apply_patch syntax, not native path/edits",
     promptGuidelines: EDIT_GUIDELINES,
-    parameters: markContract(Type.Object({
+    parameters: Type.Object({
       intent: Type.String({ description: "One short phrase stating what this patch accomplishes.", minLength: 1 }),
       patch: Type.String({ description: "Required Codex apply_patch document, beginning with *** Begin Patch and ending with *** End Patch. Do not provide native path/edits/oldText/newText arguments." }),
-    }), EDIT_PATCH_CONTRACT),
+    }),
     async execute(_id, params: { intent: string; patch: string }, _signal, _onUpdate, ctx) {
       const intent = typeof params.intent === "string" ? params.intent.trim() : "";
       if (!intent) throw new Error("edit requires a non-empty intent; retry with one short phrase stating what the patch accomplishes.");
-      const allowOutside = (params as any).__allowOutsideWorkingDirectory === true;
+      const allowOutside = consumeOutsideWorkingDirectoryGrant(params, ctx.cwd, params.patch);
       return withFileMutationQueue(ctx.cwd, async () => {
         const changes = await applyCodexPatch(ctx.cwd, params.patch, allowOutside);
         const stats = changes.map(changeStats);

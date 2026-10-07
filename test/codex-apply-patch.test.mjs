@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyCodexPatch, parseCodexPatch, isPathWithinWorkingDirectory } from "../extensions/edit/lib/codex-apply-patch.ts";
+import { applyCodexPatch } from "../extensions/edit/lib/codex-apply-patch.ts";
+import { parseCodexPatch, isPathWithinWorkingDirectory } from "../extensions/shared/patch/codex.ts";
 
 async function withTempDir(fn) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-guardrails-patch-"));

@@ -3,7 +3,8 @@ import { retryAssistantCall } from "@earendil-works/pi-ai";
 import { createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { isPathWithinWorkingDirectory, patchPaths } from "../edit/lib/codex-apply-patch.ts";
+import { isPathWithinWorkingDirectory, patchPaths } from "../shared/patch/codex.ts";
+import { grantOutsideWorkingDirectory } from "../shared/mutation-authorization.ts";
 import { analyzeBashCommand } from "./lib/bash-policy.ts";
 import { MODE_ENTRY, PermissionModes, sessionIdentity, type PermissionMode, type ModeScope } from "./lib/mode-state.ts";
 
@@ -185,11 +186,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // The edit patch tool supports file creation; keep write out of the model loadout.
-  pi.on("before_agent_start", () => {
-    pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "write"));
-  });
-
   pi.on("tool_call", async (event, ctx) => {
     const input = event.input as Record<string, unknown>;
     if (["bash", "read", "edit"].includes(event.toolName) && (typeof input.intent !== "string" || !input.intent.trim())) {
@@ -327,7 +323,7 @@ export default function (pi: ExtensionAPI) {
 
     if (ctx.signal?.aborted || sessionIdentity(ctx).key !== reviewSession) return { block: true, reason: "Permission review cancelled or session changed; operation not executed" };
     if (mode === "auto" && modes.get(ctx).mode !== "auto") return { block: true, reason: "Automatic permission mode was revoked during review; operation not executed" };
-    if (outside.length && event.toolName === "edit") input.__allowOutsideWorkingDirectory = true;
+    if (outside.length && event.toolName === "edit") grantOutsideWorkingDirectory(input, ctx.cwd, String(input.patch ?? ""));
     return undefined;
   });
 }

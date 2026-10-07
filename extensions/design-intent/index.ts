@@ -1,15 +1,14 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { markContract, DESIGN_INTENT_PROJECTION_CONTRACT, DESIGN_INTENT_READ_CONTRACT } from "../shared/contracts.ts";
 import { findProject, loadStore, queryStore, deriveNeedsReview, makeProposal, parseDraft, rebuildProposals, buildCandidate, storeDiff, commitCandidate, serializeStore, sha, type IntentProjection, type IntentDraft, type ProjectIdentity, type LoadResult, type Proposal } from "./lib.ts";
 
-const QueryParams=markContract(Type.Object({intent:Type.String({minLength:1}),text:Type.Optional(Type.String({maxLength:300})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:16})),tags:Type.Optional(Type.Array(Type.String({maxLength:80}),{maxItems:16})),cursor:Type.Optional(Type.String({maxLength:2048})),limit:Type.Optional(Type.Number({minimum:1,maximum:50}))},{additionalProperties:false}),DESIGN_INTENT_READ_CONTRACT);
-const GetParams=markContract(Type.Object({intent:Type.String({minLength:1}),id:Type.String({pattern:"^DI-[0-9]{4,}$"})},{additionalProperties:false}),DESIGN_INTENT_READ_CONTRACT);
+const QueryParams=Type.Object({intent:Type.String({minLength:1}),text:Type.Optional(Type.String({maxLength:300})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:16})),tags:Type.Optional(Type.Array(Type.String({maxLength:80}),{maxItems:16})),cursor:Type.Optional(Type.String({maxLength:2048})),limit:Type.Optional(Type.Number({minimum:1,maximum:50}))},{additionalProperties:false});
+const GetParams=Type.Object({intent:Type.String({minLength:1}),id:Type.String({pattern:"^DI-[0-9]{4,}$"})},{additionalProperties:false});
 const DraftParams=Type.Object({intent:Type.String({minLength:1}),kind:Type.Union([Type.Literal("requirement"),Type.Literal("invariant"),Type.Literal("decision"),Type.Literal("alternative")]),title:Type.String({minLength:1,maxLength:200}),statement:Type.String({minLength:1,maxLength:8000}),rationale:Type.String({minLength:1,maxLength:8000}),scope:Type.Optional(Type.Object({paths:Type.Array(Type.String({maxLength:512}),{maxItems:32}),tags:Type.Array(Type.String({maxLength:80}),{maxItems:32})},{additionalProperties:false})),supersedes:Type.Optional(Type.Array(Type.String({pattern:"^DI-[0-9]{4,}$"}),{maxItems:64})),conflictsWith:Type.Optional(Type.Array(Type.String({pattern:"^DI-[0-9]{4,}$"}),{maxItems:64})),dependsOn:Type.Optional(Type.Array(Type.String({pattern:"^DI-[0-9]{4,}$"}),{maxItems:64})),sources:Type.Optional(Type.Array(Type.Object({kind:Type.Union([Type.Literal("user"),Type.Literal("document")]),ref:Type.String({minLength:1,maxLength:512})},{additionalProperties:false}),{maxItems:16}))},{additionalProperties:false});
 const CheckParams=Type.Object({intent:Type.String({minLength:1}),paths:Type.Array(Type.String({minLength:1,maxLength:256}),{minItems:1,maxItems:16}),intentIds:Type.Optional(Type.Array(Type.String({pattern:"^DI-[0-9]{4,}$"}),{maxItems:32}))},{additionalProperties:false});
 const ProjectionItemSchema=Type.Object({id:Type.String(),kind:Type.Union([Type.Literal("requirement"),Type.Literal("invariant"),Type.Literal("decision"),Type.Literal("alternative")]),status:Type.Union([Type.Literal("accepted"),Type.Literal("rejected"),Type.Literal("superseded")]),statement:Type.String(),rationale:Type.String(),needsReview:Type.Boolean(),mustExpand:Type.Boolean(),title:Type.Optional(Type.String()),scope:Type.Optional(Type.Object({paths:Type.Array(Type.String()),tags:Type.Array(Type.String())})),supersedes:Type.Optional(Type.Array(Type.String())),conflictsWith:Type.Optional(Type.Array(Type.String())),dependsOn:Type.Optional(Type.Array(Type.String())),sources:Type.Optional(Type.Array(Type.Object({kind:Type.String(),ref:Type.String()}))),review:Type.Optional(Type.Object({note:Type.String(),recordedAt:Type.String()})),createdInRevision:Type.Optional(Type.Number()),relatedTo:Type.Optional(Type.Array(Type.String()))},{additionalProperties:true});
-const ProjectionSchema=markContract(Type.Object({type:Type.Literal("design-intent.projection.v1"),availability:Type.Union([Type.Literal("ready"),Type.Literal("missing"),Type.Literal("unavailable")]),storePath:Type.String(),storeRevision:Type.Optional(Type.Number()),sourceHash:Type.Optional(Type.String()),items:Type.Array(ProjectionItemSchema),diagnostics:Type.Array(Type.Any()),omittedIds:Type.Array(Type.String()),truncated:Type.Boolean(),nextCursor:Type.Optional(Type.String())}),DESIGN_INTENT_PROJECTION_CONTRACT);
+const ProjectionSchema=Type.Object({type:Type.Literal("design-intent.projection.v1"),availability:Type.Union([Type.Literal("ready"),Type.Literal("missing"),Type.Literal("unavailable")]),storePath:Type.String(),storeRevision:Type.Optional(Type.Number()),sourceHash:Type.Optional(Type.String()),items:Type.Array(ProjectionItemSchema),diagnostics:Type.Array(Type.Any()),omittedIds:Type.Array(Type.String()),truncated:Type.Boolean(),nextCursor:Type.Optional(Type.String())});
 const ReviewSchema=Type.Object({status:Type.Union([Type.Literal("pending"),Type.Literal("committed"),Type.Literal("rejected_pending_reason"),Type.Literal("cancelled"),Type.Literal("failed"),Type.Literal("uncertain")]),message:Type.String(),action:Type.Optional(Type.Union([Type.Literal("accept"),Type.Literal("reject")])),recordId:Type.Optional(Type.String()),revision:Type.Optional(Type.Number()),sourceHash:Type.Optional(Type.String()),receiptWarning:Type.Optional(Type.String())});
 const ProposalSchema=Type.Object({type:Type.Literal("design-intent.proposal.v1"),proposalId:Type.String(),storePath:Type.String(),baseRevision:Type.Number(),baseHash:Type.String(),draft:Type.Omit(DraftParams,["intent"]),proposalHash:Type.String(),sessionId:Type.String(),createdAt:Type.String(),review:Type.Optional(ReviewSchema)});
 
@@ -19,6 +18,13 @@ async function projectFor(ctx:ExtensionContext, allowParent=false):Promise<Proje
   return project;
 }
 function readEnabled(pi:ExtensionAPI):boolean{return pi.getFlag("design-intent-read")!==false;}
+function readSupportsIntent(pi:ExtensionAPI):boolean{
+  try{
+    const read=pi.getAllTools().find(tool=>tool.name==="read");
+    const properties=(read?.parameters as any)?.properties;
+    return !!properties&&Object.prototype.hasOwnProperty.call(properties,"intent");
+  }catch{return false;}
+}
 function projectionText(p:IntentProjection):string{
   if(p.availability!=="ready")return `[Design Intent ${p.availability}] ${p.diagnostics.map(d=>d.message).join("; ")}`;
   const items=p.items.map(i=>`- [${i.id}] ${i.kind}${i.needsReview?" (needs review)":""}${i.mustExpand?" (must expand)":""}: ${i.statement}${i.rationale?`\n  理由：${i.rationale}`:""}`).join("\n");
@@ -118,7 +124,9 @@ export default function designIntent(pi:ExtensionAPI){
       const applicable=records.filter(record=>record.scope.paths.length===0||record.scope.paths.some(scope=>{const base=scope.replace(/\\/g,"/").replace(/^(?:\.\/)+/,"");return normalized===base||normalized.startsWith(`${base.replace(/\/$/,"")}/`);}));
       if(!applicable.length){results.push({intentId:undefined,status:"unknown",reason:"No selected accepted intent applies to this path; no conformance claim can be made.",path:normalized});continue;}
       try{
-        const read=await ctx.executeTool("read",{path:normalized,intent:"Inspect file as evidence for the requested design-intent check"});
+        const readArgs:Record<string,string>={path:normalized};
+        if(readSupportsIntent(pi))readArgs.intent="Inspect file as evidence for the requested design-intent check";
+        const read=await ctx.executeTool("read",readArgs);
         const content=read.result.content.filter((p:any)=>p.type==="text").map((p:any)=>p.text).join("\n");
         const truncated=!!(read.result.details as any)?.truncated||!!(read.result.details as any)?.isTruncated||/truncated|more lines|more bytes/i.test(content);
         for(const item of applicable)results.push({intentId:item.id,status:"unknown",reason:read.isError?"File read was denied or failed; no conformance claim can be made.":truncated?"File evidence is truncated; no conformance claim can be made.":`File evidence was read (${content.length} characters), but this natural-language intent has no deterministic checker; manual review is required.`,path:normalized,...(!read.isError?{evidenceHash:sha(content)}:{}),truncated});

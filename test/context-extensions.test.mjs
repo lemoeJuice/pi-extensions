@@ -18,7 +18,7 @@ function mockPi(overrides={}){
   registerCommand(name,command){commands.set(name,command);},
   registerFlag(name,definition){flags.set(name,definition);},
   getFlag(name){return overrides[name]??flags.get(name)?.default;},
-  getAllTools(){return [{name:'read',parameters:{'x-pi-guardrails-contract':'pi-guardrails.read-intent.v1'}},...tools.values()];},
+  getAllTools(){return [{name:'read',parameters:{type:'object',properties:{path:{type:'string'}}}},...tools.values()];},
   on(name,handler){const handlers=events.get(name)||[];handlers.push(handler);events.set(name,handlers);},
   appendEntry(customType,data){appended.push({customType,data});},
  };
@@ -31,8 +31,8 @@ test('both context extensions register their public tools, commands, and lifecyc
  assert.ok(rolling.events.has('turn_end'));
  const design=mockPi();designIntent(design);
  assert.deepEqual([...design.tools.keys()],['design_intent_query','design_intent_get','design_intent_propose','design_intent_check']);
- assert.equal(design.tools.get('design_intent_query').parameters['x-pi-guardrails-contract'],'design-intent.read-projection.v1');
- assert.equal(design.tools.get('design_intent_get').parameters['x-pi-guardrails-contract'],'design-intent.read-projection.v1');
+ assert.equal(design.tools.get('design_intent_query').parameters.properties.intent.type,'string');
+ assert.equal(design.tools.get('design_intent_get').parameters.properties.id.type,'string');
  assert.ok(design.commands.has('design-intent'));
  assert.ok(design.events.has('before_agent_start'));
 });
@@ -200,11 +200,13 @@ test('the sole DI approval path rechecks trust and reports receipt failure as co
 
 test('design_intent_check bounds paths and reports denied, truncated, and stale evidence as unknown',async()=>{
  const cwd='/tmp/design-intent-check-test';await mkdir(`${cwd}/.pi`,{recursive:true});const store=emptyStore();store.revision=1;store.records=[{id:'DI-0001',kind:'invariant',title:'API rule',statement:'Keep API stable',rationale:'Compatibility',scope:{paths:['src'],tags:[]},status:'accepted',supersedes:[],conflictsWith:[],dependsOn:[],sources:[{kind:'user',ref:'request'}],review:{note:'approved',recordedAt:'2026-04-15T00:00:00.000Z'},createdInRevision:1}];const storePath=`${cwd}/.pi/design-intent.json`;await writeFile(storePath,serializeStore(store));
- const manager=SessionManager.inMemory(cwd,{id:'design-intent-check-session'},[]);const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;const tool=pi.tools.get('design_intent_check');let readResult={isError:false,result:{content:[{type:'text',text:'source contents'}],details:{}}};let reads=0;const ctx={cwd,sessionManager:manager,isProjectTrusted:()=>true,hasUI:false,executeTool:async(name,params)=>{assert.equal(name,'read');assert.equal(params.path,'src/api.ts');reads++;return readResult;}};
+ const manager=SessionManager.inMemory(cwd,{id:'design-intent-check-session'},[]);const pi=mockPi();designIntent(pi);pi.flags.get('design-intent-read').default=true;const tool=pi.tools.get('design_intent_check');let readResult={isError:false,result:{content:[{type:'text',text:'source contents'}],details:{}}};let reads=0;const readCalls=[];const ctx={cwd,sessionManager:manager,isProjectTrusted:()=>true,hasUI:false,executeTool:async(name,params)=>{assert.equal(name,'read');assert.equal(params.path,'src/api.ts');reads++;readCalls.push(params);return readResult;}};
  await assert.rejects(()=>tool.execute('bad-path',{intent:'Check',paths:['../outside']},undefined,undefined,ctx),/CHECK_PATH_INVALID/);
- readResult={isError:true,result:{content:[{type:'text',text:'permission denied'}],details:{}}};const denied=await tool.execute('denied',{intent:'Check',paths:['src/api.ts']},undefined,undefined,ctx);assert.equal(denied.details.results[0].status,'unknown');assert.equal(denied.details.complete,false);
+ readResult={isError:true,result:{content:[{type:'text',text:'permission denied'}],details:{}}};const denied=await tool.execute('denied',{intent:'Check',paths:['src/api.ts']},undefined,undefined,ctx);assert.equal(denied.details.results[0].status,'unknown');assert.equal(denied.details.complete,false);assert.equal('intent' in readCalls.at(-1),false);
  readResult={isError:false,result:{content:[{type:'text',text:'partial source'}],details:{truncated:true}}};const truncated=await tool.execute('truncated',{intent:'Check',paths:['src/api.ts']},undefined,undefined,ctx);assert.equal(truncated.details.results[0].truncated,true);assert.equal(truncated.details.complete,false);
- readResult={isError:false,result:{content:[{type:'text',text:'source contents'}],details:{}}};ctx.executeTool=async()=>{reads++;const changed={...store,revision:2};await writeFile(storePath,serializeStore(changed));return readResult;};const stale=await tool.execute('stale',{intent:'Check',paths:['src/api.ts']},undefined,undefined,ctx);assert.equal(stale.details.stale,true);assert.match(stale.details.results[0].reason,/source changed/);assert.equal(stale.details.complete,false);assert.ok(reads>=3);
+ pi.getAllTools=()=>[{name:'read',parameters:{type:'object',properties:{path:{type:'string'},intent:{type:'string'}}}},...pi.tools.values()];
+ readResult={isError:false,result:{content:[{type:'text',text:'source contents'}],details:{}}};const compatible=await tool.execute('compatible',{intent:'Check',paths:['src/api.ts']},undefined,undefined,ctx);assert.equal(compatible.details.results[0].status,'unknown');assert.match(readCalls.at(-1).intent,/Inspect file/);
+ ctx.executeTool=async()=>{reads++;const changed={...store,revision:2};await writeFile(storePath,serializeStore(changed));return readResult;};const stale=await tool.execute('stale',{intent:'Check',paths:['src/api.ts']},undefined,undefined,ctx);assert.equal(stale.details.stale,true);assert.match(stale.details.results[0].reason,/source changed/);assert.equal(stale.details.complete,false);assert.ok(reads>=3);
 });
 
 test('Rolling Context retains Design Intent as a read-only reference and never edits its store',async()=>{
@@ -212,7 +214,7 @@ test('Rolling Context retains Design Intent as a read-only reference and never e
  const header={type:'session',version:3,id:'context-intent-boundary',timestamp:new Date().toISOString(),cwd};const branch=[];const push=entry=>{entry.parentId=branch.at(-1)?.id??null;branch.push(entry);};
  push({type:'message',id:'u',timestamp:'',message:{role:'user',content:'Update the adapter without changing public API',timestamp:0}});
  const projection={type:'design-intent.projection.v1',availability:'ready',storePath,storeRevision:1,sourceHash:sha(before),items:[{id:'DI-0001',kind:'invariant',status:'accepted',statement:'Keep the public interface stable',rationale:'Existing callers rely on it.',needsReview:false,mustExpand:false}],diagnostics:[],omittedIds:[],truncated:false};
- push({type:'message',id:'query-result',timestamp:'',message:{role:'toolResult',toolCallId:'query-1',toolName:'design_intent_query',content:[{type:'text',text:'read-only projection'}],details:{type:'design-intent.query-result.v1',projection},isError:false,timestamp:0}});
+ push({type:'message',id:'query-result',timestamp:'',message:{role:'toolResult',toolCallId:'query-1',toolName:'third_party_reader',content:[{type:'text',text:'read-only projection'}],details:{projection},isError:false,timestamp:0}});
  push({type:'message',id:'note-result',timestamp:'',message:{role:'toolResult',toolCallId:'note-1',toolName:'context_note',content:[{type:'text',text:'Recorded'}],details:{type:'rolling-context.note.v1',noteId:'note-1',taskId:'RC-T-u',kind:'task-decision',text:'Use a local adapter for this task',paths:['src/adapter.ts'],replaces:[]},isError:false,timestamp:0}});
  push({type:'message',id:'a',timestamp:'',message:{role:'assistant',content:[{type:'text',text:'I will update the adapter.'}],stopReason:'stop',timestamp:0}});
  const manager=SessionManager.inMemory(cwd,{id:header.id},[header,...branch]);const pi=mockPi();rollingContext(pi);await pi.commands.get('rolling-context').handler('on',{sessionManager:manager,ui:{notify:()=>{}}});

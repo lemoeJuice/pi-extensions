@@ -26,7 +26,7 @@ Design Intent stores approved project requirements and decisions in `.pi/design-
 
 `/permissions` reports the current mode; `/permissions manual` and `/permissions auto` select the mode for the current Pi session. Mode resets to `manual` on restart.
 
-The extension wraps `bash` and `read` to require a short `intent`, removes the native `write` tool from the active tool set, and reviews operations involving out-of-workspace paths, destructive tools, or Bash commands that cannot be certified by its read-only allowlist. File paths are resolved against the session working directory (including existing symlink targets). Bash policy parsing is a review gate, **not a shell sandbox**.
+The extension wraps `bash` and `read` to require a short `intent`, and reviews operations involving out-of-workspace paths, destructive tools, or Bash commands that cannot be certified by its read-only allowlist. The patch-based `edit` implementation owns its decision to remove native `write` because that implementation supports file creation. File paths are resolved against the session working directory (including existing symlink targets). Bash policy parsing is a review gate, **not a shell sandbox**.
 
 In manual mode, review prompts let you allow once, switch to auto, or deny. Switching to auto sends the pending operation to the reviewer. Auto review sees only the operation and its intent in an isolated request, not the session transcript. Transient provider/network errors receive at most two retries with short exponential backoff; non-transient errors fail immediately. Technical review failures are reported as unavailable/undecided, not as a security denial, and the operation is not executed. The reviewer stays on the current model rather than silently falling back to another model, and only the exact verdict `APPROVE` allows the operation. Missing models, exhausted retries, timeouts, and invalid decisions fail closed. A plain `git push` is approvable when the intent explicitly authorizes the target scope; force, delete, and mirror pushes are not auto-approved. Being outside the workspace or requiring review is not by itself a reason for the reviewer to deny.
 
@@ -35,6 +35,10 @@ In manual mode, review prompts let you allow once, switch to auto, or deny. Swit
 The extension replaces the native `edit` tool with a tool that accepts exactly `intent` and `patch`. The patch must use Codex `apply_patch` syntax, from `*** Begin Patch` through `*** End Patch`; native `path` / `edits` / `oldText` / `newText` arguments are unsupported. Supported operations include add, delete, update, context hunks, end-of-file markers, and moves. File mutations are queued per working directory. The TUI displays a patch summary; **Ctrl+O** expands the result to show changed lines.
 
 Use `edit` for focused changes to existing text files. Prefer `bash` for large rewrites, many generated files, or programmatic content generation. The parser/applier follows the public grammar and behavior of [OpenAI Codex's apply-patch crate](https://github.com/openai/codex/tree/main/codex-rs/apply-patch).
+
+### Extension dependency boundaries
+
+For ordinary state display (for example Fast mode, model, session ID, context usage, or tool metadata), consumers should inspect the active Pi runtime/session projection. Producers must not register state producers or maintain consumer-specific synchronization for read-only observation. Historical Design Intent is consumed from a validated `design-intent.projection.v1` payload, independent of which tool or extension supplied it. Use explicit contracts only when a component invokes another capability or passes security/mutation authorization; share independent formats such as Codex patch parsing through neutral modules under `extensions/shared/`.
 
 ### Remote daemon
 
