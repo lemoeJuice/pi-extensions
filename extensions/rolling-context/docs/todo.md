@@ -15,8 +15,8 @@
 - [x] **RC-05：收敛预算安全边界。** 读取宿主模型窗口与 usage；usage 缺失时显示 heuristic。动态扣除输出 reserve 和保守 headroom；候选必须有估算净收益；持久状态超过 128 KiB 时整批放弃。token 估算仍不是 provider 精确 tokenizer。
 - [x] **RC-06：补齐 compact 生命周期。** manual/threshold 仅在分支覆盖完整、无图片/未知摘要/外部编辑且估算有净收益时提供结构化检查点；显式 checkpoint 不安全时取消。用户 custom instructions、overflow recovery、覆盖未知或无净收益时委托原生 compact。失败/取消不推进 checkpoint，并记入 status。真实宿主 lifecycle 仍待 INT-02。
 - [x] **RC-07：任务/事实生命周期与测试。** 验证用户约束、单分支 task scope、pin/unpin、路径编辑失效、无范围测试结果的保守失效、assistant/tool evidence 权威差异、图片/未知扩展内容对 checkpoint 的保护，以及超过 128 KiB 整批拒绝。细粒度任务切换不支持：新任务应开 session 或显式换 branch。
-- [x] **RC-08：缓存与批量调度（确定性规则路径）。** 已实现完整 turn 时钟、累计 saving、4-turn 普通批次、soft 滞回、16-turn checkpoint / warm 驻留及 after-warm preview 预算。当前 assistant usage 的高 cacheRead 仅提高普通批次门槛，不预测下一次缓存收益；无数据不猜。已有 warm 不重复写。100-turn 多 epoch 模拟、hard 特例、soft 批处理和分支恢复测试通过；真实 provider 成本 A/B 仍待实测。
-- [x] **RC-09：轻量工作状态、cold recall 与 telemetry / Graph。** 按键更新有界 project/change/test 地图，去掉 assistant/tool 正文副本与 envelope capsule 副本；用户原文、活跃显式决策及 pin 仍保护。只撤销自有且 hash/边界一致的冷藏，重放所有外部 edits；foreign compaction 不撤销。daemon 只读当前 branch 数值，提供三张 SVG 图及事件/usage 表。新增 recall 工具、遥测、daemon API/页面回归测试。
+- [x] **RC-08：缓存与批量调度（确定性规则路径）。** 已实现完整 turn 时钟、4-turn 普通批次、2048 saving、soft 滞回、16-turn checkpoint/warm residence、after-warm preview 及 cache-aware batch score（warm residence saving 减 earliest mutation suffix estimate）。高 cacheRead 提高普通门槛；超过 target 的压力可以覆盖一般 cache conservation 排序。小型 safe evidence 可直接 cold；valuable hot source 需要先 warm。100-turn 多 epoch、hard exception、新 warm boundary、direct-cold 与 cache estimate tests 通过；真实 provider 成本/缓存 A/B 仍待实测。
+- [x] **RC-09：轻量工作状态、cold recall 与 telemetry / Graph。** project/change/test 为有界工作地图，普通 follow-up 不永久 pin，最新用户请求与明确 constraint 保留原文/source span；assistant/tool 正文不复制进 L1。连续性缺失时仅在 checkpoint pressure 调用最近 12 projected entries / 12,000 字符的 extractive fallback，assistant report 不升级为 verified。Turn 0 新样本、旧 session gap、turn-N event 与 turn-(N+1) request usage 分离；daemon 只读当前 branch 数值，提供 controller overview、context/composition/memory/cache、事件日志、All turns 与 inspector。真实 provider 成本与 AgentSession/TUI e2e 仍待实测。
 
 ### B. Design Intent 完整查询与写入边界
 
@@ -30,9 +30,11 @@
 
 - [x] **INT-01：验证单一来源边界。** Rolling Context 从 Design Intent 查询结果提取只读 `{storePath, revision, sourceHash, id, projection}` 引用；task-decision 和 checkpoint 仍留在分支 state。集成测试确认 `.pi/design-intent.json` 字节不变；Design Intent 扩展不导入/读取 RC state。
 - [x] **INT-02：SessionManager/扩展回调集成（受限完成）。** 验证 turn-boundary 草稿回放/工具配对、observe 仅非 context metrics、compact 提交后 checkpoint 恢复、customInstructions 保留、`/tree` 模式和状态恢复、双扩展注册及 DI 单一来源边界。使用真实内存 SessionManager，但 Pi API 是测试 double；真实 AgentSession/TUI 时序仍未覆盖。
-- [ ] **INT-03：静态类型及交付验证（进行中）。** 完整 Node tests、Pi CLI 扩展发现、esbuild 和 `git diff --check`；若没有 TypeScript 编译器则明确 blocked，不以 esbuild 代替 typecheck。
+- [ ] **INT-03：静态类型及交付验证（进行中）。** 本轮 `node --experimental-strip-types --test test/*.test.mjs` **124/124** 通过；Rolling Context 与 Design Intent esbuild bundle、daemon JavaScript syntax、`git diff --check` 通过；测试包含 real Pi loader 的 package manifest extension discovery。环境中没有 `tsc` / TypeScript compiler，正式 typecheck 仍 blocked，不能以 esbuild 代替 typecheck。真实 provider/cache A/B 与 AgentSession/TUI e2e 也未完成。
 
 ## 已完成的前置核对
+
+- [x] 本次生命周期/Graph follow-up：完整 Node suite **124/124**；Rolling Context + Design Intent esbuild、daemon syntax、`git diff --check` 通过。新增小型 evidence direct-cold、warm residence/WARM_REQUIRED hook、fallback provenance、user constraint retention、cache mutation estimate、Turn 0/gap、N→N+1 usage attribution 与 graph tick/gap regressions。
 
 - [x] 已审阅两个总体设计和实现蓝图，确认当前交付是受限 MVP。
 - [x] 已修复默认 observe 启动后通过 `/rolling-context on` 无法启用维护的问题（提交 `45175b6`）。

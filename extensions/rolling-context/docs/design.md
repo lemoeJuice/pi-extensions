@@ -228,11 +228,11 @@ read src/auth.ts，观察范围 1–180，版本 sha256:…。
 
 当前调度的具体落地（不改变上述分层与职责）：
 
-- aging 每个完整 turn 重新计算；普通 hot→warm 默认至少间隔 **4 turn**，累计候选节省达到 **2048 估算 tokens** 才批量写入。已提交 capsule 不再改写。
-- 本轮 usage 的 `cacheRead / (input + cacheRead) >= 80%` 时，普通批次收益门槛翻倍；未知 usage 不推断缓存状态。跨 soft 可以提前处理，但仍至少间隔 2 turn 且达到基础收益门槛的一半，避免高水位下每轮修改一个旧结果。
-- 必须先 preview hot→warm 后的 projection，基于 **after-warm tokens** 判断 checkpoint。上一请求 usage、raw history 大小都不是候选投影预算。
-- checkpoint 默认最少间隔 **16 turn**，普通 warm→cold 同时要求来源已经驻留 warm 至少 16 turn。刚创建的 warm 不会同轮或下一轮被自动收走；checkpoint 是低频 epoch transition。
-- hard 压力可绕过时间间隔和 warm 驻留限制，但不能绕过协议、原文、pin、覆盖及授权保护。overflow 仍交给宿主；显式确认的 manual checkpoint 是用户请求的例外，不是普通 housekeeping。
+- aging 每个 completed turn 重新计算；普通 hot→warm 默认至少间隔 **4 turn**，累计候选节省达到 **2048 估算 tokens** 才批量写入。选择批次时比较未来 warm residence 内的节省与最早 mutation 会影响的 projected suffix，避免低收益的反复前缀失效；已提交 capsule 不再改写。
+- 本轮 assistant usage 的 `cacheRead / (input + cacheRead) >= 80%` 时，普通批次收益门槛翻倍。cacheRead 缺失时不猜。跨 soft（projected tokens > 1.2×target）可使用基础门槛的一半；超过 target 或 hard pressure 时可覆盖一般 cache-conservation 排序，但仍须满足批次间隔/收益及来源安全条件。
+- 必须先 preview hot→warm 后的 projection，基于 **after-warm tokens** 判断是否需要 checkpoint。上一请求 usage 与 raw history 大小都不是候选投影预算。只要经过完整 preview 能确认有净节省，允许分阶段推进，即使这一 epoch 尚未降到 target 以下。
+- checkpoint 默认最少间隔 **16 completed turns**；常规 warm→cold 同时要求来源驻留 warm 至少 16 turns。较大的、可安全胶囊化证据通常先 HOT→WARM；不足驻留期不得跨过其来源。很小、没有有意义 capsule saving 的安全证据可以直接 HOT→COLD，避免小结果永远阻塞 checkpoint。新 warm 在同轮不会因常规策略被冷藏。
+- hard/emergency 可绕过 cadence、驻留和普通 cache heuristic，但仍不能绕过工具配对、原文/图片、pin、foreign edit/compaction、完整覆盖和授权保护。overflow 仍交给宿主；显式确认的 manual checkpoint 是用户请求的独立例外。
 
 这里的 turn 是宿主 `turn_end(outcome="completed")`（一次 assistant response 及其直接工具批次），不是一次用户输入，也不是 branch entry 数。时钟从当前 branch 的完成回合 custom 记录恢复；epoch 及 checkpoint 时钟只承认实际匹配的 compaction entry。
 
@@ -243,7 +243,7 @@ read src/auth.ts，观察范围 1–180，版本 sha256:…。
 - 根据当前完整回合中实际的工具调用和结果做确定性提取：文件路径、修改成功/失败、显式退出信息、可识别测试摘要。
 - 用户约束使用原文来源；无法可靠判定时保护原消息。
 - 主 agent 可用 `context_note` 记录当前任务的计划、`task-decision`、focus 和 next step，并关联当前任务目标。此工具不能修改项目设计，不能创建/接受/supersede Design Intent，不能直接要求删除历史，也不能自行升级成已验证事实。写入 intent ID 为替代目标或声明项目级决策的请求必须拒绝，而非隐式晋升。
-- 不依赖 agent 永远主动记笔记；缺失连续性锚点时，不做有语义损失的检查点。
+- 不依赖 agent 永远主动记笔记。checkpoint 压力出现且连续性状态不足时，先尝试保守 fallback：只看最近 **12 个 projected entries**、输入字符上限 **12,000**，要求窗口内有最新用户请求；可附最近 assistant 原文报告但明确标为未验证，并把来源 ID、用户 span 写入状态。fallback 不扫描/总结全 session，不把推断升级成事实；无法建立可靠锚点时 checkpoint 阻塞，保留原生历史。
 
 ### 可选小模型提取器
 
@@ -265,13 +265,13 @@ read src/auth.ts，观察范围 1–180，版本 sha256:…。
 
 所有条件满足才执行：
 
-1. 已准备好覆盖即将收起历史的工作记忆；关键约束、未完成项及当前焦点不缺失。
+1. 已准备好覆盖即将收起历史的工作记忆；最新用户请求原文单独保存，明确约束保存精确 span 与源 ID，关键未完成项及当前焦点不缺失。普通 follow-up 留在 L0，不随每轮累积成永久 pinned transcript；当前请求、明确约束和显式 pin 不被普通容量淘汰。
 2. 保留区从完整依赖边界开始，没有跨边界 tool call/result。
 3. 最近受保护组仍原样保留。若保留边界越过最新用户文本消息，检查点必须包含该请求的完整原文及仍有效的追加要求，不能只保留提取器概括的「关键要求」。最新用户消息包含图片或其他不能无损写入文本摘要的内容时，不跨过该消息滚动。
-4. 候选检查点加保留区经过 token 估算和协议验证，确有收益。
+4. 候选检查点加保留区经过 token 估算和协议验证，确有净收益；不要求每个渐进 checkpoint 单次就低于 target。
 5. 没有覆盖其他扩展未纳入的 context edit、自定义内容或待输入消息。
 
-滚动正文由工作记忆渲染，而不是再请求一份全会话摘要：
+滚动正文由工作记忆渲染，而不是再请求一份全会话摘要。对有明显缩减价值的安全结果，未经 warm 的来源阻止普通 cold boundary；没有意义 warm saving 的小型安全来源可直接收起。hard/emergency 例外仍受上述安全边界约束。
 
 ```text
 [Rolling Context checkpoint v1 / revision 12]
@@ -336,11 +336,11 @@ hard = A
 
 ### 当前可观测性与 Graph View
 
-每个完整 turn 追加 `rolling-context.telemetry.v1` custom entry，不进入模型 context，也不改变已有 prompt 前缀。记录原始/有效/候选投影 token 估算、hot/warm/checkpoint/other 分量、批次及 checkpoint 事件、工作 envelope 字节数和可获得的本轮 usage。未知值使用 null，不把未知缓存数据记为 0。
+每个新 session 尝试追加 `turn=0, timelineKind=initial` 的初始 projection 样本；之后每个 completed turn 追加 `rolling-context.telemetry.v1` custom entry，不进入模型 context，也不改变已有 prompt 前缀。旧 session 若没有此样本，daemon 在 Turn 0 显示 unknown/gap，不从旧 assistant 消息伪造测量。记录原始/有效/候选投影 token 估算、hot/warm/checkpoint/other 分量、warm batch source→capsule saving、suffix invalidation 估算、checkpoint boundary/阻塞原因、工作 envelope 字节数和可获得的 usage。未知值使用 null，不把未知缓存数据记为 0。
 
-现有 daemon 只读消费当前 branch 的数值：session 页面提供 **Context Graph** 链接，显示 context size、composition、stateBytes 三张图和事件标记。Rolling Context 不导入 daemon，也不要求 daemon 存在才能运行。observe/off 同样记录 metrics；observe 的候选大小不是已提交的有效大小。
+现有 daemon 只读消费当前 branch 的数值：session 页面提供 **Context Graph** 链接，显示 controller overview、context size/composition/memory/cache 图、事件日志、All turns 与共享 inspector。Rolling Context 不导入 daemon，也不要求 daemon 存在才能运行。observe/off 同样记录 metrics；observe 的候选大小不是已提交的有效大小。
 
-图表是宿主估算及已验证边界的测量，不是 provider 精确 tokenizer 或价格预测。manual/native hook 的 compaction 另有事件索引，下一完整 turn 反映其投影及 epoch；foreign compaction 不冒充 Rolling epoch。无持久 session 时 telemetry 随进程消失，不另存 transcript。
+事件归因使用显式边界：warm/checkpoint 事件属于 turn **N 结束后**；provider usage 保留在真实发出请求的 turn **N+1**，cache rebuild 只作相邻样本关联，不把 estimate 冒充精确 cost attribution。这里的 `Usage.input` 按 Pi schema 作为 uncached input，`cacheRead/cacheWrite` 单独呈现，cache reuse ratio 为 `cacheRead / (cacheRead + uncached input)`（字段齐全时）。图表是宿主估算及已验证边界的测量，不是 provider 精确 tokenizer 或价格预测。manual/native hook 的 compaction 另有事件索引；foreign compaction 不冒充 Rolling epoch。无持久 session 时 telemetry 随进程消失，不另存 transcript。
 
 ## 9. 回合处理流程与持久化
 

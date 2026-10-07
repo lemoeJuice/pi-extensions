@@ -49,6 +49,18 @@ test('observe reports a simulated plan and submits only non-context telemetry',a
  assert.match(notices.at(-1),/observe:.*writes=0/);assert.match(notices.at(-1),/projectionValid=true/);
 });
 
+test('new sessions record a measured Turn 0 projection; existing assistant history is not reconstructed',async()=>{
+ const cwd='/tmp/rolling-context-turn-zero-test',header={type:'session',version:3,id:'turn-zero',timestamp:new Date(0).toISOString(),cwd};
+ const manager=SessionManager.inMemory(cwd,{id:header.id},[header]);manager.appendMessage({role:'user',content:'Inspect the current module.',timestamp:0});
+ const pi=mockPi();rollingContext(pi);const ctx={cwd,sessionManager:manager,getContextUsage:()=>({tokens:null,contextWindow:128000}),ui:{notify:()=>{}}};
+ await pi.events.get('session_start')[0]({type:'session_start'},ctx);
+ const initial=pi.appended.find(entry=>entry.customType==='rolling-context.telemetry.v1')?.data;
+ assert.ok(initial);assert.equal(initial.turn,0);assert.equal(initial.timelineKind,'initial');assert.equal(initial.eventPosition,undefined);assert.ok(initial.rawTokens>0);assert.ok(initial.effectiveTokens>0);assert.equal(initial.input,null);assert.equal(initial.cacheRead,null);
+ const old=SessionManager.inMemory(cwd,{id:'old-turn-zero'},[header,{type:'message',id:'old-assistant',parentId:null,timestamp:'',message:{role:'assistant',content:[{type:'text',text:'already ran'}],stopReason:'stop',timestamp:0}}]);
+ const oldPi=mockPi();rollingContext(oldPi);await oldPi.events.get('session_start')[0]({type:'session_start'},{...ctx,sessionManager:old});
+ assert.equal(oldPi.appended.some(entry=>entry.customType==='rolling-context.telemetry.v1'),false);
+});
+
 test('on-mode turn boundary returns replayable edits without breaking tool pairing',async()=>{
  const cwd='/tmp/rolling-context-turn-boundary-test';const header={type:'session',version:3,id:'turn-boundary-session',timestamp:new Date().toISOString(),cwd};const branch=[];const push=entry=>{entry.parentId=branch.at(-1)?.id??null;branch.push(entry);};
  push({type:'message',id:'u',timestamp:'',message:{role:'user',content:'Inspect these files',timestamp:0}});
@@ -89,13 +101,30 @@ test('compact hook uses a covered state checkpoint only when safe and preserves 
  manager.appendCustomEntry('rolling-context.state.v1',{schemaVersion:1,revision:1,planId:'covered',baseLeafId:manager.getLeafId(),snapshot,edits:[{targetId:'result',originalHash:hash(branch[2].message.content[0].text),replacementHash:hash('Historical module source; recall result'),warmTurn:0}]});
  manager.appendContextEdit('result',{content:[{type:'text',text:'Historical module source; recall result'}]});
  const pi=mockPi({'rolling-context-mode':'on','rolling-context-checkpoint-interval':'0'});rollingContext(pi);const notices=[];const ctx={cwd,sessionManager:manager,getContextUsage:()=>undefined,ui:{notify:(text)=>notices.push(text)}};
- const handler=pi.events.get('session_before_compact')[0];const event={reason:'threshold',willRetry:false,branchEntries:manager.getBranch(),preparation:{firstKeptEntryId:'done',tokensBefore:100000},signal:new AbortController().signal};
- const result=await handler(event,ctx);assert.ok(result?.compaction);assert.equal(result.compaction.firstKeptEntryId,'done');
- manager.appendCompaction(result.compaction.summary,result.compaction.firstKeptEntryId,result.compaction.tokensBefore,result.compaction.details,true);assert.equal(rebuild(manager.getBranch(),manager.getSessionId()).envelope.checkpoint.firstKeptEntryId,'done');
+ const handler=pi.events.get('session_before_compact')[0];const event={reason:'threshold',willRetry:false,branchEntries:manager.getBranch(),preparation:{firstKeptEntryId:'call',tokensBefore:100000},signal:new AbortController().signal};
+ const result=await handler(event,ctx);assert.ok(result?.compaction);assert.equal(result.compaction.firstKeptEntryId,'call');
+ manager.appendCompaction(result.compaction.summary,result.compaction.firstKeptEntryId,result.compaction.tokensBefore,result.compaction.details,true);assert.equal(rebuild(manager.getBranch(),manager.getSessionId()).envelope.checkpoint.firstKeptEntryId,'call');
  await pi.events.get('session_compact')[0]({reason:'threshold',willRetry:false,fromExtension:true,compactionEntry:manager.getBranch().at(-1)},ctx);
  assert.equal(await handler({...event,customInstructions:'retain the exact wording'},ctx),undefined);
  const external=SessionManager.inMemory(cwd,{id:'external-edit'},[header,...branch]);external.appendContextEdit('result',null);external.appendCustomEntry('rolling-context.state.v1',{schemaVersion:1,revision:1,planId:'covered',baseLeafId:external.getLeafId(),snapshot,edits:[]});
- const unsafe=await handler({...event,branchEntries:external.getBranch()}, {...ctx,sessionManager:external});assert.equal(unsafe,undefined);
+ const unsafe=await handler({...event,branchEntries:external.getBranch(),preparation:{firstKeptEntryId:'done',tokensBefore:100000}}, {...ctx,sessionManager:external});assert.equal(unsafe,undefined);
+});
+
+test('native compact keeps valuable un-warmed history and reports WARM_REQUIRED',async()=>{
+ const cwd='/tmp/rolling-context-warm-required-hook-test',header={type:'session',version:3,id:'warm-required-hook',timestamp:new Date(0).toISOString(),cwd};
+ const manager=SessionManager.inMemory(cwd,{id:header.id},[header]);manager.appendMessage({role:'user',content:'Inspect the module.',timestamp:0});
+ for(let i=0;i<10;i++){
+  manager.appendMessage({role:'assistant',content:[{type:'toolCall',id:`read-${i}`,name:'read',arguments:{path:`src/file-${i}.ts`}}],stopReason:'toolUse',timestamp:0});
+  manager.appendMessage({role:'toolResult',toolCallId:`read-${i}`,toolName:'read',content:[{type:'text',text:i===0?'valuable source '.repeat(700):`small result ${i}`}],isError:false,timestamp:0});
+  manager.appendMessage({role:'assistant',content:[{type:'text',text:`Reviewed group ${i}.`}],stopReason:'stop',timestamp:0});
+ }
+ manager.appendMessage({role:'user',content:'Continue this inspection.',timestamp:0});manager.appendMessage({role:'assistant',content:[{type:'text',text:'I will continue.'}],stopReason:'stop',timestamp:0});
+ const pi=mockPi({'rolling-context-mode':'on','rolling-context-checkpoint-interval':'0'});rollingContext(pi);const notices=[];
+ const ctx={cwd,sessionManager:manager,getContextUsage:()=>({tokens:100000,contextWindow:128000}),ui:{notify:text=>notices.push(text)}};
+ const branch=manager.getBranch(),groups=branch.filter(entry=>entry.type==='message'&&entry.message.role==='assistant'&&entry.message.content[0]?.type==='toolCall');
+ const event={reason:'threshold',willRetry:false,branchEntries:branch,preparation:{firstKeptEntryId:groups.at(-3).id,tokensBefore:100000},signal:new AbortController().signal};
+ const result=await pi.events.get('session_before_compact')[0](event,ctx);assert.equal(result,undefined);
+ await pi.commands.get('rolling-context').handler('status',ctx);assert.match(notices.at(-1),/checkpoint blocked: WARM_REQUIRED/);
 });
 
 test('pin and unpin persist branch-local memory changes',async()=>{
@@ -249,7 +278,7 @@ test('completed-turn telemetry is non-context, branch-local, usage-aware and ide
  const pi=mockPi({'rolling-context-mode':'off'});rollingContext(pi);const ctx={cwd,sessionManager:manager,getContextUsage:()=>undefined};const handler=pi.events.get('turn_end')[0];
  const event={outcome:'completed',messageEntryId:manager.getLeafId(),message:manager.getBranch().at(-1).message,entries:[{type:'custom',customType:'foreign.metadata',data:{keep:true}}],context:{contextEntries:manager.buildSessionProjection().entries}};
  assert.equal(await handler({...event,outcome:'aborted'},ctx),undefined);
- const result=await handler(event,ctx);assert.equal(result.entries[0],event.entries[0]);const record=result.entries.at(-1);assert.equal(record.customType,'rolling-context.telemetry.v1');assert.equal(record.data.turn,1);assert.equal(record.data.cacheRead,456);assert.equal(record.data.input,123);assert.equal(record.data.providerContextTokens,null);assert.equal(record.data.checkpointCreated,false);
+ const result=await handler(event,ctx);assert.equal(result.entries[0],event.entries[0]);const record=result.entries.at(-1);assert.equal(record.customType,'rolling-context.telemetry.v1');assert.equal(record.data.turn,1);assert.equal(record.data.eventPosition,'after-turn');assert.equal(record.data.cacheRead,456);assert.equal(record.data.input,123);assert.equal(record.data.uncachedInput,123);assert.ok(Math.abs(record.data.cacheReuseRatio-456/579)<1e-12);assert.equal(record.data.usage.input,123);assert.equal(record.data.providerContextTokens,null);assert.equal(record.data.checkpointCreated,false);
  const before=manager.buildSessionProjection().messages;manager.appendCustomEntry(record.customType,record.data);assert.deepEqual(manager.buildSessionProjection().messages,before);assert.equal(await handler(event,ctx),undefined);
 });
 

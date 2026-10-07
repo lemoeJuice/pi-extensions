@@ -22,6 +22,8 @@ Design Intent 可选契约在 `session_start`（runtime 就绪后）校验，不
 
 `/rolling-context checkpoint` 的人工确认可在 Pi 本地界面或 Remote session 网页完成；网页不在目标 session 时请求会保持排队，进入对应页面后重放。该确认没有等待超时，Pi 会在收到批准后复核 session branch 与待处理消息，再启动 compact。
 
-默认 hot→warm 批次至少间隔 4 个完整 turn，累计节省 2048 估算 tokens；checkpoint 与普通 warm 最短驻留为 16 turn。可用 `--rolling-context-warm-interval`、`--rolling-context-batch-saving`、`--rolling-context-checkpoint-interval` 调整。先 preview after-warm 再判断 checkpoint；高缓存命中时普通收益门槛翻倍。已有 capsule 不重复摘要。
+默认 hot→warm 批次至少间隔 4 个完整 turn，累计节省 2048 估算 tokens；候选会扣除最早 prefix mutation 可能影响的 suffix 成本，高缓存命中时普通收益门槛翻倍。checkpoint 与普通 warm 最短驻留为 16 turn；有价值证据先 HOT→WARM，安全的小型结果可直接 cold，hard emergency 仍受内容/来源/工具协议保护。只要 checkpoint preview 确有净节省即可渐进推进，不要求一次低于 target。可用 `--rolling-context-warm-interval`、`--rolling-context-batch-saving`、`--rolling-context-checkpoint-interval` 调整。已有 capsule 不重复摘要。
 
-每个 completed turn 保存不进模型 context 的 telemetry（observe/off 也记录）。现有 daemon 的 session 页面点击 **Context Graph**，或访问 `/s/<sessionId>/context`，查看 context size、composition、stateBytes 及事件标记。未知 usage 不猜为 0；图表 token 数为宿主估算。自己的 checkpoint 收起的来源可按需召回，但不撤销 foreign compaction 或其他插件的隐藏/脱敏。
+连续性状态不足时，只在 checkpoint 有压力时尝试 bounded fallback（最近 12 个 projected entries、输入最多 12,000 字符）；来源不清、超限或找不到最近用户请求时保留原生历史。fallback 的 assistant 报告明确标为未验证。最新用户请求以原文/来源保留，确定性识别的明确约束按 source span pin；普通 follow-up 留在原始历史，不会逐轮累积为永久 pin。
+
+新会话在首次请求前尽早尝试记录 Turn 0 projection；旧 session 若没有该样本显示 unknown/gap，不回推猜测。每个 completed turn 保存不进模型 context 的 telemetry（observe/off 也记录）。现有 daemon 的 session 页面点击 **Context Graph**，或访问 `/s/<sessionId>/context`，查看 controller overview、context/composition/memory/cache 图、事件日志、All turns 和共享 inspector。warm/checkpoint event 记在 turn N 结束边界，provider usage 记在真实请求 turn N+1；cache impact 是相邻实测关联，不宣称精确成本归因。未知 usage 不猜为 0；图表 token 数为宿主估算。自己的 checkpoint 收起的来源可按需召回，但不撤销 foreign compaction 或其他插件的隐藏/脱敏。

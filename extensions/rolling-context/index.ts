@@ -1,6 +1,6 @@
 import type { ExtensionAPI, SessionBoundaryDraft, SessionEntry, ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { analyzeGroups, boundMemory, effectiveTarget, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, serializedStateBytes, MAX_STATE_BYTES, TELEMETRY_TYPE, contextComposition, ownedEdits, ownedCheckpoint, recallProjection, turnClock, type PlanMetrics, type RollingConfig } from "./lib.ts";
+import { analyzeGroups, boundMemory, effectiveTarget, estimateProjection, groups, hash, planTurn, previewDrafts, rebuild, renderCheckpoint, serializedStateBytes, MAX_STATE_BYTES, TELEMETRY_TYPE, contextComposition, warmEffectiveness, ownedEdits, ownedCheckpoint, checkpointSafe, makeCapsule, explicitUserConstraints, recallProjection, turnClock, continuitySufficient, extractContinuityFallback, type PlanMetrics, type RollingConfig } from "./lib.ts";
 
 const NoteParams=Type.Object({intent:Type.String({minLength:1}),kind:Type.Union([Type.Literal("plan"),Type.Literal("task-decision"),Type.Literal("focus"),Type.Literal("next-step")]),text:Type.String({minLength:1,maxLength:2000}),replaces:Type.Optional(Type.Array(Type.String(),{maxItems:8})),paths:Type.Optional(Type.Array(Type.String({maxLength:256}),{maxItems:12}))},{additionalProperties:false});
 const RecallParams=Type.Object({intent:Type.String({minLength:1}),entryId:Type.Optional(Type.String()),itemId:Type.Optional(Type.String()),query:Type.Optional(Type.String({maxLength:300})),paths:Type.Optional(Type.Array(Type.String({minLength:1,maxLength:256}),{maxItems:12})),cursor:Type.Optional(Type.String({maxLength:2048})),limit:Type.Optional(Type.Number({minimum:1,maximum:8}))},{additionalProperties:false});
@@ -114,7 +114,7 @@ export default function rollingContext(pi:ExtensionAPI) {
   }});
 
   const rebuildState=(ctx:any)=>rebuild(ctx.sessionManager.getBranch(),ctx.sessionManager.getSessionId());
-  const checkpointCoverageValid=(branch:SessionEntry[],firstKeptId:string,state:ReturnType<typeof rebuild>):boolean=>{
+  const checkpointCoverageValid=(branch:SessionEntry[],firstKeptId:string,state:ReturnType<typeof rebuild>,projection:ProjectedSessionEntry[]):boolean=>{
     const cut=branch.findIndex(entry=>entry.id===firstKeptId);if(cut<0)return false;
     const prefixIds=new Set(branch.slice(0,cut).map(entry=>entry.id));
     for(const editEntry of branch)if(editEntry.type==="context_edit"&&prefixIds.has(editEntry.targetId)){
@@ -123,17 +123,33 @@ export default function rollingContext(pi:ExtensionAPI) {
       if(text===undefined||!state.envelope?.edits.some(edit=>edit.targetId===editEntry.targetId&&edit.replacementHash===hash(text)))return false;
     }
     const covered=new Set([...state.snapshot.items.flatMap(item=>item.sourceEntryIds),...state.snapshot.coverage.map(c=>c.sourceEntryId)]);
+    const projectedById=new Map(projection.map(entry=>[entry.sourceEntry.id,entry]));
+    const protectedGroupIds=new Set(analyzeGroups(projection,state.snapshot).filter(group=>group.reasons.length>0).map(group=>group.assistantId));
+    const groupsByResult=new Map(groups(projection).filter(group=>checkpointSafe(group)&&!protectedGroupIds.has(group.assistantId)).flatMap(group=>group.resultIds.map(id=>[id,group] as const)));
+    const latestUserId=[...projection].reverse().find(projected=>projected.messages.some(message=>message.role==="user"))?.sourceEntry.id;
     for(const entry of branch.slice(0,cut)){
       if(entry.type==="message"){
         const message=entry.message;
         if(message.role==="system")continue;
         if(message.role==="user"&&Array.isArray(message.content)&&message.content.some(part=>part.type==="image"))return false;
-        if(message.role==="user"||message.role==="assistant"||message.role==="bashExecution"){
-          if(!covered.has(entry.id))return false;
+        if(message.role==="user"){
+          const text=typeof message.content==="string"?message.content:message.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text).join("\n");
+          const required=explicitUserConstraints(text);
+          if(required.some(span=>!state.snapshot.items.some(item=>item.authority==="user"&&item.sourceEntryIds.includes(entry.id)&&(item.sourceSpan?.start===span.start&&item.sourceSpan.end===span.end||item.text===text))))return false;
+          if(entry.id===latestUserId&&!state.snapshot.items.some(item=>item.authority==="user"&&item.sourceEntryIds.includes(entry.id)&&item.text===text))return false;
           continue;
         }
+        if(message.role==="assistant"){
+          const projected=projectedById.get(entry.id);
+          if(message.content.some(part=>part.type==="toolCall")&&!groups(projection).some(group=>group.assistantId===entry.id&&checkpointSafe(group)))return false;
+          if(!projected||projected.messages.some(value=>value.role!=="assistant"))return false;
+          continue;
+        }
+        if(message.role==="bashExecution")return covered.has(entry.id);
         if(message.role==="toolResult"){
-          if(!covered.has(entry.id))return false;
+          const note=message.toolName==="context_note"&&(message.details as any)?.type==="rolling-context.note.v1"&&state.snapshot.items.some(item=>item.sourceEntryIds.includes(entry.id));
+          if(!covered.has(entry.id)&&!groupsByResult.has(entry.id)&&!note)return false;
+          if(message.isError||(!groupsByResult.has(entry.id)&&!note))return false;
           continue;
         }
       }
@@ -151,7 +167,22 @@ export default function rollingContext(pi:ExtensionAPI) {
     return true;
   };
   const restoreMode=(ctx:any)=>{mode=config.mode;const entry=[...ctx.sessionManager.getBranch()].reverse().find((e:SessionEntry)=>e.type==="custom"&&e.customType==="rolling-context.config.v1");const saved=(entry as any)?.data?.mode;if(saved==="on"||saved==="off"||saved==="observe")mode=saved;};
-  pi.on("session_start",(_event,ctx)=>{restoreMode(ctx);const state=rebuildState(ctx);lastStatus=`mode=${mode}; items=${state.snapshot.items.length}; diagnostics=${state.diagnostics.length}`;});
+  const recordTurnZero=(ctx:any)=>{
+    const branch=ctx.sessionManager.getBranch();
+    if(branch.some((entry:SessionEntry)=>entry.type==="custom"&&entry.customType===TELEMETRY_TYPE&&(entry.data as any)?.turn===0))return;
+    if(turnClock(branch).turn>0||branch.some((entry:SessionEntry)=>entry.type==="message"&&entry.message.role==="assistant"))return;
+    const projection=ctx.sessionManager.buildSessionProjection().entries as ProjectedSessionEntry[];
+    const state=rebuild(branch,ctx.sessionManager.getSessionId());
+    const usage=ctx.getContextUsage?.();
+    const contextWindow=Number.isSafeInteger(ctx.model?.contextWindow)&&ctx.model.contextWindow>0?ctx.model.contextWindow:usage?.contextWindow;
+    const target=effectiveTarget({...config,mode,contextWindow});
+    const raw=branch.filter((entry:SessionEntry):entry is Extract<SessionEntry,{type:"message"}>=>entry.type==="message").map((entry:SessionEntry)=>({sourceEntry:entry,messages:[(entry as Extract<SessionEntry,{type:"message"}>).message]})) as ProjectedSessionEntry[];
+    const warmIds=new Set(ownedEdits(branch).keys());
+    const nullValue=null;
+    const data={type:TELEMETRY_TYPE,turn:0,timelineKind:"initial",messageEntryId:null,epoch:turnClock(branch).epoch,mode,tokenBasis:"host-estimate",rawTokens:estimateProjection(raw),projectedTokens:estimateProjection(projection),effectiveTokens:estimateProjection(projection),afterWarmTokens:nullValue,afterCheckpointTokens:nullValue,targetTokens:target,softThresholdTokens:Math.ceil(target*1.2),hardThresholdTokens:contextWindow===undefined?nullValue:Math.max(0,contextWindow-config.reserveTokens-Math.max(2048,Math.ceil(contextWindow*0.05))),...contextComposition(projection,warmIds),...warmEffectiveness(projection,branch,warmIds),capsulesCreated:0,capsuleTokensSaved:0,checkpointWanted:false,checkpointCandidate:false,checkpointBlockedBy:[],checkpointCreated:false,checkpointReason:null,protectedTokens:0,protectedTokensByReason:{},eligibleHistoricalTokens:0,stateBytes:serializedStateBytes(state.envelope??state.snapshot),stateLimitBytes:MAX_STATE_BYTES,input:nullValue,uncachedInput:nullValue,cacheRead:nullValue,cacheWrite:nullValue,cacheReuseRatio:nullValue,usage:{input:nullValue,uncachedInput:nullValue,cacheRead:nullValue,cacheWrite:nullValue},providerContextTokens:typeof usage?.tokens==="number"?usage.tokens:nullValue,planValid:true,attemptedStateBytes:nullValue,planRejectedReason:nullValue};
+    pi.appendEntry(TELEMETRY_TYPE,data);
+  };
+  pi.on("session_start",(_event,ctx)=>{restoreMode(ctx);recordTurnZero(ctx);const state=rebuildState(ctx);lastStatus=`mode=${mode}; items=${state.snapshot.items.length}; diagnostics=${state.diagnostics.length}`;});
   pi.on("session_tree",(_event,ctx)=>{restoreMode(ctx);const state=rebuildState(ctx);lastStatus=`mode=${mode}; branch=${ctx.sessionManager.getLeafId()??"empty"}; items=${state.snapshot.items.length}`;});
   pi.on("turn_end",async(event,ctx)=>{
     const state=rebuildState(ctx);
@@ -179,14 +210,29 @@ export default function rollingContext(pi:ExtensionAPI) {
     const editDrafts=applied.filter(d=>d.type==="context_edit");
     const checkpoint=applied.find(d=>d.type==="compaction");
     const envelope=applied.find(d=>d.type==="custom"&&d.customType==="rolling-context.state.v1");
-    const warmIds=new Set(ownedEdits(branch).keys());for(const d of editDrafts)warmIds.add(d.targetId);
+    const warmIds=new Set(ownedEdits(branch).keys());if(mode==="on")for(const d of editDrafts)warmIds.add(d.targetId);
     const metric=(value:unknown)=>typeof value==="number"&&Number.isFinite(value)?value:null;
-    const telemetry={type:TELEMETRY_TYPE,turn,messageEntryId:event.messageEntryId,epoch:clock.epoch+(checkpoint?1:0),mode,
+    const uncachedInput=metric(usage?.input),cacheRead=metric(usage?.cacheRead),cacheWrite=metric(usage?.cacheWrite);
+    const cacheDenominator=uncachedInput!==null&&cacheRead!==null?uncachedInput+cacheRead:0;
+    const cacheReuseRatio=cacheDenominator>0?cacheRead!/cacheDenominator:null;
+    const actualWarm=warmEffectiveness(effective,branch,warmIds);
+    const checkpointBlockedBy=planning.checkpointBlockedBy??[];
+    const hardThreshold=contextWindow===undefined?null:Math.max(0,contextWindow-config.reserveTokens-Math.max(2048,Math.ceil(contextWindow*0.05)));
+    const telemetry={type:TELEMETRY_TYPE,turn,timelineKind:"completed",eventPosition:"after-turn",messageEntryId:event.messageEntryId,epoch:clock.epoch+(checkpoint?1:0),mode,
       tokenBasis:"host-estimate",rawTokens:estimateProjection(branch.filter((e):e is Extract<SessionEntry,{type:"message"}>=>e.type==="message").map(e=>({sourceEntry:e,messages:[e.message]}))),
       projectedTokens:tokens,effectiveTokens:estimateProjection(effective),afterWarmTokens:planning.afterWarmTokens??(afterWarm?estimateProjection(afterWarm):null),afterCheckpointTokens:planning.afterCheckpointTokens??(preview?estimateProjection(preview):null),
-      ...contextComposition(effective,warmIds),capsulesCreated:editDrafts.length,capsuleTokensSaved:applied.length&&afterWarm?tokens-estimateProjection(afterWarm):0,
-      checkpointCreated:!!checkpoint,checkpointReason:checkpoint?(checkpoint.details as any)?.reason??null:null,
-      stateBytes:serializedStateBytes(envelope?.data??state.envelope??state.snapshot),input:metric(usage?.input),cacheRead:metric(usage?.cacheRead),cacheWrite:metric(usage?.cacheWrite),
+      targetTokens:budget,softThresholdTokens:Math.ceil(budget*1.2),hardThresholdTokens:hardThreshold,stateLimitBytes:MAX_STATE_BYTES,
+      ...contextComposition(effective,warmIds),...actualWarm,capsulesCreated:editDrafts.length,
+      warmEventSourceTokens:mode==="on"&&editDrafts.length?planning.warmSourceTokens??0:0,warmEventCapsuleTokens:mode==="on"&&editDrafts.length?planning.warmCapsuleTokens??0:0,warmEventTokensSaved:mode==="on"&&editDrafts.length?planning.warmTokensSaved??0:0,
+      capsuleTokensSaved:mode==="on"&&editDrafts.length?planning.warmTokensSaved??0:0,
+      earliestMutationPosition:mode==="on"&&editDrafts.length?planning.earliestMutationPosition??null:null,earliestMutationEntryId:mode==="on"&&editDrafts.length?planning.earliestMutationEntryId??null:null,
+      projectedTokensBeforeMutation:mode==="on"&&editDrafts.length?planning.projectedTokensBeforeMutation??null:null,estimatedInvalidatedSuffixTokens:mode==="on"&&editDrafts.length?planning.estimatedInvalidatedSuffixTokens??0:0,
+      plannedWarmSourceTokens:planning.warmSourceTokens??0,plannedWarmCapsuleTokens:planning.warmCapsuleTokens??0,plannedWarmTokensSaved:planning.warmTokensSaved??0,
+      checkpointWanted:planning.checkpointWanted??false,checkpointCandidate:planning.checkpointCandidate??false,checkpointBlockedBy,checkpointCreated:!!checkpoint,
+      checkpointReason:checkpoint?(checkpoint.details as any)?.reason??null:planning.checkpointReason??null,protectedTokens:planning.protectedTokens??0,protectedTokensByReason:planning.protectedTokensByReason??{},eligibleHistoricalTokens:planning.eligibleHistoricalTokens??0,
+      checkpointBoundaryEntryId:planning.checkpointBoundaryEntryId??null,checkpointKeptTokens:planning.checkpointKeptTokens??null,checkpointEstimatedTokens:planning.checkpointEstimatedTokens??null,checkpointPreviewTokens:planning.checkpointPreviewTokens??null,
+      stateBytes:serializedStateBytes(envelope?.data??state.envelope??state.snapshot),input:uncachedInput,uncachedInput,cacheRead,cacheWrite,cacheReuseRatio,
+      usage:{input:uncachedInput,uncachedInput,cacheRead,cacheWrite,cacheReuseRatio},
       providerContextTokens:metric(current?.tokens),planValid:valid,attemptedStateBytes:planning.attemptedStateBytes??null,planRejectedReason:planning.rejection??null};
     const result={entries:[...event.entries,...applied,{type:"custom" as const,customType:TELEMETRY_TYPE,data:telemetry}]};
     const analysis=analyzeGroups(projection,state.snapshot);
@@ -219,16 +265,39 @@ export default function rollingContext(pi:ExtensionAPI) {
     const clock=turnClock(ctx.sessionManager.getBranch());
     if(!explicit&&(mode!=="on"||clock.turn-clock.lastCheckpointTurn<config.minCheckpointTurns)){lastStatus+="; native compact delegated: Rolling checkpoint cadence";return;}
     const state=rebuildState(ctx);
+    const projection=ctx.sessionManager.buildSessionProjection().entries as ProjectedSessionEntry[];
+    if(!continuitySufficient(state.snapshot)){
+      const extracted=extractContinuityFallback(projection,state.snapshot);
+      if(!extracted.ok){
+        lastStatus+="; checkpoint blocked: MISSING_CONTINUITY_STATE";
+        if(explicit){ctx.ui.notify("Rolling checkpoint cancelled: bounded continuity extraction could not establish a safe task state.","warning");return{cancel:true};}
+        return;
+      }
+    }
     const firstKeptEntryId=event.preparation.firstKeptEntryId;
-    if(!firstKeptEntryId||!checkpointCoverageValid(event.branchEntries,firstKeptEntryId,state)){
+    if(!firstKeptEntryId||!checkpointCoverageValid(event.branchEntries,firstKeptEntryId,state,projection)){
       if(explicit){ctx.ui.notify("Rolling checkpoint cancelled: the task state does not cover every context entry before the proposed boundary.","warning");return {cancel:true};}
       lastStatus+=`; native compact delegated: checkpoint coverage unknown at ${firstKeptEntryId??"missing boundary"}`;return;
     }
     const warm=ownedEdits(event.branchEntries);
     const proposedCut=event.branchEntries.findIndex(e=>e.id===firstKeptEntryId);
     const prefix=new Set(event.branchEntries.slice(0,proposedCut).map(e=>e.id));
-    const oldGroups=groups(ctx.sessionManager.buildSessionProjection().entries).filter(g=>prefix.has(g.assistantId));
-    if(!explicit&&oldGroups.some(g=>g.results.some(r=>["read","bash","edit"].includes(r.message.toolName)&&(!warm.has(r.id)||clock.turn-(warm.get(r.id)?.warmTurn??clock.turn)<config.minCheckpointTurns)))){lastStatus+="; native compact delegated: hot evidence / warm residence";return;}
+    const oldGroups=groups(projection).filter(g=>prefix.has(g.assistantId));
+    const contextWindow=Number.isSafeInteger(ctx.model?.contextWindow)&&ctx.model!.contextWindow>0?ctx.model!.contextWindow:ctx.getContextUsage()?.contextWindow;
+    const hard=contextWindow===undefined?Infinity:Math.max(0,contextWindow-config.reserveTokens-Math.max(2048,Math.ceil(contextWindow*0.05)));
+    const emergency=event.preparation.tokensBefore>hard;
+    const valuableUnwarmed=oldGroups.some(group=>group.results.some(result=>{
+      if(warm.has(result.id))return false;
+      const source=event.branchEntries.find(entry=>entry.id===result.id);
+      if(source?.type!=="message"||source.message.role!=="toolResult"||!Array.isArray(source.message.content)||source.message.content.some((part:any)=>part.type!=="text"))return false;
+      const original=source.message.content.map((part:any)=>part.text).join("\n"),capsule=makeCapsule(group,event.branchEntries,result.id);
+      return !!capsule&&original.length-capsule.length>=config.minSavingTokens*4;
+    }));
+    if(valuableUnwarmed&&!emergency){lastStatus+="; checkpoint blocked: WARM_REQUIRED";if(explicit){ctx.ui.notify("Rolling checkpoint cancelled: valuable historical evidence must enter warm and satisfy residence before checkpointing.","warning");return{cancel:true};}return;}
+    const tooYoungWarm=oldGroups.some(group=>group.results.some(result=>{
+      const committed=warm.get(result.id);return !!committed&&!emergency&&clock.turn-(committed.warmTurn??clock.turn)<config.minCheckpointTurns;
+    }));
+    if(tooYoungWarm){lastStatus+="; checkpoint blocked: WARM_RESIDENCE";if(explicit){ctx.ui.notify("Rolling checkpoint cancelled: a committed warm source has not met its residence period.","warning");return{cancel:true};}return;}
     boundMemory(state.snapshot);
     const summary=renderCheckpoint(state.snapshot);
     const cut=event.branchEntries.findIndex(entry=>entry.id===firstKeptEntryId);
@@ -263,7 +332,7 @@ export default function rollingContext(pi:ExtensionAPI) {
     if(verb==="pin"||verb==="unpin"){
       const id=rest[0];if(!id){ctx.ui.notify(`Usage: /rolling-context ${verb} ITEM_ID\n先用 /rolling-context inspect 查看条目 ID。`,"warning");return;}
       const state=rebuildState(ctx);const item=state.snapshot.items.find(candidate=>candidate.id===id);if(!item){ctx.ui.notify(`Unknown active-branch item ${id}`,"error");return;}
-      item.pinned=verb==="pin";state.snapshot.revision++;
+      item.pinned=verb==="pin";item.pinReason=verb==="pin"?"explicit":undefined;state.snapshot.revision++;
       const envelope={schemaVersion:1 as const,revision:state.snapshot.revision,planId:hash([ctx.sessionManager.getSessionId(),ctx.sessionManager.getLeafId(),id,verb,state.snapshot.revision]).slice(0,24),baseLeafId:ctx.sessionManager.getLeafId(),snapshot:state.snapshot,edits:state.envelope?.edits??[],checkpoint:state.envelope?.checkpoint};
       if(serializedStateBytes(envelope)>MAX_STATE_BYTES){ctx.ui.notify("Rolling Context state exceeds 128 KiB; pin state was not written.","error");return;}
       pi.appendEntry("rolling-context.state.v1",envelope);ctx.ui.notify(`${verb}ned ${id}`,"info");return;

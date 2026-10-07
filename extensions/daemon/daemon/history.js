@@ -114,26 +114,49 @@ function sanitizeMessage(message) {
 function httpError(status, message) { const error = new Error(message); error.status = status; return error; }
 async function readTelemetry(sessionFile, sessionId, leafId) {
   const branch = await readBranch(sessionFile, sessionId, leafId);
-  const numeric = ['turn','epoch','rawTokens','projectedTokens','effectiveTokens','afterWarmTokens','afterCheckpointTokens','hotTokens','warmTokens','checkpointTokens','otherTokens','capsulesCreated','capsuleTokensSaved','stateBytes','attemptedStateBytes','cacheRead','cacheWrite','input','providerContextTokens'];
+  const numeric = ['turn','epoch','rawTokens','projectedTokens','effectiveTokens','afterWarmTokens','afterCheckpointTokens','targetTokens','softThresholdTokens','hardThresholdTokens','hotTokens','warmTokens','checkpointTokens','otherTokens','warmSourceTokens','warmCapsuleTokens','warmTokensSaved','warmEventSourceTokens','warmEventCapsuleTokens','warmEventTokensSaved','plannedWarmSourceTokens','plannedWarmCapsuleTokens','plannedWarmTokensSaved','eligibleHistoricalTokens','protectedTokens','earliestMutationPosition','projectedTokensBeforeMutation','estimatedInvalidatedSuffixTokens','checkpointKeptTokens','checkpointEstimatedTokens','checkpointPreviewTokens','capsulesCreated','capsuleTokensSaved','stateBytes','stateLimitBytes','attemptedStateBytes','cacheRead','cacheWrite','input','uncachedInput','cacheReuseRatio','providerContextTokens'];
+  const blockedCodes = new Set(['MISSING_CONTINUITY_STATE','CHECKPOINT_CADENCE','WARM_REQUIRED','WARM_RESIDENCE','ACTIVE_DEPENDENCY','ACTIVE_PATH_DEPENDENCY','UNRESOLVED_ERROR','UNSUPPORTED_CONTENT','UNSUPPORTED_TOOL_OR_RESULT','IMAGE','FOREIGN_EDIT','NO_SAFE_BOUNDARY','NO_NET_SAVING','STATE_SIZE_LIMIT','INVALID_FINAL_PROJECTION','INCOMPLETE_TOOL_GROUP','NOT_CONSUMED','RECENT_GROUP','PINNED_SOURCE','LATEST_USER_REQUEST','PROTECTED_SET_OVER_BUDGET']);
   const turns = branch.filter(e => e.type === 'custom' && e.customType === 'rolling-context.telemetry.v1').map(e => {
     const d = e.data || {}, row = {};
     for (const key of numeric) row[key] = typeof d[key] === 'number' && Number.isFinite(d[key]) && d[key] >= 0 ? d[key] : null;
     row.mode = ['on','off','observe'].includes(d.mode) ? d.mode : 'unknown';
+    row.timelineKind = d.timelineKind === 'initial' ? 'initial' : 'completed';
+    row.eventPosition = d.eventPosition === 'after-turn' ? 'after-turn' : null;
     row.checkpointCreated = d.checkpointCreated === true;
-    row.planRejectedReason = ['STATE_SIZE_LIMIT','INVALID_FINAL_PROJECTION'].includes(d.planRejectedReason) ? d.planRejectedReason : null;
+    row.checkpointWanted = d.checkpointWanted === true;
+    row.checkpointCandidate = d.checkpointCandidate === true;
+    row.checkpointBlockedBy = Array.isArray(d.checkpointBlockedBy) ? [...new Set(d.checkpointBlockedBy.filter(code => blockedCodes.has(code)))].slice(0,16) : [];
+    row.protectedTokensByReason = d.protectedTokensByReason && typeof d.protectedTokensByReason === 'object' && !Array.isArray(d.protectedTokensByReason) ? Object.fromEntries(Object.entries(d.protectedTokensByReason).filter(([key,value]) => blockedCodes.has(key) && typeof value === 'number' && Number.isFinite(value) && value >= 0).slice(0,24)) : {};
+    row.earliestMutationEntryId = typeof d.earliestMutationEntryId === 'string' && d.earliestMutationEntryId.length <= 128 ? d.earliestMutationEntryId : null;
+    row.checkpointBoundaryEntryId = typeof d.checkpointBoundaryEntryId === 'string' && d.checkpointBoundaryEntryId.length <= 128 ? d.checkpointBoundaryEntryId : null;
+    row.planRejectedReason = blockedCodes.has(d.planRejectedReason) ? d.planRejectedReason : null;
     row.checkpointReason = ['hard','after-warm-budget','manual','threshold','overflow'].includes(d.checkpointReason) ? d.checkpointReason : null;
+    const usage = d.usage && typeof d.usage === 'object' ? d.usage : {};
+    row.usage = {
+      input: typeof usage.input === 'number' && Number.isFinite(usage.input) && usage.input >= 0 ? usage.input : row.input,
+      uncachedInput: typeof usage.uncachedInput === 'number' && Number.isFinite(usage.uncachedInput) && usage.uncachedInput >= 0 ? usage.uncachedInput : row.uncachedInput ?? row.input,
+      cacheRead: typeof usage.cacheRead === 'number' && Number.isFinite(usage.cacheRead) && usage.cacheRead >= 0 ? usage.cacheRead : row.cacheRead,
+      cacheWrite: typeof usage.cacheWrite === 'number' && Number.isFinite(usage.cacheWrite) && usage.cacheWrite >= 0 ? usage.cacheWrite : row.cacheWrite,
+      cacheReuseRatio: typeof usage.cacheReuseRatio === 'number' && Number.isFinite(usage.cacheReuseRatio) && usage.cacheReuseRatio >= 0 && usage.cacheReuseRatio <= 1 ? usage.cacheReuseRatio : row.cacheReuseRatio,
+    };
+    if (row.cacheReuseRatio === null && row.usage.cacheRead !== null && row.usage.uncachedInput !== null && row.usage.cacheRead + row.usage.uncachedInput > 0) row.cacheReuseRatio = row.usage.cacheRead / (row.usage.cacheRead + row.usage.uncachedInput);
     return row;
-  }).filter(row => Number.isSafeInteger(row.turn) && row.turn > 0);
-  const checkpoints = branch.filter(e => e.type === 'compaction').map(e => {
+  }).filter(row => Number.isSafeInteger(row.turn) && row.turn >= 0);
+  if (!turns.some(row => row.turn === 0 && row.timelineKind === 'initial')) {
+    for (let i = turns.length - 1; i >= 0; i--) if (turns[i].turn === 0) turns.splice(i, 1);
+    turns.unshift({ turn: 0, timelineKind: 'unknown', mode: 'unknown', gap: true, ...Object.fromEntries(numeric.filter(key => key !== 'turn').map(key => [key, null])), checkpointCreated: false, checkpointWanted: false, checkpointCandidate: false, checkpointBlockedBy: [], protectedTokensByReason: {}, usage: { input: null, uncachedInput: null, cacheRead: null, cacheWrite: null, cacheReuseRatio: null } });
+  }
+  turns.sort((a, b) => a.turn - b.turn);
+  let observedTurn = 0;
+  const checkpoints = [];
+  for (const e of branch) {
+    if (e.type === 'custom' && e.customType === 'rolling-context.telemetry.v1' && Number.isSafeInteger(e.data?.turn) && e.data.turn >= 0) observedTurn = Math.max(observedTurn, e.data.turn);
+    if (e.type !== 'compaction') continue;
     const d = e.details, c = d?.stateEnvelope?.checkpoint;
     const summaryHash = require('node:crypto').createHash('sha256').update(e.summary || '').digest('hex');
     const rolling = d?.type === 'rolling-context.checkpoint.v1' && d.firstKeptEntryId === e.firstKeptEntryId && d.summaryHash === summaryHash && c?.firstKeptEntryId === e.firstKeptEntryId && c?.summaryHash === summaryHash;
-    return {
-      turn: Number.isSafeInteger(d?.turn) ? d.turn : null,
-      rolling,
-      reason: ['hard','after-warm-budget','manual','threshold','overflow'].includes(d?.reason) ? d.reason : null,
-    };
-  });
-  return { turns, checkpoints, tokenBasis: 'host-estimate', rawBasis: 'raw message history (system/user/assistant/tool)', snapshotTimestamp: branch.at(-1)?.timestamp || null };
+    checkpoints.push({ turn: Number.isSafeInteger(d?.turn) ? d.turn : observedTurn > 0 ? observedTurn : null, rolling, kind: rolling ? 'checkpoint' : 'foreign', reason: ['hard','after-warm-budget','manual','threshold','overflow'].includes(d?.reason) ? d.reason : null, eventPosition: 'after-turn' });
+  }
+  return { turns, checkpoints, tokenBasis: 'host-estimate', usageBasis: 'Pi Usage.input is uncached input; cacheRead is reported cached input', turnZero: turns.find(row => row.turn === 0)?.timelineKind === 'initial' ? 'measured' : 'gap', rawBasis: 'raw message history (system/user/assistant/tool)', snapshotTimestamp: branch.at(-1)?.timestamp || null };
 }
 module.exports = { findSessionFile, readHistory, readTelemetry };
