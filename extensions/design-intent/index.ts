@@ -93,7 +93,7 @@ export default function designIntent(pi:ExtensionAPI){
     let review:{status:"pending"|"committed"|"rejected_pending_reason"|"cancelled"|"failed"|"uncertain";message:string}={status:"pending",message:`Proposal ${proposal.proposalId} saved for review. No project file was changed. Use /design-intent review ${proposal.proposalId}.`};
     let terminate=false;
     if(ctx.hasUI){
-      const choice=await ctx.ui.select(`Design Intent proposal ${proposal.proposalId}\nSource revision ${proposal.baseRevision} · hash ${proposal.baseHash}\n\n${JSON.stringify(proposal.draft,null,2)}\n\nAccept: review the exact file diff and confirm. Reject: stop this workflow and explain the reason in your next message, without writing the project store. Later: keep the proposal pending.`,["Accept","Reject","Later"],{signal:signal??ctx.signal});
+      const choice=await ctx.ui.select(`Design Intent proposal ${proposal.proposalId}\nAccept opens the full candidate diff for a separate confirmation. Reject stops this workflow; explain the reason in your next message. Later keeps the proposal pending.`,["Accept","Reject","Later"],{signal:signal??ctx.signal});
       if(signal?.aborted||ctx.signal?.aborted||ctx.sessionManager.getSessionId()!==sessionId){review={status:"cancelled",message:"Proposal review cancelled: session changed or operation was aborted. No project file was changed."};}
       else if(choice==="Reject"){
         review={status:"rejected_pending_reason",message:`Proposal ${proposal.proposalId} 已 Reject，当前工作流已停止。请在下一条普通消息中说明 reject 理由。\nNo project file was changed. 若要将否决及理由保存为项目记录，可使用 /design-intent reject ${proposal.proposalId} <reason>。不要推断理由或自动提交否决记录。`};

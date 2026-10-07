@@ -39,7 +39,7 @@ async function waitPrompt(broker, method) {
 test('Later, dismissal, headless and Reject never create the project store; Reject aborts and asks naturally for a reason',async t=>{
   for(const choice of ['Later',undefined,'Reject']){
     const f=await fixture(t,[choice]);const result=await f.call();await assertNoStore(f);assert.equal(Check(f.tool.outputSchema,result.structuredContent),true);
-    assert.deepEqual(f.prompts[0].options,['Accept','Reject','Later']);assert.match(f.prompts[0].title,/Existing consumers/);
+    assert.deepEqual(f.prompts[0].options,['Accept','Reject','Later']);assert.match(f.prompts[0].title,/Accept opens the full candidate diff/);assert.doesNotMatch(f.prompts[0].title,/Keep the public API compatible|Existing consumers/);
     assert.equal(f.manager.getBranch().find(entry=>entry.customType==='design-intent.proposal.v1').data.proposalHash,result.details.proposalHash);
     assert.equal(rebuildProposals(f.manager.getBranch()).get(result.details.proposalId).proposalHash,result.details.proposalHash);
     assert.equal(f.prompts.length,1);
