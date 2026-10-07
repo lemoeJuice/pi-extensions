@@ -1,0 +1,279 @@
+{
+  "schemaVersion": 1,
+  "revision": 6,
+  "records": [
+    {
+      "kind": "invariant",
+      "title": "Design Intent 与 Rolling Context 的单一权威分界",
+      "statement": "Design Intent 是项目级长期 requirements、architectural invariants、关键设计决策及其演化记录的唯一权威；Rolling Context 仅管理当前任务的执行记忆，包括 task-decision、焦点、下一步及有来源的执行证据。Rolling Context 的 context_note、任务记录、代码修改或测试结果不得创建、接受、覆盖或 supersede 项目级 intent；Design Intent 不保存 Rolling Context 的任务工作记忆。",
+      "rationale": "两项设计文档和集成说明明确将项目长期意图与单任务执行状态分开，并禁止从 task-decision、代码或测试结果自动晋升项目事实。单一来源可避免插件状态分叉和旧任务状态改变项目架构真相。",
+      "scope": {
+        "paths": [
+          "extensions/design-intent/docs/design.md",
+          "extensions/rolling-context/docs/design.md",
+          "extensions/design-intent/docs/integration.md",
+          "extensions/rolling-context/docs/implementation.md"
+        ],
+        "tags": [
+          "design-intent",
+          "rolling-context",
+          "plugin-boundary"
+        ]
+      },
+      "supersedes": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "sources": [
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/integration.md:13-18"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/design.md:15-17"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/rolling-context/docs/design.md:29-33"
+        },
+        {
+          "kind": "proposal",
+          "ref": "DIP-5f77962334574a32:607c0cc246358325cf3fdf5412b803350370e33a09fae9ddeea9eeb9a54dda90"
+        }
+      ],
+      "id": "DI-0001",
+      "status": "accepted",
+      "review": {
+        "note": "Approved by user through proposal UI",
+        "recordedAt": "2026-10-07T09:43:40.832Z"
+      },
+      "createdInRevision": 1
+    },
+    {
+      "kind": "invariant",
+      "title": "Rolling Context 仅通过版本化引用读取 Design Intent",
+      "statement": "跨插件依赖保持单向且可选：Rolling Context 可消费 Design Intent 的 query/get 结果或兼容的 `design-intent.projection.v1`，在当前 session branch 只保存相关 intent 的 ID、storePath、storeRevision、sourceHash 和有界短投影；不得直接读取 Design Intent 文件或依赖其私有模块。Design Intent 不导入、不读取、不修改 Rolling Context 状态。源路径、revision 或 hash 变化时，旧引用仅是历史快照，必须标为待核验并通过 Design Intent 重新查询；不得从 session history 恢复为当前项目真相。",
+      "rationale": "集成说明和两侧实现文档明确约定一向依赖、最小引用 payload、独立加载，以及 stale projection 的复核方式。该契约避免复制第二套批准状态库，也使任一插件可独立运行。",
+      "scope": {
+        "paths": [
+          "extensions/design-intent/docs/integration.md",
+          "extensions/design-intent/docs/design.md",
+          "extensions/design-intent/docs/implementation.md",
+          "extensions/rolling-context/docs/design.md",
+          "extensions/rolling-context/docs/implementation.md"
+        ],
+        "tags": [
+          "design-intent",
+          "rolling-context",
+          "projection",
+          "plugin-boundary"
+        ]
+      },
+      "supersedes": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "sources": [
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/integration.md:5-18"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/rolling-context/docs/implementation.md:314-324"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/rolling-context/docs/design.md:143-148,176"
+        },
+        {
+          "kind": "proposal",
+          "ref": "DIP-d12e10e817444a32:cfa7f7f6cc32db381af978442000eeb0e87c3e55f5fb7c3ccbe360577ecd06bf"
+        }
+      ],
+      "id": "DI-0002",
+      "status": "accepted",
+      "review": {
+        "note": "Approved by user through proposal UI",
+        "recordedAt": "2026-10-07T09:44:53.331Z"
+      },
+      "createdInRevision": 2
+    },
+    {
+      "kind": "invariant",
+      "title": "Design Intent 写入必须经过明确人类审批",
+      "statement": "Design Intent 插件不得因加载、查询、生成提案、任务完成、代码修改或测试通过而自动创建或写入项目权威 store。模型提出的内容只是 session-local proposal；写入 accepted intent 必须先由用户明确选择 Accept，并确认绑定当前 source hash/revision 的准确候选 diff。Later、关闭审批、无 UI 提案及即时 Reject（尚无明确理由）不写权威文件。缺失 store 表示尚未建立意图库，不表示项目没有约束；读取失败或损坏表示 unavailable，不得按空库初始化覆盖。首次权威写入只能是明确审批后的提交，或用户明确给出理由并确认的拒绝记录。",
+      "rationale": "Design Intent 设计与实现文档将 proposed 与 accepted 权威状态分开，规定精确 diff 确认、无 UI 默认不提交，并明确 missing/unavailable 语义和首次创建边界。这可防止模型输出或误读空文件变成项目级规则。",
+      "scope": {
+        "paths": [
+          "extensions/design-intent/docs/design.md",
+          "extensions/design-intent/docs/implementation.md",
+          "extensions/design-intent/docs/integration.md"
+        ],
+        "tags": [
+          "design-intent",
+          "approval",
+          "store-lifecycle",
+          "provenance"
+        ]
+      },
+      "supersedes": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "sources": [
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/design.md:25-29,59-72,169-173"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/implementation.md:82-90,174-190,212-226"
+        },
+        {
+          "kind": "proposal",
+          "ref": "DIP-a9cfaf559c4aa3df:e7d6df94edb49083ad0a569ae8c7cc265eefe51caae3e0309dd6d459315aa6dd"
+        }
+      ],
+      "id": "DI-0003",
+      "status": "accepted",
+      "review": {
+        "note": "Approved by user through proposal UI",
+        "recordedAt": "2026-10-07T09:48:41.415Z"
+      },
+      "createdInRevision": 3
+    },
+    {
+      "kind": "invariant",
+      "title": "Design Intent store 固定在当前受信任工作区",
+      "statement": "Design Intent 只把 Pi 启动时的 canonical `ctx.cwd` 作为本项目根，并将权威文件定位为 `<ctx.cwd>/.pi/design-intent.json`。不得向父目录或其他项目自动搜索、回退或合并 intent store；`.pi` 目录和 store 文件必须是项目内普通路径，不跟随符号链接越界。缺失与不可读取/损坏必须分别报告；切换项目须从新工作区重新定位。",
+      "rationale": "当前 `findProject(cwd)` 对 cwd 做 realpath 后只构造该目录下的 store 路径，明确不向父级扫描；加载器也校验路径边界并拒绝 symlink。固定根避免嵌套项目意外继承或写入上层约束。",
+      "scope": {
+        "paths": [
+          "extensions/design-intent/lib.ts",
+          "extensions/design-intent/index.ts",
+          "extensions/design-intent/docs/implementation.md",
+          "extensions/design-intent/docs/design.md"
+        ],
+        "tags": [
+          "design-intent",
+          "workspace-root",
+          "store-security"
+        ]
+      },
+      "supersedes": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "sources": [
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/lib.ts:61-72"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/implementation.md:3-7,46-61,82-90"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/design.md:23-29"
+        },
+        {
+          "kind": "proposal",
+          "ref": "DIP-de236e3a925b8aff:af4b601d63ea1710ede96a51561300fff1edd7195a1009c705f908bde239965d"
+        }
+      ],
+      "id": "DI-0004",
+      "status": "accepted",
+      "review": {
+        "note": "Approved by user through proposal UI",
+        "recordedAt": "2026-10-07T09:51:53.409Z"
+      },
+      "createdInRevision": 4
+    },
+    {
+      "kind": "invariant",
+      "title": "Intent check 只能报告限定证据，不能充当合规证书",
+      "statement": "Design Intent 的 check 结果必须绑定当前 store revision/sourceHash、选定路径和实际取得的证据；拒绝、缺失、截断、来源变化、未覆盖范围或语义不明时返回 `unknown`。`complete` 只表示所选证据完整采集，不表示实现符合所有 intents。`no-violation-found` 仅限明确检查的范围和有证据的规则，不等价于项目整体通过；check 是 advisory evidence，不自动更新 intent，也不作为强制架构 gate。",
+      "rationale": "实现文档明确要求所有检查带来源版本与证据范围，当前语义检查保持 unknown；检查范围有限且自然语言约束通常不能自动判定。显式限定可避免把不完整读取宣传为项目合规。",
+      "scope": {
+        "paths": [
+          "extensions/design-intent/docs/design.md",
+          "extensions/design-intent/docs/implementation.md",
+          "extensions/design-intent/docs/integration.md"
+        ],
+        "tags": [
+          "design-intent",
+          "evidence",
+          "check-semantics"
+        ]
+      },
+      "supersedes": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "sources": [
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/design.md:135-146"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/integration.md:16-18"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/implementation.md:270-300"
+        },
+        {
+          "kind": "proposal",
+          "ref": "DIP-a5e673414bd68b02:254cddad3649cce8bbb2d9ae7f1c45097144ca1ccc2e68204571d611bfb18c6b"
+        }
+      ],
+      "id": "DI-0005",
+      "status": "accepted",
+      "review": {
+        "note": "Approved by user through proposal UI",
+        "recordedAt": "2026-10-07T09:52:39.181Z"
+      },
+      "createdInRevision": 5
+    },
+    {
+      "kind": "invariant",
+      "title": "Intent 变更必须保留历史并显式演化",
+      "statement": "Accepted intent 的正文、理由和 scope 不原地改写。设计变更通过新的 intent ID/revision 和显式 supersedes 提案完成，旧记录及其来源保留；依赖、冲突和 supersede 关系必须校验，不得静默修复冲突、自动迁移依赖或把 rejected/superseded 记录当作当前约束。依赖失效或需复核时显式标示 needs-review。",
+      "rationale": "Design Intent 的数据模型保存状态、sources、review 和关系；演化规则明确要求 supersede 以新记录执行，并保留旧内容与理由。显式关系和 needs-review 诊断可以避免项目设计历史被覆盖或误判为有效。",
+      "scope": {
+        "paths": [
+          "extensions/design-intent/docs/design.md",
+          "extensions/design-intent/docs/implementation.md"
+        ],
+        "tags": [
+          "design-intent",
+          "record-evolution",
+          "relations"
+        ]
+      },
+      "supersedes": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "sources": [
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/design.md:35-61,79-90"
+        },
+        {
+          "kind": "document",
+          "ref": "extensions/design-intent/docs/implementation.md:94-124,216-224"
+        },
+        {
+          "kind": "proposal",
+          "ref": "DIP-6a30e8f7373e4343:2d791c26a57130a8723def165ba0967d32a1028047e7521640d68d8bceae499c"
+        }
+      ],
+      "id": "DI-0006",
+      "status": "accepted",
+      "review": {
+        "note": "Approved by user through proposal UI",
+        "recordedAt": "2026-10-07T09:53:04.680Z"
+      },
+      "createdInRevision": 6
+    }
+  ]
+}
