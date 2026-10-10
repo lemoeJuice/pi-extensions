@@ -8,6 +8,7 @@ import { getDaemonVersion } from './daemon/version.js';
 import { UIBroker } from './ui/broker.ts';
 import { installUIProxy } from './ui/adapter.ts';
 import { dispatchRemoteCommand } from './ui/command-dispatch.ts';
+import { SafeReloadController, sourceFingerprint } from './reload/controller.ts';
 import { UI_VERSION } from './daemon/ui-protocol.js';
 
 const daemonPath = resolve(__dirname, 'daemon/main.js');
@@ -105,6 +106,7 @@ async function ensureDaemon(isCurrent: () => boolean) {
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag('remote-ui-proxy', { type: 'boolean', default: true, description: 'Mirror supported local TUI dialogs to the remote session page (compatibility adapter)' });
+  pi.registerFlag('auto-reload', { type: 'boolean', default: true, description: 'Reload changed package extensions after this Pi becomes safely idle (TUI)' });
   let socket: WebSocket | undefined;
   let stopped = false;
   let connectionGeneration = 0;
@@ -122,6 +124,54 @@ export default function (pi: ExtensionAPI) {
   let broker: UIBroker | undefined;
   let restoreUI: (() => void) | undefined;
   let registeredSocket: WebSocket | undefined;
+  let reloadController: SafeReloadController | undefined;
+  let reloadTimer: ReturnType<typeof setInterval> | undefined;
+  const packageRoot=resolve(__dirname,'../..');
+  const pendingShells:Array<{command:string;before:Set<string>}>=[];
+  const completedShellIds=new Set<string>();
+  let pendingUIPrompt=false;
+
+  function stopReloadWatcher(){if(reloadTimer)clearInterval(reloadTimer);reloadTimer=undefined;reloadController?.stop();reloadController=undefined;pendingShells.length=0;completedShellIds.clear();pendingUIPrompt=false;}
+  function reloadBlocked(ctx:any):string|undefined {
+    if(ctx.mode!=='tui'||!ctx.hasUI||!broker)return 'Safe reload requires the TUI UI proxy; use native /reload when idle';
+    if(!ctx.isIdle())return 'Agent, tools, retry or compaction is active';
+    if(ctx.hasPendingMessages())return 'Queued messages must finish first';
+    if(pendingUIPrompt||broker.hasPendingRequests)return 'A local or remote extension dialog is still pending';
+    if(pendingShells.length){
+      // !/!! commands are outside ctx.isIdle(). A new recorded result is the
+      // only completion evidence available through this fork's public API.
+      const entries=ctx.sessionManager.getEntries();
+      for(let n=pendingShells.length-1;n>=0;n--){const shell=pendingShells[n];
+        const done=entries.find((e:any)=>e.type==='message'&&e.message.role==='bashExecution'&&e.message.command===shell.command&&!shell.before.has(e.id)&&!completedShellIds.has(e.id));
+        if(done){completedShellIds.add(done.id);pendingShells.splice(n,1);}
+      }
+      if(pendingShells.length)return 'A user shell command has no recorded completion yet';
+    }
+    return undefined;
+  }
+
+  pi.registerCommand('reload-safe',{description:'Queue a resource reload; wait for agent, queued work, shell commands and UI to finish',handler:async(args,ctx)=>{
+    if(!reloadController){ctx.ui.notify('Safe reload unavailable here; use native /reload when idle','warning');return;}
+    if(args.trim()==='apply'){
+      await reloadController.apply(()=>ctx.reload());return;
+    }
+    if(args.trim()){ctx.ui.notify('/reload-safe (queue) or /auto-reload status|on|off|cancel','warning');return;}
+    reloadController.request();ctx.ui.notify('Reload queued; active work will finish first','info');sendMetadata(ctx);
+  }});
+  pi.registerCommand('auto-reload',{description:'Automatic package reload: status | on | off | cancel',handler:async(args,ctx)=>{
+    if(!reloadController){ctx.ui.notify('Automatic reload unavailable here','warning');return;}
+    const verb=args.trim()||'status';
+    if(verb==='on'||verb==='off'){
+      const enabled=verb==='on';reloadController.enabled=enabled;
+      if(!enabled)reloadController.cancel();
+      pi.appendEntry('pi.auto-reload.config.v1',{enabled});
+    } else if(verb==='cancel')reloadController.cancel();
+    else if(verb!=='status'){ctx.ui.notify('/auto-reload status|on|off|cancel','warning');return;}
+    ctx.ui.notify(JSON.stringify(reloadController.status()),'info');sendMetadata(ctx);
+  }});
+  pi.on('user_bash',(event,ctx)=>{pendingShells.push({command:event.command,before:new Set(ctx.sessionManager.getEntries().map(e=>e.id))});});
+  pi.on('ui_prompt_start',()=>{pendingUIPrompt=true;});
+  pi.on('ui_prompt_end',()=>{pendingUIPrompt=false;});
 
   function sendUI(frame: any) {
     if (socket !== registeredSocket || socket?.readyState !== WebSocket.OPEN) return;
@@ -134,6 +184,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on('session_start', async (_event, ctx) => {
+    stopReloadWatcher();
     await releaseUI();
     registeredSocket = undefined;
     const generation = ++connectionGeneration;
@@ -152,6 +203,16 @@ export default function (pi: ExtensionAPI) {
       const next = new UIBroker(sendUI);
       try { restoreUI = installUIProxy(ctx.ui, next, () => sendMetadata(ctx)); broker = next; }
       catch (error) { next.dispose(); ctx.ui.notify(`Remote UI proxy unavailable; local UI unchanged: ${String(error)}`, 'warning'); }
+    }
+    if(ctx.mode==='tui'&&broker){
+      const saved=[...ctx.sessionManager.getBranch()].reverse().find(e=>e.type==='custom'&&e.customType==='pi.auto-reload.config.v1');
+      const enabled=typeof (saved as any)?.data?.enabled==='boolean'?(saved as any).data.enabled:pi.getFlag('auto-reload')!==false;
+      try {
+        reloadController=new SafeReloadController({fingerprint:()=>sourceFingerprint(packageRoot),blocked:()=>reloadBlocked(ctx),
+          dispatch:async()=>{await pi.sendUserMessage('/reload-safe apply',{deliverAs:'steer',expandPromptTemplates:true});},
+          report:error=>{try{ctx.ui.notify(`Safe reload deferred: ${String(error)}`,'warning');}catch{/* old runtime may already be invalid */}}},enabled);
+        reloadTimer=setInterval(()=>{void reloadController?.tick();},1500);reloadTimer.unref();
+      }catch(error){ctx.ui.notify(`Automatic reload unavailable: ${String(error)}`,'warning');}
     }
     void connect(ctx, generation);
   });
@@ -249,7 +310,7 @@ export default function (pi: ExtensionAPI) {
       totals.output += Number(usage.output) || 0;
     }
     const activeModel = ctx.model;
-    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), fastMode: inspectFastModeSegment(), contextUsage: ctx.getContextUsage(), totals };
+    return { model: activeModel ? `${activeModel.provider}/${activeModel.id}` : model, thinkingLevel: pi.getThinkingLevel(), fastMode: inspectFastModeSegment(), contextUsage: ctx.getContextUsage(), totals, reload:reloadController?.status() };
   }
   function sendMetadata(ctx: any) {
     if (socket?.readyState === WebSocket.OPEN) sendEvent({ type: 'metadata', metadata: collectMetadata(ctx) });
@@ -314,6 +375,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
   pi.on('session_shutdown', async () => {
+    stopReloadWatcher();
     await releaseUI(); registeredSocket = undefined;
     stopped = true; connectionGeneration++; if (heartbeat) clearInterval(heartbeat); heartbeat = undefined;
     try { socket?.close(); } catch { /* ignored */ }

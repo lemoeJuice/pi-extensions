@@ -13,10 +13,14 @@ export class UIBroker {
   private active?: { request: Request; choose?: (outcome: Outcome) => boolean };
   private localMarkers: Request[] = [];
   private disposed = false;
+  private pendingDialogs = 0;
   private status: Record<string, string> = Object.create(null);
 
   private publish: (frame: any) => void;
   constructor(publish: (frame: any) => void) { this.publish = publish; }
+
+  /** Includes queued dialogs before their native UI has been installed. */
+  get hasPendingRequests(): boolean { return this.pendingDialogs > 0 || this.localMarkers.length > 0; }
 
   snapshot() {
     const request = this.active?.request ?? this.localMarkers.at(-1);
@@ -28,7 +32,8 @@ export class UIBroker {
   private emit(frame: any) { try { this.publish(frame); } catch { /* local UI is independent */ } }
   private changed() { this.revision++; if (!this.disposed) this.emit(this.snapshot()); }
   private enqueue<T>(run: () => Promise<T>): Promise<T> {
-    const result = this.queue.then(run, run);
+    this.pendingDialogs++;
+    const result = this.queue.then(run, run).finally(() => { this.pendingDialogs--; });
     this.queue = result.then(() => undefined, () => undefined);
     return result;
   }

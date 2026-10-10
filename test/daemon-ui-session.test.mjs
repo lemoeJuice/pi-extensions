@@ -110,6 +110,30 @@ test('real daemon extension decorates shared native UI and replays the same pend
   assert.equal(await confirmed, true);
   assert.equal(host.mode.extensionSelector, undefined);
 
+  await t.test('loaded daemon safe reload waits for local agent/queue/UI/shell and retains the same session',async()=>{
+    let idle=false,queued=false,reloads=0;
+    const manager=host.ctx.sessionManager,sid=manager.getSessionId();
+    host.runner.bindCore({getThinkingLevel:()=> 'off',getCommands:()=> [],appendEntry:(type,data)=>manager.appendCustomEntry(type,data),
+      sendUserMessage:async text=>{assert.equal(text,'/reload-safe apply');await host.runner.getCommand('reload-safe').handler('apply',host.runner.createCommandContext());}},
+      {getModel:()=>undefined,getScopedModels:()=>[],isIdle:()=>idle,isProjectTrusted:()=>true,getSignal:()=>undefined,
+        abort:()=>assert.fail('reload must never abort'),hasPendingMessages:()=>queued,shutdown:()=>assert.fail('reload must never exit'),getContextUsage:()=>undefined,compact:()=>assert.fail('reload must never compact'),getSystemPrompt:()=>''});
+    host.runner.bindCommandContext({reload:async()=>{reloads++;}});
+    const command=host.runner.getCommand('reload-safe'),ctx=host.runner.createCommandContext();
+    await host.runner.getCommand('auto-reload').handler('off',ctx);
+    const original=structuredClone(manager.getBranch());
+    await command.handler('',ctx);await command.handler('apply',ctx);assert.equal(reloads,0);
+    idle=true;queued=true;await command.handler('apply',ctx);assert.equal(reloads,0);queued=false;
+    const dialog=host.ctx.ui.confirm('Keep this approval','Reload must wait');
+    await new Promise(setImmediate);await command.handler('apply',ctx);assert.equal(reloads,0);assert.ok(host.mode.extensionSelector);
+    host.mode.extensionSelector.handleInput('\n');await dialog;await new Promise(setImmediate);
+    await host.runner.emitUserBash({type:'user_bash',command:'long test',excludeFromContext:true,cwd:process.cwd()});
+    await command.handler('apply',ctx);assert.equal(reloads,0);
+    assert.deepEqual(manager.getBranch(),original,'request and defer do not rewrite evidence');
+    manager.appendMessage({role:'bashExecution',command:'long test',output:'finished',exitCode:0,cancelled:false,truncated:false,excludeFromContext:true,timestamp:Date.now()});
+    await command.handler('apply',ctx);assert.equal(reloads,1);assert.equal(manager.getSessionId(),sid);
+    await command.handler('apply',ctx);assert.equal(reloads,1);
+  });
+
   await host.runner.emit({ type: 'session_tree' });
   const navigated = await next(frame => frame.type === 'ui_snapshot' && frame.uiEpoch !== snapshot.uiEpoch);
   assert.deepEqual(navigated.pending, []);

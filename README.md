@@ -18,7 +18,7 @@ Helper modules under each extension's `lib/` (or daemon runtime directory) are i
 
 ### Rolling Context and Design Intent
 
-`/rolling-context status` inspects task memory. Automatic rolling edits are opt-in with `--rolling-context-mode on`; observe mode is the default. The extension preserves source history and uses conservative tool-result capsules/checkpoints, with native compaction retained as fallback. See [`extensions/rolling-context/README.md`](extensions/rolling-context/README.md).
+`/rolling-context status` inspects projection v2, enabled by default. Raw evidence remains intact; independent exact/capsule/cold representations dynamically construct model input with cache-aware commits. Graph and Projection View expose actual hook output. See [`extensions/rolling-context/README.md`](extensions/rolling-context/README.md).
 
 Design Intent stores approved project requirements and decisions in `.pi/design-intent.json`. The fixed file is read by default in a trusted current workspace without prompting (`--design-intent-read false` disables reading). Proposals immediately ask **Accept / Reject / Later** when UI is available: Accept requires exact-diff confirmation before writing; Reject stops the agent workflow and asks for the reason in the next ordinary user message, without writing a reasonless rejection; Later keeps the proposal pending. The file is created only by an explicitly approved commit, not by loading, reading, or proposing. `/design-intent accept|reject` remains available for deferred review. See [`extensions/design-intent/README.md`](extensions/design-intent/README.md).
 
@@ -71,6 +71,23 @@ HTTP API:
 Remote command dispatch includes built-in `abort`, `compact`, `thinking`, and `name` controls, as well as commands available in that Pi session. Commands are expanded/dispatched by Pi, not executed by the daemon.
 
 For daemon internals and the wire protocol see [`extensions/daemon/README.md`](extensions/daemon/README.md); the design notes are in [`extensions/daemon/docs/pi-remote-daemon-design.md`](extensions/daemon/docs/pi-remote-daemon-design.md).
+
+### Safe automatic reload
+
+TUI sessions with the default remote UI proxy automatically watch this package's `extensions/` runtime files and `package.json`. After changes settle for two seconds, Pi reloads extensions/resources in the same process and session. It waits for the complete agent run (including tools/retries), compaction, queued messages, local/remote dialogs, and recorded completion of `!`/`!!` shell commands. It never sends abort, TERM/KILL, or opens a replacement session. Reload resets extension runtime state as native `/reload` does; persisted session state survives.
+
+Use `/auto-reload status|on|off|cancel`, or `--auto-reload false`. Explicit on/off is saved per session; off cancels pending reload. `/reload-safe` queues a manual reload regardless of automatic watching. Code checks are polled every 1.5 seconds, and the command repeats the local busy check immediately before calling Pi's public `ctx.reload()`.
+
+Queue all registered writable Pi sessions:
+
+```sh
+./reload-pi-sessions.mjs --dry-run
+./reload-pi-sessions.mjs
+./reload-pi-sessions.mjs --session SESSION_ID
+./restart-pi-session.sh  # current Pi ancestor only; compatibility name, now safe
+```
+
+The script uses `PI_REMOTE_HOST/PORT` or `--url`; `PI_REMOTE_URL` is also supported. Running sessions are queued, not interrupted. Conflicting, offline, unregistered, and old runtimes lacking `reload-safe` are skipped. Existing Pi processes must first load this feature using native `/reload` after their current task finishes. A script cannot safely retrofit a missing extension into a busy process. RPC/headless or disabled UI-proxy sessions stay untouched because this fork does not expose complete UI activity there. If a user shell fails without recording a result, automatic reload stays pending; use native `/reload` only after verifying that shell has ended. Polling covers this package, not third-party plugins or a Pi binary upgrade.
 
 ## Install and run
 
