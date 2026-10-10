@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { CombinedAutocompleteProvider } from '@earendil-works/pi-tui';
-import rollingContext from '../extensions/rolling-context/index.ts';
+// Archived v1 shell regression coverage, including the legacy manual command.
+import rollingContext from '../extensions/rolling-context/legacy/index.ts';
 import designIntent from '../extensions/design-intent/index.ts';
 import { UIBroker } from '../extensions/daemon/ui/broker.ts';
 import { installUIProxy } from '../extensions/daemon/ui/adapter.ts';
@@ -188,7 +189,11 @@ test('manual Rolling Context checkpoint confirms through ordinary UI, including 
  const proxy=proxyUI(request=>{assert.equal(request.method,'confirm');assert.match(request.message,/当前任务/);return{confirmed:true};});
  const ctx={cwd,sessionManager:manager,hasUI:true,waitForIdle:async()=>{},hasPendingMessages:()=>false,ui:proxy.ui,compact:options=>{compactOptions=options;}};
  await pi.commands.get('rolling-context').handler('checkpoint',ctx);
- assert.ok(compactOptions);assert.match(compactOptions.customInstructions,/Do not add or infer project Design Intent/);proxy.restore();
+ assert.ok(compactOptions);assert.match(compactOptions.customInstructions,/Do not add or infer project Design Intent/);
+ const hook=pi.events.get('session_before_compact')[0];const cancelled=await hook({reason:'manual',branchEntries:manager.getBranch(),preparation:{tokensBefore:100000}},ctx);
+ assert.deepEqual(cancelled,{cancel:true});await pi.events.get('session_compact_failed')[0]({reason:'manual',aborted:true},ctx);compactOptions.onError(new Error('Compaction cancelled'));
+ assert.match(proxy.notices.at(-1).message,/MISSING_CONTINUITY_STATE/);assert.doesNotMatch(proxy.notices.at(-1).message,/Compaction cancelled/);
+ await pi.commands.get('rolling-context').handler('status',ctx);assert.match(proxy.notices.at(-1).message,/checkpoint blocked: MISSING_CONTINUITY_STATE/);proxy.restore();
  compactOptions=undefined;await pi.commands.get('rolling-context').handler('checkpoint',{...ctx,hasUI:false});assert.equal(compactOptions,undefined);
 });
 

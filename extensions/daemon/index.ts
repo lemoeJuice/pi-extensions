@@ -7,6 +7,7 @@ import WebSocket from 'ws';
 import { getDaemonVersion } from './daemon/version.js';
 import { UIBroker } from './ui/broker.ts';
 import { installUIProxy } from './ui/adapter.ts';
+import { dispatchRemoteCommand } from './ui/command-dispatch.ts';
 import { UI_VERSION } from './daemon/ui-protocol.js';
 
 const daemonPath = resolve(__dirname, 'daemon/main.js');
@@ -212,10 +213,13 @@ export default function (pi: ExtensionAPI) {
               const available = pi.getCommands().some(command => command.name === msg.name);
               if (!available) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: 'Command is not available in this Pi session' })); return; }
               try {
-                // A dispatch acknowledgement is not command completion. Any subsequent
-                // dialog/notification is mirrored from the same local UI, without plugin hooks.
-                await pi.sendUserMessage(`/${msg.name}${args ? ` ${args}` : ''}`, { deliverAs: 'steer', expandPromptTemplates: true });
-                ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: `Dispatched /${msg.name} to Pi` }));
+                // Extension commands can wait indefinitely for generic remote UI confirmation.
+                // Do not hold the HTTP command request open until that human decision arrives.
+                dispatchRemoteCommand(
+                  () => pi.sendUserMessage(`/${msg.name}${args ? ` ${args}` : ''}`, { deliverAs: 'steer', expandPromptTemplates: true }),
+                  () => ws.send(JSON.stringify({ type: 'request_ack', requestId: msg.requestId, result: `Dispatched /${msg.name} to Pi` })),
+                  error => ctx.ui.notify(`Remote command /${msg.name} failed: ${error instanceof Error ? error.message : String(error)}`, 'error'),
+                );
               }
               catch (error) { ws.send(JSON.stringify({ type: 'request_error', requestId: msg.requestId, error: String(error) })); }
             }

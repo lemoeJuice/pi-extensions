@@ -1,361 +1,103 @@
-# Rolling Context 实现细节设计
+# Rolling Context projection v2
 
-状态：本文是实现蓝图；当前代码是**受限 MVP**，不是本文所有 P0/P1 能力的完整交付。已接入根包清单、提供 note/recall/状态命令、分支回放、工具结果证据、保守裁剪规划及 checkpoint callback。实现集中在 `index.ts`、`lib.ts`，函数/字段与本文拟议接口可能不同。上层决策见 [design.md](design.md)，双插件边界见[集成说明](../../design-intent/docs/integration.md)。
+默认入口 `index.ts` 注册 session lifecycle、context/context_with_system、turn_end、recall 和正常命令。v1 的 `planTurn / checkpointSafe / target / blocker` 全部隔离到 `legacy/v1.ts`，旧 shell 保留在 `legacy/index.ts` 供兼容回归。新 runtime 不使用 checkpoint drafts。
 
-当前明确限制：首版默认 observe，`--rolling-context-mode on` opt-in；预算使用宿主 projection 估算与 `contextWindow`，扣除 reserve 与安全余量，仍非 provider 精确 tokenizer。已实现 cache-aware 批次选择、完整 turn 时钟、warm 驻留/低频 checkpoint、bounded continuity fallback、轻量工作状态、自己的 cold evidence recall 及 daemon Graph View。没有模型提取器、持久检索索引或对所有宿主扩展消息类型的适配。checkpoint 在连续性、来源覆盖、非多模态/外部修改安全和 preview 净收益均可验证时尝试，否则保留上下文/交由原生 compact；这可能导致超预算但避免静默丢失。
-
-## 当前实现的生命周期修正
-
-实现继续集中在 `lib.ts` / `index.ts`，没有按下文蓝图拆出 registry、planner 类或独立数据库，也不更改 Design Intent。
-
-1. `turnClock(branch)` 读取 completed-turn telemetry；`lastWarmTurn` 从实际已提交且 hash 匹配的 edit 元数据恢复，`lastCheckpointTurn` / epoch 从实际匹配的 Rolling compaction 恢复。只有 state、没有 edit/checkpoint 不推进对应生命周期。没有完成 turn 记录的旧历史不换算成 entry 数。
-2. 普通批次间隔 4 completed turns，累计 saving 2048；assistant usage 的 `cacheRead/(input+cacheRead) >= 0.8` 时普通收益门槛翻倍。soft（`projectedTokens > 1.2*target`）可提前到至少 2 turns / 基础 saving 的一半；超过 target 或 hard 时可以覆盖普通 cache-conservation 排序。批次比较 `tokensSaved × expectedResidenceTurns - estimatedInvalidatedSuffixTokens`，同一 stable prefix 后面的 candidates 尽量合并一次 mutation。预算为 `target=effectiveTarget(config)`、`soft=1.2*target`、`hard=window-reserve-max(2048,5% window)`；窗口未知则不推断 hard 压力。
-3. `planTurn` 先 preview inherited + warm drafts，基于 **afterWarmTokens** 判断 checkpoint；再 preview 完整 checkpoint（包括宿主系统 checkpoint），验证边界、协议和净收益。允许净收益为正的渐进 checkpoint，即使单次后仍高于 target。`currentTokens` 不参与候选容量判断。
-4. checkpoint 默认间隔 16 completed turns，普通冷藏只跨越已驻留 warm 至少 16 turns 的工具组；有明显 capsule saving 的未 warm 来源会被边界保护（`WARM_REQUIRED`），而无意义 warm saving 的小型安全证据可直接 HOT→COLD。最新三组、未消费组、pin/活跃路径依赖仍受保护。常规同轮新 warm 不会被 cold；hard emergency 是可绕过 cadence/residence 的安全受限例外；overflow 委托宿主。
-5. MemorySnapshot 不再追加一般 assistant 报告或工具输出正文。当前用户请求最多保留一个精确原文项；符合确定性 modal/constraint 规则的用户句段以原 source ID/span pinned 保存，普通 follow-up 留在 L0，不会被逐轮复制成永久 pin。project/change/test 按工作键更新，普通工作地图每类最多 32 项，coverage 只留最近 64 个轻量来源 disposition。旧来源直接按 branch 搜索，不要求永远留在 snapshot。显式活跃 task-decision 和显式 pin 不被容量策略静默删除；这些真正不可压缩的状态仍可能触发 128 KiB 安全拒绝，报告 `planRejectedReason` / `attemptedStateBytes`。
-6. active warm edit 元数据只保存 `targetId/originalHash/replacementHash/warmTurn`，不复制 capsule 正文。兼容旧 state 的 `replacement`，下次保存去掉。冷藏后的 edit 从新 envelope 移出，所有权证据仍在早期 append-only state/edit 里；hard 同轮生成后冷藏的 edit 在该轮 envelope 留下声明。
-7. `ownedEdits` 顺序校验声明、实际 edit 和原始来源 hash；任何 foreign edit 历史的 target 不恢复 raw。`recallProjection` 只撤销 hash/边界/快照一致的 Rolling compaction，再由宿主重放完整 branch 的 context edits，当前 live projection 优先。存在任何 foreign compaction 时不撤销冷藏，缺失来源返回 denied。绝不读取外部 fullOutputPath 或当前项目文件。
-
-普通 capsule 落盘后不再生成第二版；无 prefix mutation 时，state/telemetry custom entries 不改变模型前缀。真实价格/cache 收益仍需 provider A/B 实测，不能由 synthetic fixture 宣称已经获得。
-
-### Telemetry 与 daemon Graph View
-
-新 session 尽早尝试记录 `turn=0, timelineKind="initial"` 的实际 projection 样本；旧 session 没有样本时 daemon 显示 unknown/gap，不从历史 assistant 消息推测。之后每个 `turn_end(outcome="completed")` 的列表末尾附 `customType: "rolling-context.telemetry.v1"`。保留 inherited drafts；observe/off 只写非 context metrics，不写候选 state/edit/checkpoint。用 messageEntryId 去重；aborted/error 不推进完整 turn 时钟。
-
-字段包括：`turn/epoch/mode/eventPosition`、`rawTokens/projectedTokens/effectiveTokens/afterWarmTokens/afterCheckpointTokens`、`hotTokens/warmTokens/checkpointTokens/otherTokens`、resident warm coverage 的 source/capsule/saved tokens、单次 batch 的 `warmEventSourceTokens/warmEventCapsuleTokens/warmEventTokensSaved`、`earliestMutationPosition/EntryId/estimatedInvalidatedSuffixTokens`、checkpoint boundary/kept/estimated/preview tokens 与 `checkpointBlockedBy`、`stateBytes`、provider `input/uncachedInput/cacheRead/cacheWrite/cacheReuseRatio/providerContextTokens`，以及拒绝时的 `attemptedStateBytes/planRejectedReason`。
-
-- raw 是当前 branch 的原始 message history 估算，不含 state/telemetry；projected 是边界前有效 projection；effective 是通过 preview 验证且当前 mode 允许提交的投影。after-warm / after-checkpoint 是本轮候选阶段，observe 时不代表已执行。
-- warm 分量是已验证 capsule 的工具结果；仍保持原文的 assistant/tool-call 骨架计 hot；compactionSummary 计 checkpoint，system/未知贡献计 other。分量之和等于 effective estimate。
-- stateBytes 是工作 snapshot/envelope 的 JSON UTF-8 bytes，不是 JSONL 总大小。Pi `Usage.input` 按未缓存输入保留为 `input/uncachedInput`；`cacheRead/cacheWrite` 独立存储，字段齐全时 reuse ratio 为 `cacheRead/(cacheRead+uncachedInput)`。usage 只取本轮 assistant 实际提供的字段，未知为 null。
-- warm/checkpoint event 落在 turn N 的结束边界；provider usage 落在真实请求 turn N。cache rebuild 关联 warm event N 与随后请求 N+1 的实测数据，不把 suffix/capsule estimate 当作 provider 成本。N+1 的 usage 不被倒填到 N。
-- 数值在本 handler 的已验证边界上测量，宿主边界不是文件事务。后续扩展若撤销/重写草稿，该测量不是最终授权证明；后续生命周期仍从实际 branch 重建。崩溃且未写到 telemetry 不伪造该轮样本。
-- daemon 复用 history.js 的 session root、header ID 与 parent-chain 校验，只读导出数值白名单。`GET /api/sessions/:id/context-telemetry` 提供样本及 compaction 事件；`/s/:id/context` 显示 controller overview、context/composition/memory/cache 图、事件日志、All turns 与共享 inspector，缺值断线、unknown usage 显示 `—`。事件时间线从 Turn 0 开始，session 页面有 Context Graph 链接，5 秒刷新，不请求模型；没有数据显示空态。
-- Rolling Context 不依赖 daemon。telemetry 随 session/fork/tree 生命周期走，没有外部正文存储。权限工具流程仍生效；无法观察的请求级过滤不能被当作已验证兼容，foreign compaction 不允许反向恢复。
-
-## 1. 实现约束与宿主基线
-
-实现、集成测试先固定在 `@earendil-works/pi-coding-agent@1.0.0`；通过验证后再声明支持其他版本。入口导入宿主公开 export，不 deep-import 核心私有实现。
-
-必须遵守：
-
-- 决策类型只使用 `task-decision`；本插件没有项目 intent 的写入口。
-- 状态从当前 `getBranch()` 重建；实际裁剪对象来自有效 projection，不能直接发送 raw branch。
-- 只在完整边界提交持久化上下文变更；不改原始工具结果，不裁剪 streaming 内容。
-- MVP 仅替换已消费的纯文本 toolResult，以及追加单 entry compaction。不删除 assistant/toolResult 配对。
-- 不强转只读 `ctx.sessionManager` 调写 API；需要模拟时创建独立内存 SessionManager。
-- 维护工作不设置 `continue`，不额外调用主 agent；也不覆盖其他扩展的 continuation。
-- 不关闭原生自动 compact。无法证明安全的候选保留并记录原因。
-
-### 已核实的 API 注意点
-
-| 能力 | 使用方式 |
-| --- | --- |
-| 完整回合 | `turn_end` 有当前 assistant/result entry ID，以及包含前序扩展草稿的 `event.context` |
-| 最终边界 | `agent_before_settle` 可写草稿；`agent_settled` 只通知 |
-| 草稿组合 | 返回 `entries: [...event.entries, ...ownDrafts]`；不是只返回自己的增量 |
-| compact 命令 | `ctx.compact(options): void`，使用 `onComplete/onError`；不能直接 `await ctx.compact()` |
-| 用户命令空闲 | 只有命令 context 提供 `waitForIdle()`；生命周期 handler 不能等待自身 idle |
-| 预算估算 | 公开 `estimateTokens(message)` 可用；`estimateProjectedContextTokens` 未从根 export 暴露，不依赖它 |
-| 系统成本 | projection 包含 system messages；`getContextUsage()` 可能为 undefined 或 tokens=null |
-| 嵌套工具 | `executeTool()` 只在工具 context 中提供；边界/命令 handler 不能凭空调用它 |
-
-## 2. 文件与模块接口
+## 请求与提交
 
 ```text
-index.ts                 # 注册；只做事件/工具/命令的薄连接
-lib/types.ts             # 内部 TypeScript 类型和 TypeBox schema
-lib/state.ts             # 重建、增量合并、提交识别、配置
-lib/groups.ts            # 调用/结果关联、消费状态、保护集合
-lib/adapters.ts          # 当前仓库 read/bash/edit 证据适配
-lib/memory.ts            # 来源、task-decision、冲突/失效、覆盖校验
-lib/planner.ts           # 候选排序、胶囊化、checkpoint、内存模拟
-lib/budget.ts            # 公共估算、余量、缓存收益
-lib/recall.ts            # 分支检索、分页、编辑来源限制
-lib/telemetry.ts         # 数值指标和可解释诊断
+raw branch → host-authorized session projection → evidence registry
+                     ↓
+        per-source committed representation
+                     ↓
+    context hook → chronological model projection
+                     ↓
+      Pi restores prompt and tool declarations
+                     ↓
+ context_with_system → actual hook-output snapshot
+                     ↓
+              normal Pi provider runtime
 ```
 
-可选模型提取器在 P2 增加 `extractor.ts`；MVP 不调用辅助模型。小函数可同文件实现，不为每个类型建立类或 registry。
+每次请求从宿主授权 projection 开始，不从 raw branch 恢复被其他扩展隐藏的消息。`context` 只修改 Pi runner 的 structuredClone 中的 content，保留 message identity，使该 fork 的 `restoreSystemMessages` 不会把未改变的 chronological system/tool deltas 全部折叠到开头。Raw SessionManager entries 不会被修改。
 
-主要纯函数：
+`turn_end(outcome=completed)` 从包含前序扩展 drafts 的 boundary preview ingest、更新 aging、生成候选、估算经济性，返回继承 drafts + representation delta + telemetry。任何 await 后复核 session ID/leaf；旧分支不提交。下一次 hook 从实际 branch rebuild，未落盘 drafts 不推进 generation。新 evidence 使请求接近容量时，context hook 也可做一次 capacity preflight commit。Normal aging 不产生 `context_edit / compaction / continue`。
 
-```ts
-rebuild(branch: SessionEntry[]): RebuiltState
-buildGroups(projected: ProjectedSessionEntry[], branch: SessionEntry[]): ExecutionGroup[]
-extractEvidence(group: ExecutionGroup, view: EvidenceView): EvidenceDelta
-reduceMemory(state: MemorySnapshot, delta: EvidenceDelta): MemorySnapshot
-buildProtection(input: PlanInput): ProtectionSet
-plan(input: PlanInput): PlanResult
-preview(header: SessionHeader, branch: SessionEntry[], drafts: SessionBoundaryDraft[]): SessionProjection
-validateCandidate(before: SessionProjection, after: SessionProjection, plan: PlanResult): Diagnostic[]
-```
+Native/manual/overflow compaction 保留。Native threshold 若只是 raw log 大而 v2 projection 可容纳，则取消该次 threshold compact；真实容量不可行、manual 或 overflow 委托宿主。Normal generation 不是 checkpoint。
 
-`PlanInput` 显式携带 branch、已有草稿、projection、pendingMessages、模型信息、配置及预期 leaf。函数不捕获全局 session，不做磁盘扫描。主流程可通过 fixture 离线测试。
+## Evidence 和 representation
 
-## 3. 状态与提交数据
+`projection/evidence.ts` 保存进程内 registry：session/source IDs、宿主授权 message hash、raw token estimate、original source entry、message index、born/last-use turn、paths/entities、tool call 与 pinned/reducible flags。Registry 从 branch/host projection 重建，不落盘第二份原始 transcript。
 
-沿用 design 中 `MemoryItem`、`MemorySnapshot`、`IntentReference`。追加一个存储 envelope，将业务记忆与裁剪提交区分：
-
-```ts
-interface StateEnvelope {
-  schemaVersion: 1;
-  revision: number;
-  parentRevision: number | null;
-  planId: string;
-  baseLeafId: string | null;
-  snapshot: MemorySnapshot;
-  edits: Array<{
-    targetId: string;
-    originalContentHash: string;
-    expectedProjectedHash: string;
-    replacementHash: string;
-    adapterVersion: string;
-  }>;
-  checkpoint?: {
-    firstKeptEntryId: string;
-    summaryHash: string;
-  };
-}
-```
-
-- `customType: "rolling-context.state.v1"` 存 envelope。snapshot 描述已取得的事实，edits/checkpoint 描述拟议投影变化，**不表示后者一定已提交**。
-- `planId` 对基础 leaf、状态增量、目标内容 hash 和配置版本做稳定 hash。重复处理同一候选不能反复追加 edit。
-- `revision` 从当前分支已有有效记录递增，不用 wall-clock 排序，不以全 session 最大 revision 作为本分支状态。
-- `coveredThroughEntryId` 是覆盖游标，不是“最后看到的消息”。每个 entry 的 disposition 必须另行校验；不能跨过未知未覆盖内容。
-- compaction 的 `details` 使用 `{ type: "rolling-context.checkpoint.v1", planId, stateRevision, firstKeptEntryId, summaryHash }`。命令/hook 无法追加 custom 草稿时，可在 details 中附同 schema 的 `stateEnvelope`，供重建消费。
-- MVP 固定使用完整 envelope，仅状态实际变化或规划裁剪时追加，限制单条序列化状态为 128 KiB。冷证据搜索索引从 branch 重建，不每回合复制所有原输出。状态过大时停止本次裁剪并报告，不丢约束凑上限。
-
-P2 再引入完整快照 + 有序 delta 的判别联合，在 checkpoint 或每 8 个增量落完整快照；delta 缺环/未知版本回退前一有效状态。先验证正确性，不在 MVP 同时实现两种写入协议。
-
-### 重建顺序
-
-1. 获取当前 branch，校验来源 ID 均在本路径中。
-2. 按路径顺序读取完整 envelope，以及本插件 compaction details 中的快照，校验 parentRevision。P2 加入匹配 parentRevision 的 delta 重放；MVP 遇未知 delta 停用它，不猜解码。
-3. 读取 `context_note` 工具结果 details，应用尚未覆盖的笔记；工具结果被 compact 收起后仍在 raw branch 中。
-4. 用实际 `context_edit` 和 compaction entry 检查每项计划提交情况。缺失 checkpoint 就不能推进 epoch。
-5. 对 foreign edits、恢复 omissions、来源缺失、未知 schema 做诊断；失效状态不得成为裁剪依据。
-6. 调用 `buildSessionProjection()` 获取实际模型工作集，刷新内存索引。
-
-进程内只缓存 `{ sessionId, leafId, revision, branchIndex, memory }`。leaf 不再是上次 leaf 的后代或 session/cwd 变化时全量重建；正常追加走增量。任何 await 后返回计划前复核 sessionId 和 leaf，变化即放弃，不提交到新会话。
-
-已保存 snapshot 也不能绕过后来的编辑策略：来源被 recovery/foreign omission 排除、被其他插件脱敏或改写后，关联事实须撤销其活跃证据资格并重新核验。裁剪渲染前重查来源授权；无法确认派生笔记是否包含已隐藏内容时停用该次记忆渲染/检查点，沿用宿主当前授权投影，而不是从旧 snapshot 再次泄露内容。
-
-## 4. 任务身份与笔记工具
-
-MVP 每个会话分支维护一个 active task，首次用户 entry 生成 `taskId = "RC-T-" + entryId`。后续 user/steering 默认延续，不凭关键词自动宣布旧任务完成；主题不明时保护旧约束。新独立任务优先使用新会话或 `/tree` 分支，细粒度任务切换留后续实现。普通历史工具/assistant 正文不作为永久状态；工作地图按键更新并有数量边界。若不可压缩的用户约束、活跃决策或 pin 仍使 envelope 超过 128 KiB，整批 planner 写入被拒绝并保留原上下文，不静默丢保护事实。
-
-`context_note` 参数：
+`RepresentationState`：
 
 ```ts
 {
-  intent: string;
-  kind: "plan" | "task-decision" | "focus" | "next-step";
-  text: string;                  // 1–2000 字符
-  replaces?: string[];           // 只允许当前 task 的 RC MemoryItem ID
-  paths?: string[];              // 必要代码依赖，不触发自动读取
+  sourceId, sourceHash,
+  desiredRepresentation: 'EXACT' | 'CAPSULE' | 'COLD',
+  committedRepresentation: 'EXACT' | 'CAPSULE' | 'COLD',
+  capsule?: { text, semanticRisk, compressionTokens, coldSafe, reducer },
+  reason, generation, changedTurn, lastUseTurn, retryTurn?
 }
 ```
 
-使用 `Type.Object(..., { additionalProperties: false })` 并做运行时校验；禁止 project-level kind、intent 状态修改及 DI ID 替代目标。自然语言可能谈论架构，但无论措辞如何，工具结果都只有 `agent-report`、task-local 权威，不能被状态合并器提升。
+Raw hash 不匹配时旧 capsule 不再适用。User、system、Design Intent authority 精确保留。工具调用骨架精确保留；图片、混合非文本、未解决 tool error 只保护自身。未知 tool 名称不会生成 blocker。
 
-工具注册 `executionMode: "sequential"`。执行时验证当前 task、参数长度及替代目标，返回短确认和 `details: { type: "rolling-context.note.v1", noteId, taskId, kind, text, replaces, paths }`。noteId 从 toolCallId 派生；在边界找到持久化结果后再绑定 sourceEntryId。不在工具返回前先修改权威内存 snapshot。
+Aging 根据每个 source 的 age/last use、coldSafe 和 occupancy 独立设置 desired。默认 exact age=3，cold age=16；它们是 source relevance 启发式，不是 checkpoint cadence 或 warm 驻留 gate。高 occupancy 提前 exact/cold eligibility。最近 agent/user 自然文本中的 source/path 引用也刷新 last-use；同一路径只刷新最新 observation，旧版本继续独立 aging。Recall 写轻量 last-use entry，可重新使 cold source 的 capsule 成为 desired resident。desired=CAPSULE/committed=EXACT 与 desired=COLD/committed=CAPSULE 都是合法常态。
 
-`paths` 用于保守保护精确代码片段；所有笔记来源仍是笔记自身，不凭笔记声称已有成功 edit/test 证据。替代只能修改同任务笔记，不能覆盖用户原文或 tool-evidence。
+Committed COLD 不驻留 evidence 正文，只留短 ref，保留 tool call/result 配对。Capsule、cold source、user 与 assistant 仍在原 chronological 位置，前面没有每轮动态 focus/full summary。
 
-纯会话工具的 annotations 标明不修改项目文件、不访问网络；这不代表可以省略业务校验。工具返回必须有 `content` 和 `details`；参数非法 throw，或返回明确的 `isError: true`，不能仅给普通结果写“失败”。
+`rolling-context.representation.v2` 只记录 changes。同一个 capsule 在后续 desired/generation metadata 更新中省略，replay 从前一状态继承；generation 仅在实际 representation commit 时增加。切 branch、session restart、native compact 后从所选 parent chain rebuild。
 
-## 5. 完整组与消费判定
+## Reducer
 
-```ts
-interface ExecutionGroup {
-  assistantEntryId: string;
-  callIds: string[];
-  resultEntryIds: string[];
-  complete: boolean;
-  consumedBy?: string;
-  protectedReasons: string[];
-}
-```
+`projection/reducer.ts` 的 deterministic reducers 为 read/edit/bash/test 添加 invocation、paths、历史标签、事实、unresolved 状态与 recall ref。重复 line/phrase 只压缩相邻 runs，保留不同事实的顺序，不依赖 shell 白名单。
 
-构建算法：按有效 projection 的 source entry 顺序，读取 assistant 内容中的直接 toolCall；用 `toolCallId` 找结果。每个直接调用必须恰有一个有效结果，重复/缺失/name 不符使本组异常并保护。
+Generic extractive reducer 对 unknown/MCP/custom/assistant 文本采用相同语义 envelope，保留 unique output。无法取得足够节省时使用 generic semantic reducer：通过公开 `ctx.modelRegistry.streamSimple`，只传这一个 evidence 和 invocation，输出 whatHappened/facts/unresolved/entities/semanticRisk/coldSafe JSON。它不依赖 tool schema，不发送整个 session，不调用主 agent。输入不截断：超过 32k chars 保持 exact。最多两次辅助请求/turn，输出 1,200 tokens，8 秒 timeout，失败/invalid JSON/risk>0.2/insufficient saving 都保留 source exact。失败后 source 独立 backoff。
 
-嵌套 `parentToolCallId` 的执行通知和 `nestedCalls` 只作为外层结果的辅助证据，不构造成独立 transcript 调用。`tool_execution_end` 不是完整组边界，不能据此裁剪并行 sibling 结果。
+模型声称的 semanticRisk 不是正确性证明；真实工程内容的 loss 风险需长 session 评估。Code/复杂论证通常会依赖语义 reducer或继续 exact；deterministic repetition 不声称识别所有程序语义。
 
-更早组只有在结果之后存在成功 assistant（`stop` 或 `toolUse`）时可记 consumed。`length/error/aborted/deferred` 不构成成功消费；被 recovery omission 排除的 assistant 也不算。消费是调度条件而非理解证明；存在无法兼容的请求级过滤器时保守停用受影响缩减。
+## Planner / KV economics
 
-默认保护最近 **3 个完整工具组**、所有不完整组、最新未消费结果、必要精确依赖、所有图片、未知角色/结果和未解决错误。它们可能超过目标预算，保护优先。
+`projection/materialize.ts` 在当前 committed chronological projection 上记录每项候选的 source、current/desired、token position、raw/projected tokens、saving/request、semanticRisk、futureRequests、compressionTokens 和 recallRisk。
 
-读取外部 custom_message、branchSummary 等未知贡献时，保留并阻止跨越它的 checkpoint。已识别的 Design Intent 投影按第 12 节只读处理。
-
-## 6. 证据适配器与失效
-
-适配器输入必须包含原始调用参数、当前授权投影结果和原始 source ID，输出 `{ facts, capsule?, exactDependencies, coverage, diagnostics }`。不读取任意工具 details 里的路径后自动访问磁盘。
-
-| 适配器 | 本仓库可用证据 | MVP 处理 |
-| --- | --- | --- |
-| `read` | args.path/offset/limit；结果纯文本；permissions 加入的 details.intent | 记录范围与结果 hash，不把片段 hash 当完整文件版本；活跃编辑路径正文保留 |
-| `edit` | 成功结果 details.changes 的 path/kind，及 intent；diff 可能截断 | 记录 add/update/delete、改动目的并失效相关观察/测试；不把 diff 作为完整前后文件 |
-| `bash` | 命令、isError、输出、截断信息；不总有可靠 exitCode 字段 | 保留未知命令；仅识别白名单格式的搜索或测试摘要；isError=false 本身不证明测试全通过 |
-| `context_note` | 本插件 details schema | 作为 task-local agent-report 合并 |
-| Design Intent 工具 | 第 12 节版本化 envelope | 只提取引用/短投影，不创建 project decision |
-
-成功 edit 后，对被改路径的观察和相关测试设 stale。未知可能写入的 bash 若无法识别范围，设置 workspace generation dirty，相关验证均待复核；不冒险继续显示通过。
-
-`observedHash` 仅在取得完整、授权的文件内容时使用。片段使用单独的 evidence hash 与 range；两个不同范围 hash 不可用来证明文件没变。MVP 不在每回合直接 fs.readFile 全仓，当前磁盘核验由正常 read/tool 证据补充。重启/分支跳转后的磁盘事实先标待核验。
-
-胶囊从授权原内容和已验证的记忆生成，带来源 ID、历史/当前标签、准确状态及召回方法。已经匹配 replacementHash 就跳过。不从上一版胶囊重新自由总结。
-
-## 7. 规划、保护和覆盖
-
-边界正常路径：
+`projection/planner.ts` 对每个候选 frontier 比较它及其后正收益 changes：
 
 ```text
-ensureRebuilt → 读取 event.context + inherited entries
-→ 关联当前组和更早组 → 抽取/失效/合并笔记
-→ 保护集合 → 批次间隔/cache/累计收益评估 → 选择胶囊
-→ preview after-warm → 若仍超目标且满足 checkpoint cadence / warm 驻留：尝试 checkpoint
-→ 模拟 + 协议/语义校验 → 返回状态、edit、可选 compaction
+benefit = Σ saving × (estimated future requests + attention weight + occupancy urgency)
+cost    = projected tokens - earliest mutation position
+          + Σ semantic-risk penalty + compression tokens + recall/reread risk
 ```
 
-observe 模式只输出统计，不写胶囊/compaction；off 停止新自动维护，已落盘投影不还原。显式调用的 note/recall 仍可使用，但不得借此触发隐藏裁剪。
+Suffix KV invalidation 只计算一次。早位置收益小的候选可以保持 pending，而后面的大收益和 capsule→cold 可以合并。低 occupancy 要求净收益与 batch saving；接近 available capacity 时优先容纳下一次 request，不以任何固定 target 为目标。break-even=(suffix + risk/compression costs)/saving，都是保守宿主估算，不是 provider 价格模型。
 
-单个候选缩减要求：当前投影纯文本、无 foreign edit 竞争、已消费、非保护内容、存在可用来源与覆盖项，并且有明显收益。首版至少节省 256 估算 tokens 且缩短 50%，减少小输出的缓存抖动。
+Available capacity = model contextWindow（未知时 272000）- reserve（默认16384）- max(2048,5%window)。`BUDGET_INFEASIBLE` 仅表示当前 required/resident projection 超过容量，不出现 checkpointBlocked episode。
 
-coverage 不是泛用“已总结”标记：
+## Recall 和 legacy
 
-- `retained`：精确内容仍须出现在保留区，或作为用户原文/必要证据无损写入检查点。
-- `extracted`：具体有效 MemoryItem/source 引用已覆盖该语义内容。
-- `recall-only`：仅适用于已消费的重复日志、旧广域输出、已替代版本等可明确降为冷证据的内容。
+`recall.ts` 使用当前 session branch ownership + 宿主/legacy redaction projection 授权，不检查 v2 resident visibility。v2 COLD raw 仍在宿主 log，因此可 recall。foreign omission、foreign/native compact、redaction 仍然权威；own v1 checkpoint 只在 append-order/hash ownership 校验通过时撤销其归档影响以取 evidence。不会打开 fullOutputPath、读取当前项目文件或绕过工具授权。
 
-不允许把未知用户约束、未总结的方案论证、未解决错误或未知 custom 内容一律标 recall-only。checkpoint 压力出现且连续性状态不足时，才尝试 bounded fallback：最近 12 个 projected entries / 12,000 字符，必须包含最新用户请求，单条用户原文最多 8,192 字符。用户来源及 span 保留；最近 assistant report 可附带但显式标记未验证。窗口不足、过长或无用户请求时阻塞为 `MISSING_CONTINUITY_STATE`，不会读取更早 session 或把推断升级为事实。
+保留 legacy note/item/path filter、stale 标签、bounded text、cursor 和 thinking/image omission。查询检索完整授权文本，再返回命中 excerpt；entryId 支持 offset/nextOffset 分页，cold 原文尾部也可访问。明确跨 branch/不存在的 source 不会返回原文。Recall usage 只记 source IDs。
 
-## 8. Checkpoint 算法与候选模拟
+v1 config `{mode}` 是旧命令实际写入的明确选择，继续尊重 off/observe。没有 config entry 的旧默认 observe 迁移为 on；带 explicit=false 或 origin=default 的旧 default entry 忽略。v2 commands 保存 schemaVersion=2/explicit=true。
 
-1. 从保护集合求最早必须保留 entry；集合包含最新三组、未消费/错误/未知组、最新用户请求/图片、pin 和活跃依赖；边界始终指向原 branch entry，绝不以 toolResult 开始。
-2. 基于 after-warm projection 估算候选保留区、summary 与完整宿主 preview；只提交有净收益的安全边界。净收益可逐 epoch 累积，不要求单次就落到 target 以下。
-3. 检查待收起的所有模型贡献与此前检查点：本插件结构化检查点可由工作记忆重建；未知原生/其他扩展摘要不能只靠 RC snapshot 替换，保留它或回退原生 compact。
-4. 最新文本用户请求若在收起区，完整原文和仍有效追加要求无损加入新检查点；多模态用户消息不跨越。用户片段的 role/权威标签与历史工具数据区明确分开。
-5. 渲染目标、约束、项目观察、相关 intent、task-decision、改动/验证、焦点/下一步和少量证据 ID。stale 项保留状态而不当成功事实。
-6. 新 checkpoint 的 `firstKeptEntryId` 必须是当前 branch 中的原始 ID，不能用模拟中新生成 ID。有其他扩展已提出 compaction 时，MVP 不再追加第二个 compaction。
-7. 用公开 `SessionManager.inMemory(cwd, undefined, [header, ...branch])` 重放已有草稿及本插件草稿。只在这个独立实例上调用 appendCustomEntry、appendContextEdit、appendCompaction 等公开方法，然后 `buildSessionProjection()`。
-8. 有意义的可胶囊化 source 必须 HOT→WARM 后再跨 cold boundary；尚未 warm 时以 `WARM_REQUIRED` 留在 projection。无实质 capsule saving 的小型安全结果允许直接 cold；新 warm source 普通策略在驻留期前不越界，hard emergency 是受限例外。校验候选工具配对、系统状态、原文保留、foreign edits、保护结果 content hash、覆盖、当前任务焦点和 token 净收益。
+## Graph / Projection View
 
-模拟器使用 exhaustive switch 处理四种 SessionBoundaryDraft。宿主新增草稿类型或消息类型不认识时 fail conservative，不自行猜测其行为；不把模拟器当宿主的替代实现。
+Telemetry transport 与 daemon API 不变：同一路 `context-telemetry` 读取 v1/v2 metrics，v1 UI 仅用于旧数据，v2 显示 projected/window、raw/reduction、exact/capsule/cold equivalent/frame/pinned composition、pending gain、saving/request、frontier、one-suffix invalidation、break-even、cacheRead/uncached input、state bytes、generation/changes。W/C/G/F/R 事件与 Turn 0/completed timeline、Event Log、All turns、inspector 保留。Provider usage 对应真实请求，after-turn generation 影响之后请求的 cache association，不宣称精确因果归因。
 
-每个草稿提交前缀都要验证工具配对：状态记录不影响协议；toolResult 只换文本不改 ID/角色/isError；单条 checkpoint 的保留边界已验证完整。因而崩溃不留下半组调用/结果 omission。
+`context-projection?requestId=...` 读取 `rolling-context.projection-snapshot.v2`：
 
-## 9. 提交与生命周期处理
+- request/turn/generation、outputHash、messageCount、totals；
+- source→representation/raw/projected tokens/hash/reason/bounded preview/born/last-use/generation mapping；
+- `prefixRequestId + segments` 复用前一 snapshot 的任意未改变 mapping run，避免动态开头或 generation 变化复制所有 rows；
+- source 原文从对应 raw/host projection 取，capsule 从该 generation 的 representation delta 取；
+- 未关联 raw source 的 prompt/extension fragments 按 hash 落一次 content object，超过128KiB显示 unavailable。
 
-| 事件 | 具体工作 |
-| --- | --- |
-| `session_start/session_tree` | 清空 session scoped 缓存，重建；新 session 尚无 assistant history 时尽早记录 Turn 0 projection 样本；磁盘相关事实/intent 缓存待核验 |
-| `before_agent_start` | 记录新请求将到达，不假定其 entry 已存在；不修改系统文本或宣布旧任务完成 |
-| `turn_end` | 提取、规划、返回累积草稿；异常 outcome 仅保存确定性状态，不滚动 |
-| `agent_before_settle` | 从修复后投影重建；保存未覆盖状态，避免再次处理同一组；默认不做新激进检查点 |
-| `session_before_compact` | 处理第 10 节兼容逻辑，不直接调用 compact 形成递归 |
-| `session_compact/session_compact_failed` | 成功重建；失败不推进归档/epoch，清理本次请求标记 |
-| `model_select` | 重算窗口和预算；下一安全边界处理，不在此时裸写投影 |
-| `context` | 校验和诊断为主，不靠临时过滤实现常规裁剪；不能保证运行于其他扩展之后 |
-| `agent_settled` | 记录最终数值指标，无状态提交 |
-| `session_shutdown` | 取消可选提取器/清缓存，幂等处理 |
+共享 `snapshot-codec.js` 只回放 mapping changes，不执行 planner。Daemon 重建 messages 后校验每项 projectedHash 与总 outputHash；当前授权若已修改/隐藏 source，则内容与旧 preview 都 withheld。Rendered 展示完整文本、toolCall、thinking、system sections/tool declarations；图片显示 actual-input placeholder，不展示 binary payload。Mapping / Diff 比较 raw 与 committed/desired，显示 saving、reason、age、last-use 和 generation。Recall raw 按当前授权读取，正文默认使用既有 bounded history 上限。
 
-正常草稿顺序为 `custom(state) → context_edit... → compaction?`。handler 返回前不推进 in-memory revision。下一边界/命令读取 raw branch 检查提交结果，避免把宿主后续 handler 撤销的草稿当已完成。
+记录点是本插件 `context_with_system` 输出，默认插件清单中 Rolling 最后运行。第三方后续 context_with_system 或宿主 forced-prompt/hidden-tool/provider wire transforms 仍可能进一步修改请求；快照明确记录 hook 名称，不能宣称已观察到未知后续 wire payload。
 
-部分提交恢复：
+## 验证与风险
 
-| 实际落盘 | 恢复结果 |
-| --- | --- |
-| 无新增状态 | 旧状态与旧投影继续 |
-| 只有 state | 新证据可用，裁剪未发生；重新规划，不冒称已滚动 |
-| state + 部分 edit | 已完成 edit 按 hash 识别，其余候选下次复核；来源仍在 |
-| state + edit + checkpoint | 依据匹配的 compaction entry 推进 epoch |
+`test/rolling-context-v2.test.mjs` 覆盖默认模式、无维护工具、真实 Pi ExtensionRunner、raw immutability、specialized/generic success/failure、images 保留、desired/committed 解耦、frontier batching/一次suffix成本、chronology/protocol、capacity urgency、state delta/restart/branch、actual snapshot replay、动态 prompt 段复用、legacy restore、cold/foreign recall 和120-turn zero-cooperation。旧 v1 regression 继续独立运行。
 
-无法确定 edit 来源时禁止还原 raw 内容到模型，并停用受影响裁剪；插件没有跨进程原子 session 写入保证。
-
-## 10. 原生 compact 与用户命令
-
-`session_before_compact` 默认返回 undefined。manual/threshold 仅在 snapshot 覆盖 preparation 的整个收起范围、无图片/未知摘要/未识别 context edit，且粗略预算有净收益时提供自定义 compaction。连续性不足时 hook 与 planner 共用 bounded fallback；拟收起区内若有较大、可胶囊化但尚未 warm 的 source，则以 `WARM_REQUIRED` 阻塞；已 warm source 检查 16-turn residence。小型安全结果可直接 checkpoint。hard pressure 可绕过 cadence/residence，但不能绕过 image/foreign/coverage/protocol/authorization checks。hook 使用 preparation.tokensBefore 和 branch 中安全的 firstKeptEntryId；只有宿主真正提交 matching compaction 后才标记归档。无法证明安全或有收益时记录诊断并委托原生行为。
-
-用户 `/compact` 带 customInstructions 时，MVP 不猜语义，直接委托原生逻辑。overflow/recovery 始终委托宿主。显式 `/rolling-context checkpoint` 若分支/覆盖或净收益校验失败会取消，避免静默替换为另一种 compact；其他 native compact 校验失败时不拦截宿主。失败、取消和宿主成功均更新 status 诊断。
-
-`/rolling-context checkpoint` 走命令专属流程：
-
-1. `await ctx.waitForIdle()`，重新取 sessionId/leaf；有 pending messages 时拒绝本次操作。
-2. 做一次无副作用规划，向用户显示安全/不可行原因。
-3. 设置进程内一次性 `manualRequest`（sessionId、leaf、planId），调用 `ctx.compact({ onComplete, onError })`。不直接 appendCompaction，也不通过 sendMessage 触发主 agent。
-4. 在本次 `session_before_compact` 中重新校验计划并返回 snapshot 渲染结果；details 携带恢复需要的 envelope。
-5. 仅对这个显式 RC 请求，条件变化导致不可行时取消并报告，不能悄悄执行另一种压缩。一次性标记在成功、失败或取消时清除；仅 customInstructions 文本相似不能冒充请求标记。
-
-status/inspect/pin/on/off/observe 命令等 idle 后执行。配置和 pin 保存不进模型上下文的 custom entry；这些用户命令可以调用 `pi.appendEntry`，不伪造边界。off 不撤销已存在 compact，命令应明确告知。
-
-## 11. 预算、cache 与配置
-
-A/B/soft/hard 是完整蓝图；当前具体公式见本文开头的生命周期修正。后续实现可拆为 `estimateConversation()`、`estimateSystem()` 和 `computeBudget()`；同一 system/tool 状态只计一次，保留 per-message 开销和非 ASCII/图片误差余量。
-
-公共 `estimateTokens()` 是粗略 heuristic，不等于 provider tokenizer；对未知角色返回 unknown，不把 undefined 当 0。usage 仅校准同类未修改输入，不能用旧 request usage 给新 checkpoint 保证容量。
-
-扩展 context 没有公开 SettingsManager。有效 reserve 优先使用显式配置，或已经观察到的 `preparation.settings`；未知时用公开默认 reserve 保守估算并标明来源，**不宣称已读到模型 override**。用户 override 更大时原生 compact 仍可能先执行；需要精确对齐时显式配置 reserve。所有安全失败仍回退原生管理。
-
-初始配置：
-
-```text
-mode=observe                    targetTokens=32768
-keepRecentGroups=3              minCheckpointTurns=16
-minSavingTokens=256              minBatchSavingTokens=2048
-recallMaxTokens=2000             recallMaxEntries=8
-extractor=disabled              reserveTokens=未配置
-```
-
-用 `registerFlag` 的 string/boolean 类型解析，例如 `--rolling-context-mode`、`--rolling-context-target`、`--rolling-context-reserve`；数值严格解析为有界 safe integer。未知值或负数报错，不静默吞掉。会话命令覆盖保存为 config custom entry，不修改原生 settings。
-
-每次完整边界可以计算，但普通胶囊批次至少间隔 4 个完整 turn 且达到批量收益；soft 可提前到至少 2 turns / 基础收益的一半。候选以 expected residence saving 减去最早 prefix mutation 影响的 suffix tokens 评分；高 cacheRead 加倍普通门槛，projected tokens 超过 target/hard 时覆盖一般 cache-conservation heuristic。checkpoint 默认间隔 16 turns，普通 warm 驻留同样至少 16 turns；小型安全 source 可 HOT→COLD，有价值 source 需 HOT→WARM→residence→COLD；hard pressure 优先安全兜底。epoch 只在匹配 compaction 真正存在时递增。配置 flag 为 `--rolling-context-warm-interval`、`--rolling-context-batch-saving`、`--rolling-context-checkpoint-interval`，后者绝不是 branch entry 数。
-
-cache 优化首版是可解释阈值，不建立复杂预测模型：高 cacheRead 比例时提高普通批次门槛；超过 target 的容量压力可覆盖一般 cache-conservation score，但不放宽 source safety。warm/checkpoint event 属于 turn N 结束边界，provider usage 保持在实际请求 turn N+1；cache rebuild 仅关联相邻实测，不表示精确因果或费用。Pi `Usage.input` 按 uncached input 保留，`cacheRead/cacheWrite` 独立记录。另记录 suffix/capsule estimates、回退原因和召回成本；P2 提取成本独立列出，不能藏在主 agent usage 中。
-
-## 12. Design Intent 的只读消费
-
-两边约定一份版本化数据形状，字段见 [Design Intent 实现文档](../../design-intent/docs/implementation.md) 的 projection 部分。没有公共包、内部模块互相 import 或必需事件总线。
-
-从已持久化的 `design-intent.projection.v1` custom_message 或 DI query/get 工具 details 中提取 `storePath/storeRevision/sourceHash/id`。只保存 IntentReference 和有限短投影；不复制批准记录/依赖图，也不根据 RC facts 计算 intent 生命周期。
-
-检查点区分相关 intent 与 task-decision。所有投影都带“在该版本观察到，设计敏感操作前 query/get”的标签；恢复旧会话、看到新 hash 或读取失败后标待核验。RC 不直接读项目意图库以刷新真相，也不在 handler 中调用另一插件的工具；agent 通过 query/get 明确刷新。
-
-识别过的入口投影可在 checkpoint 中转为相同版本的短视图和引用；必要 invariant 未展开时保存 must-expand 标记，不伪造完整约束。提案和检查报告只能成为任务证据，不能变成 accepted 项目事实。
-
-DI 不可用与不存在插件不同：已有引用不可解析是任务风险/待核验，不表示约束已经取消。`task-decision.replaces`、状态合并和 pin 均不准以 DI ID 修改项目权威集合。
-
-## 13. Recall 实现与数据授权
-
-参数为 `intent`，以及互斥的 `entryId/itemId/query`，可附 `paths`、分页 cursor 和受限 tokenBudget。默认只检索当前 branch；搜索索引是内存 Map，按 entry ID 保存文本索引，不持久化重复工具全文。
-
-直接 ID 优先，再按精确路径、词项命中排序。工具输出只包含来源、历史/失效标签和文本片段，不序列化 thinking/signatures，不重放 ToolCall 对象。图片 MVP 只返回“有图片证据”的引用，不自动复制大附件。
-
-cursor 包含 sessionId、查询 hash、索引版本和下一位置；leaf/索引变化后拒绝旧 cursor，要求重查，避免跨分支取下一页。
-
-授权原则：原始消息不等于永远可重新暴露。扫描全 branch 的 context_edit，结合本插件已确认 edit 清单判断所有权；任何不明来源编辑、foreign omission、脱敏变化或来源不在本分支时，不能通过 recall 还原原内容。本插件胶囊化且无竞争的来源可以取原文；已被其他扩展改写的来源只取允许的有效内容，或返回 denied/unknown。不能证明兼容的脱敏扩展存在时停用 raw recall，不靠字符串相同就认定有权限。
-
-外部 fullOutputPath 不自动读，返回失效可能性与路径引用。需要当前文件/完整外部输出由 agent 使用 read，通过既有授权流程；RC 不用 fs 旁路当前 permissions。
-
-## 14. 故障与测试计划
-
-诊断使用稳定 code，例如 `INCOMPLETE_TOOL_GROUP`、`UNCOVERED_SEMANTICS`、`FOREIGN_CONTEXT_EDIT`、`STALE_INTENT_REF`、`UNKNOWN_BUDGET`、`PROTECTED_SET_OVER_BUDGET`、`BRANCH_CHANGED`。日志保存 entry ID、数量、hash 和原因，不保存全部文件正文或密钥。
-
-建议测试文件：
-
-| 文件 | 关键场景 |
-| --- | --- |
-| `rolling-context-state.test.mjs` | 快照、分支回放、缺环、部分草稿、revision 幂等；delta 测试随 P2 加入 |
-| `rolling-context-groups.test.mjs` | 并行/嵌套、缺失/重复结果、aborted/length/recovery 不算消费 |
-| `rolling-context-planner.test.mjs` | 保护组、精确依赖、覆盖不足、原文/图片、foreign custom、缓存阈值 |
-| `rolling-context-projection.test.mjs` | 真实内存 SessionManager 重放每个提交前缀，配对和 compact 保留边界 |
-| `rolling-context-recall.test.mjs` | 分页/切分支、foreign 脱敏、不泄露 thinking、外部路径不暗读 |
-| `context-intent-integration.test.mjs` | checkpoint 分区、hash 变化、引用非权威、禁止 DI supersede |
-
-单元测试复用仓库 `node --experimental-strip-types --test test/*.test.mjs` 形式；宿主集成测试在测试依赖环境中运行，不使用付费模型做纯逻辑测试。
-
-实现顺序仍按下文分期推进；当前包清单已注册两个入口。后续扩展范围前先补对应 fixture、宿主集成与故障恢复测试，不将“已注册/可加载”描述为全部蓝图均已完成。
-
-## 15. 实现参考
-
-已完整阅读宿主 `docs/extensions.md`、`docs/session-format.md`、`docs/compaction.md` 及 `examples/extensions/todo.ts`、`custom-compaction.ts`、`commands.ts`。精确类型以根 export、`dist/core/extensions/types.d.ts` 和 `dist/core/session-manager.d.ts` 为准。
-
-证据适配以本仓库 `extensions/permissions/index.ts`、`extensions/edit/index.ts` 的实际结果结构为准；工具重注册或宿主版本变化必须重新验收，不能按名称假定结构永远不变。
+Fixture 使用模拟 provider usage 和可重复输出，因此验证生命周期与可观测性，不能证明真实 provider 收益或所有任意任务的语义完整性。当前仍使用宿主 heuristic tokenizer、有限 semantic jobs、全 branch rebuild/按需 snapshot chain replay；非常长 session 的 CPU/索引规模及真实 cache amortization 还需现场测试。Pinned/unsupported resident 超出容量时会委托宿主，而不是丢掉 required evidence。

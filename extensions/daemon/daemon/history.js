@@ -114,11 +114,16 @@ function sanitizeMessage(message) {
 function httpError(status, message) { const error = new Error(message); error.status = status; return error; }
 async function readTelemetry(sessionFile, sessionId, leafId) {
   const branch = await readBranch(sessionFile, sessionId, leafId);
-  const numeric = ['turn','epoch','rawTokens','projectedTokens','effectiveTokens','afterWarmTokens','afterCheckpointTokens','targetTokens','softThresholdTokens','hardThresholdTokens','hotTokens','warmTokens','checkpointTokens','otherTokens','warmSourceTokens','warmCapsuleTokens','warmTokensSaved','warmEventSourceTokens','warmEventCapsuleTokens','warmEventTokensSaved','plannedWarmSourceTokens','plannedWarmCapsuleTokens','plannedWarmTokensSaved','eligibleHistoricalTokens','protectedTokens','earliestMutationPosition','projectedTokensBeforeMutation','estimatedInvalidatedSuffixTokens','checkpointKeptTokens','checkpointEstimatedTokens','checkpointPreviewTokens','capsulesCreated','capsuleTokensSaved','stateBytes','stateLimitBytes','attemptedStateBytes','cacheRead','cacheWrite','input','uncachedInput','cacheReuseRatio','providerContextTokens'];
+  const numeric = ['requestRepresentationChanges','requestSavingPerRequest','requestMutationPosition','requestInvalidatedSuffixTokens','generation','representationChanges','sourcesCold','contextWindow','exactTokens','capsuleTokens','coldEquivalentTokens','coldRefTokens','frameTokens','pinnedExactTokens','pendingCompressionGain','savingPerRequest','breakEvenRequests','compressionTokens','occupancy','requestGeneration','turn','epoch','rawTokens','projectedTokens','effectiveTokens','afterWarmTokens','afterCheckpointTokens','targetTokens','softThresholdTokens','hardThresholdTokens','hotTokens','warmTokens','checkpointTokens','otherTokens','warmSourceTokens','warmCapsuleTokens','warmTokensSaved','warmEventSourceTokens','warmEventCapsuleTokens','warmEventTokensSaved','plannedWarmSourceTokens','plannedWarmCapsuleTokens','plannedWarmTokensSaved','eligibleHistoricalTokens','protectedTokens','earliestMutationPosition','projectedTokensBeforeMutation','estimatedInvalidatedSuffixTokens','checkpointKeptTokens','checkpointEstimatedTokens','checkpointPreviewTokens','capsulesCreated','capsuleTokensSaved','stateBytes','stateLimitBytes','attemptedStateBytes','cacheRead','cacheWrite','input','uncachedInput','cacheReuseRatio','providerContextTokens'];
   const blockedCodes = new Set(['MISSING_CONTINUITY_STATE','CHECKPOINT_CADENCE','WARM_REQUIRED','WARM_RESIDENCE','ACTIVE_DEPENDENCY','ACTIVE_PATH_DEPENDENCY','UNRESOLVED_ERROR','UNSUPPORTED_CONTENT','UNSUPPORTED_TOOL_OR_RESULT','IMAGE','FOREIGN_EDIT','NO_SAFE_BOUNDARY','NO_NET_SAVING','STATE_SIZE_LIMIT','INVALID_FINAL_PROJECTION','INCOMPLETE_TOOL_GROUP','NOT_CONSUMED','RECENT_GROUP','PINNED_SOURCE','LATEST_USER_REQUEST','PROTECTED_SET_OVER_BUDGET']);
-  const turns = branch.filter(e => e.type === 'custom' && e.customType === 'rolling-context.telemetry.v1').map(e => {
+  const turns = branch.filter(e => e.type === 'custom' && ['rolling-context.telemetry.v1','rolling-context.telemetry.v2'].includes(e.customType)).map(e => {
     const d = e.data || {}, row = {};
     for (const key of numeric) row[key] = typeof d[key] === 'number' && Number.isFinite(d[key]) && d[key] >= 0 ? d[key] : null;
+    row.schemaVersion = e.customType.endsWith('.v2') ? 2 : 1;
+    row.requestGenerationCommitted = d.requestGenerationCommitted === true;
+    row.generationCommitted = d.generationCommitted === true;
+    row.capacityStatus = ['HEALTHY','BUDGET_INFEASIBLE','CAPACITY_PRESSURE'].includes(d.capacityStatus) ? d.capacityStatus : null;
+    row.requestId = typeof d.requestId === 'string' && d.requestId.length <= 128 ? d.requestId : null;
     row.mode = ['on','off','observe'].includes(d.mode) ? d.mode : 'unknown';
     row.timelineKind = d.timelineKind === 'initial' ? 'initial' : 'completed';
     row.eventPosition = d.eventPosition === 'after-turn' ? 'after-turn' : null;
@@ -150,7 +155,7 @@ async function readTelemetry(sessionFile, sessionId, leafId) {
   let observedTurn = 0;
   const checkpoints = [];
   for (const e of branch) {
-    if (e.type === 'custom' && e.customType === 'rolling-context.telemetry.v1' && Number.isSafeInteger(e.data?.turn) && e.data.turn >= 0) observedTurn = Math.max(observedTurn, e.data.turn);
+    if (e.type === 'custom' && ['rolling-context.telemetry.v1','rolling-context.telemetry.v2'].includes(e.customType) && Number.isSafeInteger(e.data?.turn) && e.data.turn >= 0) observedTurn = Math.max(observedTurn, e.data.turn);
     if (e.type !== 'compaction') continue;
     const d = e.details, c = d?.stateEnvelope?.checkpoint;
     const summaryHash = require('node:crypto').createHash('sha256').update(e.summary || '').digest('hex');
@@ -159,4 +164,67 @@ async function readTelemetry(sessionFile, sessionId, leafId) {
   }
   return { turns, checkpoints, tokenBasis: 'host-estimate', usageBasis: 'Pi Usage.input is uncached input; cacheRead is reported cached input', turnZero: turns.find(row => row.turn === 0)?.timelineKind === 'initial' ? 'measured' : 'gap', rawBasis: 'raw message history (system/user/assistant/tool)', snapshotTimestamp: branch.at(-1)?.timestamp || null };
 }
-module.exports = { findSessionFile, readHistory, readTelemetry };
+module.exports = { findSessionFile, readHistory, readTelemetry, readProjection };
+
+/** Replay the archived hook mapping; no aging or planner is run by the daemon. */
+async function readProjection(sessionFile, sessionId, leafId, { requestId, sourceId } = {}) {
+  const branch = await readBranch(sessionFile, sessionId, leafId);
+  const [{ SessionManager }, legacy, common, representation, codec] = await Promise.all([
+    import('@earendil-works/pi-coding-agent'),
+    import('../../rolling-context/legacy/v1.ts'),
+    import('../../rolling-context/projection/common.ts'),
+    import('../../rolling-context/projection/state.ts'),
+    import('../../rolling-context/projection/snapshot-codec.js'),
+  ]);
+  // readBranch has already verified the real file root, header identity and parent chain.
+  const header = { type:'session', version:3, id:sessionId, cwd:'/tmp', timestamp:'' };
+  const live = SessionManager.inMemory('/tmp', undefined, [header,...branch]).buildSessionProjection().entries;
+  const authorized = legacy.recallProjection('/tmp', header, branch, live);
+  const authorizedById = new Map(authorized.map(e=>[e.sourceEntry.id,e]));
+  if (sourceId) {
+    const source = branch.find(e=>e.id===sourceId), permitted = authorizedById.get(sourceId);
+    if (!source || !permitted?.messages.length) throw httpError(403,'Source is not authorized in the current branch');
+    const owned = legacy.ownedEdits(branch).get(sourceId);
+    const messages = permitted.messages.map(message=> {
+      if (owned && source.type==='message' && common.hash(common.text(message))===owned.replacementHash) return source.message;
+      return message;
+    });
+    return {sourceId, messages:messages.map(message=>sanitizeMessage({...message,content:Array.isArray(message.content)?message.content.filter(p=>p.type!=='thinking'):message.content}))};
+  }
+  const snapshots = branch.filter(e=>e.type==='custom' && e.customType==='rolling-context.projection-snapshot.v2')
+    .map(e=>({requestId:e.data?.requestId,turn:e.data?.turn,generation:e.data?.generation}));
+  const snapshot = codec.default.replaySnapshots(branch,requestId);
+  if (!snapshot) return { snapshots, snapshot:null, rows:[], reason:'No actual context hook snapshot on this branch' };
+  const end = branch.findIndex(e=>e.type==='custom' && e.customType==='rolling-context.projection-snapshot.v2' && e.data?.requestId===snapshot.requestId);
+  const atRequest = branch.slice(0,end+1);
+  const projection = SessionManager.inMemory('/tmp', undefined, [header,...atRequest]).buildSessionProjection().entries;
+  const byId = new Map(projection.map(e=>[e.sourceEntry.id,e]));
+  const state = representation.restoreProjectionState(atRequest);
+  const blobs = new Map(atRequest.filter(e=>e.type==='custom'&&e.customType==='rolling-context.projection-content.v2').map(e=>[e.data?.hash,e.data]));
+  const rows = snapshot.rows.map(row=> {
+    let message, unavailable;
+    if(row.sourceEntryId) {
+      const original = byId.get(row.sourceEntryId)?.messages[row.messageIndex];
+      const current = authorizedById.get(row.sourceEntryId)?.messages[row.messageIndex];
+      if (!current || common.hash(current)!==row.sourceHash) unavailable='Source changed or was withheld by current branch authorization';
+      else if(!original || common.hash(original)!==row.sourceHash) unavailable='Source hash does not match archived hook input';
+      else {
+        message=original;
+        if(row.representation!=='EXACT') {
+          const record=state.sources.get(row.sourceId);
+          if(!record || record.sourceHash!==row.sourceHash || !record.capsule) unavailable='Representation is unavailable';
+          else message=common.replaceText(original,row.representation==='CAPSULE'?record.capsule.text:`[Cold evidence source=${row.sourceEntryId}; context_recall(entryId="${row.sourceEntryId}") for raw.]`);
+        }
+      }
+    } else {
+      const blob=blobs.get(row.contentRef);message=blob?.message;unavailable=blob?.unavailable;
+    }
+    if(!unavailable && (!message || common.hash(message)!==row.projectedHash)) unavailable='Projected message hash mismatch';
+    // Never render bounded previews as complete messages or leak old previews after redaction.
+    return {...row, preview:unavailable?'':row.preview, message:unavailable?null:message, unavailable:unavailable||null,
+      age:Math.max(0,snapshot.turn-row.bornTurn),saving:row.rawTokens-row.projectedTokens};
+  });
+  const complete=rows.every(row=>!row.unavailable);
+  const verified=complete && common.hash(rows.map(row=>row.message))===snapshot.outputHash;
+  return {snapshots,snapshot:{requestId:snapshot.requestId,turn:snapshot.turn,generation:snapshot.generation,totals:snapshot.totals,hook:snapshot.hook,outputHash:snapshot.outputHash},rows,verified};
+}

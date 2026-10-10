@@ -50,6 +50,7 @@
   }
   function rowAt(rows,turn){return rows.find(row=>row.turn===turn)||null;}
   function render(doc,data,requestedTurn){
+    if((data.turns||[]).some(row=>row.schemaVersion===2))return renderV2(doc,data,requestedTurn);
     const rows=(data.turns||[]).slice().sort((a,b)=>a.turn-b.turn),compactions=data.checkpoints||[],markers=eventMarks(rows,compactions);
     const latest=rows.filter(row=>row.turn>0).at(-1)||rows.at(-1)||{};
     if(requestedTurn!==undefined)selectedTurn=requestedTurn;
@@ -115,6 +116,49 @@
       node.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();render(doc,data,Number(node.getAttribute('data-turn')));}};
     }
   }
+  function renderV2(doc,data,requestedTurn){
+    const rows=(data.turns||[]).slice().sort((a,b)=>a.turn-b.turn),latest=rows.at(-1)||{};
+    if(requestedTurn!==undefined)selectedTurn=requestedTurn;
+    if(!rows.some(r=>r.turn===selectedTurn))selectedTurn=latest.turn??0;
+    const selected=rowAt(rows,selectedTurn)||{};
+    const window=latest.contextWindow||272000,available=latest.hardThresholdTokens||window;
+    const occupancy=finite(latest.effectiveTokens)?latest.effectiveTokens/available:null;
+    const status=latest.capacityStatus==='BUDGET_INFEASIBLE'?'Capacity pressure':latest.mode==='on'?'Healthy':latest.mode||'Unknown';
+    const metrics=items=>items.map(([label,value])=>`<div class="metric"><small>${escape(label)}</small><strong>${escape(value)}</strong></div>`).join('');
+    const reduction=finite(latest.rawTokens)&&latest.rawTokens>0&&finite(latest.effectiveTokens)?ratio(1-latest.effectiveTokens/latest.rawTokens):'—';
+    doc.querySelector('#overview').innerHTML=`<div class="status-card"><strong>${escape(status)}</strong><span>Chronological semantic projection · capacity is an upper bound</span></div><div class="metric-grid">${metrics([
+      ['Projected / window',`${format(latest.effectiveTokens)} / ${format(window)}`],['Raw equivalent',format(latest.rawTokens)],['Reduction',reduction],['Generation',latest.generation??0],['Occupancy (after reserve)',ratio(occupancy)],['Cold equivalent',format(latest.coldEquivalentTokens)],['Cache reuse',ratio(latest.cacheReuseRatio)],['State bytes',format(latest.stateBytes)]
+    ])}</div>`;
+    const markers=[];const events=[];
+    for(const row of rows){
+      if(row.requestGenerationCommitted){markers.push({turn:row.turn,kind:'generation',label:`G · preflight generation ${row.requestGeneration}`});events.push({turn:row.turn,title:'G · BEFORE REQUEST CAPACITY COMMIT',detail:`Generation ${row.requestGeneration} · ${format(row.requestRepresentationChanges)} changes · frontier ${format(row.requestMutationPosition)} · suffix ${format(row.requestInvalidatedSuffixTokens)}; this request observes the commit`});}
+      if(row.capsulesCreated>0){markers.push({turn:row.turn,kind:'warm',label:'W · EXACT → CAPSULE'});events.push({turn:row.turn,title:'W · EXACT → CAPSULE',detail:`${format(row.capsulesCreated)} capsule changes`});}
+      if(row.sourcesCold>0){markers.push({turn:row.turn,kind:'cold',label:'C · resident → COLD'});events.push({turn:row.turn,title:'C · RESIDENT → COLD',detail:`${format(row.sourcesCold)} sources; raw is recallable`});}
+      if(row.generationCommitted){markers.push({turn:row.turn,kind:'generation',label:`G · generation ${row.generation}`});events.push({turn:row.turn,title:'G · GENERATION COMMIT',detail:`Generation ${row.generation} · ${format(row.representationChanges)} changes · saves ${format(row.savingPerRequest)}/request · frontier ${format(row.earliestMutationPosition)} · one affected suffix ${format(row.estimatedInvalidatedSuffixTokens)} · break-even ${finite(row.breakEvenRequests)?row.breakEvenRequests.toFixed(1):'—'} requests`});}
+      const previous=rowAt(rows,row.turn-1);
+      if(previous?.generationCommitted&&finite(row.cacheReuseRatio)&&((finite(previous.cacheReuseRatio)&&previous.cacheReuseRatio-row.cacheReuseRatio>=.1)||(finite(row.uncachedInput)&&finite(previous.uncachedInput)&&row.uncachedInput-previous.uncachedInput>=2048))){
+        markers.push({turn:row.turn,kind:'cache',label:'R · next-request cache observation'});
+        events.push({turn:row.turn,title:'R · NEXT REQUEST CACHE IMPACT',detail:`Request generation ${row.requestGeneration??'—'} · uncached ${format(row.uncachedInput)} · cacheRead ${format(row.cacheRead)} · reuse ${ratio(row.cacheReuseRatio)}; associated with generation commit after turn ${previous.turn}, not exact provider attribution`});
+      }
+    }
+    for(const f of data.checkpoints||[])if(finite(f.turn)){markers.push({turn:f.turn,kind:'foreign',label:'F · native/legacy compact'});events.push({turn:f.turn,title:'F · NATIVE / LEGACY COMPACT',detail:'Host compatibility event'});}
+    doc.querySelector('#size').innerHTML=chart(rows,[{key:'rawTokens',label:'Raw equivalent',color:colors[0]},{key:'effectiveTokens',label:'Projected',color:colors[1]}],{markers,thresholds:[{value:window,label:'Context capacity'},{value:available,label:'Available after reserve'}],selected:selectedTurn});
+    doc.querySelector('#composition').innerHTML=chart(rows,[{key:'exactTokens',label:'Exact',color:colors[0]},{key:'capsuleTokens',label:'Capsule',color:colors[2]},{key:'coldRefTokens',label:'Cold refs',color:colors[3]},{key:'frameTokens',label:'Prompt / frame',color:colors[1]}],{stacked:true,markers,selected:selectedTurn});
+    doc.querySelector('#warm-stats').innerHTML=metrics([['Cold equivalent',format(latest.coldEquivalentTokens)],['Pinned exact',format(latest.pinnedExactTokens)],['Pending compression gain',format(latest.pendingCompressionGain)],['Saving / request',format(latest.savingPerRequest)],['Mutation frontier',format(latest.earliestMutationPosition)],['KV invalidation estimate',format(latest.estimatedInvalidatedSuffixTokens)],['Break-even requests',finite(latest.breakEvenRequests)?latest.breakEvenRequests.toFixed(1):'—']]);
+    doc.querySelector('#memory-stats').innerHTML=metrics([['Representation index bytes',format(latest.stateBytes)],['Generation commits',rows.filter(r=>r.generationCommitted).length],['Changes in last commit',latest.representationChanges??0]]);
+    doc.querySelector('#memory').innerHTML=chart(rows,[{key:'stateBytes',label:'Representation state bytes',color:colors[0]}],{bytes:true,height:165,selected:selectedTurn});
+    doc.querySelector('#cache-stats').innerHTML=metrics([['Cache reuse',ratio(latest.cacheReuseRatio)],['Uncached input',format(latest.uncachedInput)],['cacheRead / cacheWrite',`${format(latest.cacheRead)} / ${format(latest.cacheWrite)}`],['Compression tokens',format(latest.compressionTokens)]]);
+    doc.querySelector('#cache').innerHTML=chart(rows,[{key:'cacheRead',label:'cacheRead',color:colors[1]},{key:'uncachedInput',label:'Uncached input',color:colors[0]}],{markers,selected:selectedTurn});
+    doc.querySelector('#event-log').innerHTML=events.slice(-120).reverse().map(e=>`<button class="event" data-turn="${e.turn}"><b>Turn ${e.turn} · ${escape(e.title)}</b><span>${escape(e.detail)}</span></button>`).join('')||'<p>No representation commits yet.</p>';
+    const keys=['generation','requestGeneration','rawTokens','projectedTokens','effectiveTokens','contextWindow','exactTokens','capsuleTokens','coldEquivalentTokens','frameTokens','pendingCompressionGain','savingPerRequest','earliestMutationPosition','estimatedInvalidatedSuffixTokens','breakEvenRequests','stateBytes','uncachedInput','cacheRead','cacheReuseRatio'];
+    doc.querySelector('#all-turns').innerHTML=`<div class="table-scroll"><table><thead><tr><th>Turn</th>${keys.map(k=>`<th>${escape(k)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr data-turn="${r.turn}"><th>${r.turn}</th>${keys.map(k=>`<td>${escape(r[k]??'—')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+    doc.querySelector('#inspector').innerHTML=`<h2>Turn ${selectedTurn} · Generation ${selected.generation??'—'}</h2><dl>${keys.map(k=>`<dt>${escape(k)}</dt><dd>${escape(selected[k]??'—')}</dd>`).join('')}</dl>${selected.requestId?`<button data-projection-request="${escape(selected.requestId)}">Open actual request projection</button>`:''}`;
+    doc.querySelector('#status').textContent=`${status} · ${rows.filter(r=>r.turn>0).length} completed turns · Generation ${latest.generation??0} · Turn 0 ${data.turnZero||'unknown'}`;
+    const view=doc.querySelector('#event-view'),all=doc.querySelector('#all-view');if(view)view.hidden=detailsMode!=='events';if(all)all.hidden=detailsMode!=='all';
+    if(doc.querySelectorAll)for(const node of doc.querySelectorAll('[data-turn]'))node.onclick=()=>renderV2(doc,data,Number(node.getAttribute('data-turn')));
+    const open=doc.querySelector('[data-projection-request]');if(open&&root.PiProjectionView)open.onclick=()=>root.PiProjectionView.open(open.getAttribute('data-projection-request'));
+  }
+
   function bind(doc){const toggle=doc.querySelector('#details-toggle');if(toggle)toggle.onclick=()=>{detailsMode=detailsMode==='events'?'all':'events';if(root.PiContextGraphData)render(doc,root.PiContextGraphData);};}
   const api={chart,render,bind};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.PiContextGraph=api;
 })(typeof globalThis!=='undefined'?globalThis:this);

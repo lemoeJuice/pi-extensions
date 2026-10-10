@@ -1,29 +1,21 @@
-# Rolling Context：滚动式上下文管理
+# Rolling Context · projection v2
 
-状态：**MVP 已实现并由包清单加载**。首次仍为 `observe` 模式；需要传入 `--rolling-context-mode on` 才启用自动投影编辑。原生 compact 保持开启。
+Rolling Context 默认 `on`，是透明的 semantic context cache。Raw session 是完整 evidence log；正常 aging 只改变每次模型请求的 projection，不产生 `context_edit` 或 Rolling compaction，不需要主 agent 调用任何维护工具。
 
-Design Intent 可选契约在 `session_start`（runtime 就绪后）校验，不在扩展 factory 加载时查询工具。provider 缺失允许独立运行；发现不兼容 provider 则报告错误，并在上下文改写和 checkpoint 执行边界再次校验，停止 Rolling 改写而保留原生 compact。
+每个 source 独立保持 `EXACT / CAPSULE / COLD`，并区分 `desiredRepresentation` 与 `committedRepresentation`。模型输入保持 chronology，在原位置替换 capsule。Cold 工具结果只保留短来源 ref 和协议配对，原文仍可 `context_recall`。图片、未知格式或压缩失败只让对应 source 留 exact，不阻塞其他来源。
 
-目标是把模型上下文从不断增长的会话日志，改为「可验证的工作状态 + 最近执行窗口 + 按需召回」，在保留原始历史的同时，逐步移出已经消费、过时或低价值的内容。这里只管理当前任务的执行记忆，`task-decision` 不会自动成为项目设计事实。
+272k 是缺省容量上限，实际优先使用当前模型窗口，扣除 output reserve 和 safety margin。没有固定 32k target，也没有 checkpoint cadence / blocked 生命周期。低 occupancy 以经济性选择 mutation frontier；高 occupancy 提高 aging 紧迫程度。一次 batch 只估算一次最早 mutation 后的 KV suffix 成本。
 
-完整方案见 [`docs/design.md`](docs/design.md)，包括 pi API 可行性、记忆结构、淘汰策略、预算、恢复机制和分阶段实现计划。
+正常命令：`/rolling-context status|on|off|observe|inspect`。`on` 应用 committed representations，`observe` 只观察候选，`off` 使用宿主原有 projection；两者不会撤销 legacy edits/native compactions。新 session 自动启用；旧版本由命令写入的明确 off/observe 继续有效，旧默认值不产生永久 observe 锁定。
 
-具体模块接口、状态格式、回合规划、提交恢复与测试见 [`docs/implementation.md`](docs/implementation.md)。
+Daemon session 的 **Context Graph** 页面提供 **Graph | Projection**。Graph 保留 Turn 0、completed turns、provider usage、事件日志和 inspector，增加 resident composition、generation、frontier、KV invalidation 与 break-even。Projection 提供 **Rendered** 和 **Mapping / Diff**，读取真正 `context_with_system` hook 输出的快照，用来源/hash/representation 重建并逐消息校验，不重新运行 planner。`Recall raw` 遵守当前 branch 的 redaction/compaction 授权。
 
-项目级长期设计由独立的 [Design Intent](../design-intent/README.md) 管理；两者边界见[简短集成说明](../design-intent/docs/integration.md)。
+Generic reducer 优先做保留 unique facts 和顺序的确定性重复缩减；无法缩减时，通过 Pi 自带 `modelRegistry.streamSimple` 发起有界辅助语义请求。每 turn 最多两项、单项最多 32,000 字符/1,200 output tokens/8 秒；失败或语义风险过高保留 exact。它不会调用 primary agent 或其工具，但有额外模型费用和延迟。
 
-可用工具：`context_note`、`context_recall`。可用命令：`/rolling-context status|inspect|on|off|observe|pin|unpin|checkpoint`。MVP 不启用小模型提取；面对未覆盖上下文、图片、未知扩展消息或不安全 checkpoint 时保守回退。功能边界详见 [`docs/implementation.md`](docs/implementation.md)。
+State 保存 append-only representation deltas，capsule 只保存一次；request snapshots 保存可复用 mapping 段、哈希、bounded previews 和 totals。未关联 raw source 的 prompt/extension 内容按哈希只存一次，超过归档限制时显示 unavailable，绝不把 preview 冒充完整输入。
 
-在 TUI 输入 `/rolling-context ` 可看到子命令补全与说明；`/rolling-context help` 显示完整帮助。
-`status` 查看状态（无参数时默认执行）；`inspect` 查看连续性摘要及条目 ID；
-`on` 启用后续自动维护，`observe` 仅观察，`off` 停止后续 Rolling 改写（都不回滚已有 edits/checkpoints）；
-`pin ITEM_ID` / `unpin ITEM_ID` 固定或解除固定当前分支条目，ID 从 `inspect` 获取；
-`checkpoint` 等待 idle 并人工确认，随后验证覆盖和净节省再请求 compact。
+旧 `rolling-context.note.v1`、state、context edits、own checkpoints、native compaction 和 Design Intent 历史投影继续可读/inspect/recall。v1 planner/shell 已隔离到 `legacy/`，默认入口不调用它。`lib.ts` 只保留兼容 export。
 
-`/rolling-context checkpoint` 的人工确认可在 Pi 本地界面或 Remote session 网页完成；网页不在目标 session 时请求会保持排队，进入对应页面后重放。该确认没有等待超时，Pi 会在收到批准后复核 session branch 与待处理消息，再启动 compact。
+详见 [v2 implementation](docs/implementation.md)。历史设计见 [v1 implementation](docs/implementation-v1.md) 与 [v1 design](docs/design.md)，其 target/checkpoint 规则不适用于默认 v2。
 
-默认 hot→warm 批次至少间隔 4 个完整 turn，累计节省 2048 估算 tokens；候选会扣除最早 prefix mutation 可能影响的 suffix 成本，高缓存命中时普通收益门槛翻倍。checkpoint 与普通 warm 最短驻留为 16 turn；有价值证据先 HOT→WARM，安全的小型结果可直接 cold，hard emergency 仍受内容/来源/工具协议保护。只要 checkpoint preview 确有净节省即可渐进推进，不要求一次低于 target。可用 `--rolling-context-warm-interval`、`--rolling-context-batch-saving`、`--rolling-context-checkpoint-interval` 调整。已有 capsule 不重复摘要。
-
-连续性状态不足时，只在 checkpoint 有压力时尝试 bounded fallback（最近 12 个 projected entries、输入最多 12,000 字符）；来源不清、超限或找不到最近用户请求时保留原生历史。fallback 的 assistant 报告明确标为未验证。最新用户请求以原文/来源保留，确定性识别的明确约束按 source span pin；普通 follow-up 留在原始历史，不会逐轮累积为永久 pin。
-
-新会话在首次请求前尽早尝试记录 Turn 0 projection；旧 session 若没有该样本显示 unknown/gap，不回推猜测。每个 completed turn 保存不进模型 context 的 telemetry（observe/off 也记录）。现有 daemon 的 session 页面点击 **Context Graph**，或访问 `/s/<sessionId>/context`，查看 controller overview、context/composition/memory/cache 图、事件日志、All turns 和共享 inspector。warm/checkpoint event 记在 turn N 结束边界，provider usage 记在真实请求 turn N+1；cache impact 是相邻实测关联，不宣称精确成本归因。未知 usage 不猜为 0；图表 token 数为宿主估算。自己的 checkpoint 收起的来源可按需召回，但不撤销 foreign compaction 或其他插件的隐藏/脱敏。
+验证：`node --experimental-strip-types --test --test-isolation=none test/*.test.mjs`。Daemon 集成测试需要 localhost 临时端口。120-turn zero-cooperation fixture 覆盖 read/edit/bash/test/unknown tools、重启、多个 generations、cold recall、raw immutability 和真实快照回放；fixture usage 是模拟数据，不能作为真实 provider 成本实验。
